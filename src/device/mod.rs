@@ -9,37 +9,57 @@ use futures::{
 };
 
 #[async_trait]
-trait Device {
+pub trait Device {
     fn name(&self) -> String;
     async fn capacity(&self) -> eyre::Result<usize>;
+    async fn init(&self) -> eyre::Result<()>;
     async fn write(&self, addr: usize, data: &[u8]) -> eyre::Result<()>;
     async fn read(&self, addr: usize, size: usize) -> eyre::Result<Vec<u8>>;
 }
 
 #[derive(Clone)]
-pub struct Block {
-    is_root: bool,
+pub struct LogicalDevice {
     max_concurrent: usize,
     replica: Vec<Arc<dyn Device>>,
 }
 
-impl Block {
-    fn new(
-        is_root: bool,
-        max_concurrent: usize,
-        devices: Vec<Arc<dyn Device>>,
-    ) -> eyre::Result<Self> {
+impl LogicalDevice {
+    pub fn new(max_concurrent: usize, devices: Vec<Arc<dyn Device>>) -> eyre::Result<Self> {
         if devices.is_empty() {
             eyre::bail!("Device cannot be empty");
         }
-        Ok(Block {
-            is_root,
+
+        Ok(LogicalDevice {
             max_concurrent,
             replica: devices,
         })
     }
 
-    async fn write(&self, addr: usize, data: &[u8]) -> eyre::Result<()> {
+    pub async fn allocate_if_unset(&self) -> eyre::Result<usize> {
+        let sizes = stream::iter(self.replica.iter().map(|device| async move {
+            {
+                device.init().await?;
+                let name = device.name();
+                device.capacity().await.map(|c| (name, c))
+            }
+        }))
+        .buffer_unordered(self.max_concurrent)
+        .try_collect::<Vec<(String, usize)>>()
+        .await?;
+
+        let expected = sizes[0].1;
+        for (device, size) in sizes {
+            if size != expected {
+                eyre::bail!(
+                    "Fatal error: expected allocated capacity {expected} on device {device}, got {size} instead"
+                );
+            }
+        }
+
+        Ok(expected)
+    }
+
+    pub async fn write(&self, addr: usize, data: &[u8]) -> eyre::Result<()> {
         stream::iter(
             self.replica
                 .iter()
@@ -50,7 +70,7 @@ impl Block {
         .await
     }
 
-    async fn read(&self, addr: usize, size: usize) -> eyre::Result<Vec<u8>> {
+    pub async fn read(&self, addr: usize, size: usize) -> eyre::Result<Vec<u8>> {
         let mut stream = stream::iter(self.replica.iter().map(|replica| replica.read(addr, size)))
             .buffer_unordered(self.max_concurrent);
         let mut errors = vec![];
