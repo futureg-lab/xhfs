@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 
 use crate::{
-    device::{Device, LogicalDevice, fs_device::FsDevice},
+    device::{Device, fs_device::FsDevice, logical::LogicalDevice},
     disk::Controller,
 };
 
@@ -26,26 +26,18 @@ async fn main() -> eyre::Result<()> {
 
     let dev1 = LogicalDevice::new(
         2,
-        vec![
-            Arc::from(FsDevice {
-                file: "A.bin".into(),
-                size: 10,
-            }) as Arc<dyn Device>,
-            Arc::from(FsDevice {
-                file: "B.bin".into(),
-                size: 10,
-            }) as Arc<dyn Device>,
+        [
+            Arc::from(FsDevice::new("A.bin", 10).await?) as Arc<dyn Device>,
+            Arc::from(FsDevice::new("B.bin", 10).await?) as Arc<dyn Device>,
         ],
     )?;
     let dev2 = LogicalDevice::new(
         2,
-        vec![Arc::from(FsDevice {
-            file: "C.bin".into(),
-            size: 20,
-        }) as Arc<dyn Device>],
+        [Arc::from(FsDevice::new("C.bin", 20).await?) as Arc<dyn Device>],
     )?;
 
     let ctrl = Controller::from(vec![dev1, dev2]).await?;
+    println!("Total size {:?}", ctrl.total_capacity());
     ctrl.write(8, "ABCDEF".as_bytes()).await?;
 
     let data = String::from_utf8(ctrl.read(8, 6).await?)?;

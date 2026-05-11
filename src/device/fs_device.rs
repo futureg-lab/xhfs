@@ -7,21 +7,24 @@ use tokio::{
 };
 
 pub struct FsDevice {
-    pub file: PathBuf,
-    pub size: usize,
+    file: PathBuf,
+    size: usize,
+}
+
+impl FsDevice {
+    pub async fn new<P: Into<PathBuf>>(file: P, size: usize) -> eyre::Result<Self> {
+        let file: PathBuf = file.into();
+        fs::write(&file, vec![0u8; size])
+            .await
+            .map_err(|e| eyre::eyre!(e))?;
+        Ok(Self { file, size })
+    }
 }
 
 #[async_trait]
 impl Device for FsDevice {
     fn name(&self) -> String {
         "fs".to_string()
-    }
-
-    async fn init(&self) -> eyre::Result<()> {
-        let size = self.size;
-        fs::write(&self.file, vec![0u8; size])
-            .await
-            .map_err(|e| eyre::eyre!(e))
     }
 
     async fn capacity(&self) -> eyre::Result<usize> {

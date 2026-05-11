@@ -1,8 +1,5 @@
-use std::path::PathBuf;
-
+use crate::device::logical::LogicalDevice;
 use eyre::Context;
-
-use crate::device::LogicalDevice;
 
 #[derive(Clone)]
 pub struct PinnedDevice {
@@ -103,17 +100,25 @@ impl INode {
 
 #[derive(Clone)]
 pub struct Controller {
-    size: usize,
     pinned_devices: Vec<PinnedDevice>,
 }
 
+// TODO:
+// from yaml config
+// chunks:
+//   - type: fs
+//     allocate: ...
+//     path: A.bin
+//   - type: kv # addr resolution should be fun
+//     allocate: ..
+//     backend: memory | http (makes request to remote kv like Cloudflare) | redis | s3
 impl Controller {
     pub async fn from(devices: Vec<LogicalDevice>) -> eyre::Result<Self> {
         let mut logical_end = 0;
         let mut pinned_devices = vec![];
 
         for device in devices {
-            let size = device.allocate_if_unset().await?;
+            let size = device.validate_layout().await?;
             let start = logical_end;
             logical_end += size;
             pinned_devices.push(PinnedDevice {
@@ -123,10 +128,14 @@ impl Controller {
             });
         }
 
-        Ok(Self {
-            size: logical_end,
-            pinned_devices,
-        })
+        Ok(Self { pinned_devices })
+    }
+
+    pub fn total_capacity(&self) -> Option<usize> {
+        if let Some((sd, ed)) = self.pinned_devices.first().zip(self.pinned_devices.last()) {
+            return Some(ed.end - sd.start);
+        }
+        None
     }
 
     pub async fn write(&self, mut logical_addr: usize, data: &[u8]) -> eyre::Result<()> {
