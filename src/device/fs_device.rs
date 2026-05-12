@@ -14,9 +14,27 @@ pub struct FsDevice {
 impl FsDevice {
     pub async fn new<P: Into<PathBuf>>(file: P, size: usize) -> eyre::Result<Self> {
         let file: PathBuf = file.into();
-        fs::write(&file, vec![0u8; size])
-            .await
-            .map_err(|e| eyre::eyre!(e))?;
+        match fs::metadata(&file).await {
+            Ok(meta) => {
+                let existing_size = meta.len() as usize;
+                if existing_size == size {
+                    tracing::warn!("Reusing existing {file:?}");
+                    return Ok(Self { file, size });
+                } else {
+                    eyre::bail!(
+                        "File exists but has wrong size (expected {size}, got {existing_size})",
+                    );
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                tracing::warn!("Creating new file {file:?}");
+                fs::write(&file, vec![0u8; size])
+                    .await
+                    .map_err(|e| eyre::eyre!(e))?;
+            }
+            Err(e) => return Err(eyre::eyre!(e)),
+        }
+
         Ok(Self { file, size })
     }
 }

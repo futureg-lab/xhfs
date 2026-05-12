@@ -9,6 +9,7 @@ use crate::{
 
 pub mod device;
 pub mod disk;
+pub mod bfs;
 
 #[cfg(test)]
 mod tests;
@@ -36,7 +37,7 @@ async fn main() -> eyre::Result<()> {
         [Arc::from(FsDevice::new("C.bin", 20).await?) as Arc<dyn Device>],
     )?;
 
-    let ctrl = Controller::from(vec![dev1, dev2]).await?;
+    let ctrl = Controller::from([dev1, dev2]).await?;
     println!("Total size {:?}", ctrl.total_capacity());
     ctrl.write(8, "ABCDEF".as_bytes()).await?;
 

@@ -1,2 +1,2 @@
 mod devices;
-mod inode;
+mod serialization;

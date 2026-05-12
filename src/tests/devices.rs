@@ -149,7 +149,7 @@ async fn test_logical_device() -> eyre::Result<()> {
     test_read_write_complex!(&dev1).await?;
     test_read_write_complex!(&dev2).await?;
 
-    let ctrl = Controller::from(vec![dev1, dev2]).await?;
+    let ctrl = Controller::from([dev1, dev2]).await?;
     assert_eq!(
         ctrl.total_capacity().unwrap(),
         20 + 6 * 7,
