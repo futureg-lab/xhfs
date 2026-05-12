@@ -1,7 +1,7 @@
 use crate::disk::Controller;
 use eyre::Context;
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -275,6 +275,10 @@ impl Directory {
     }
 
     pub fn deserialize(data: &[u8]) -> eyre::Result<Self> {
+        // if data.is_empty() {
+        //     return Ok(Directory { entries: vec![] });
+        // }
+
         let expected_size = 8;
         let incoming_size = data.len();
         if incoming_size < expected_size {
@@ -402,6 +406,11 @@ impl BruteFsHeader {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct WriteOption {
+    overwrite: bool,
+}
+
 impl BruteFS {
     pub fn new(ctrl: Controller) -> eyre::Result<Self> {
         Ok(Self {
@@ -434,6 +443,23 @@ impl BruteFS {
         self.ctrl.write(0, &header.serialize()?).await?;
 
         Ok(())
+    }
+
+    pub async fn get_header(&self) -> eyre::Result<BruteFsHeader> {
+        BruteFsHeader::deserialize(&self.ctrl.read(0, self.header_size).await?)
+    }
+
+    pub async fn get_root_inode(&self) -> eyre::Result<(u64, INode)> {
+        let root_inode_addr = self.header_size;
+        Ok((
+            root_inode_addr as u64,
+            INode::deserialize(
+                &self
+                    .ctrl
+                    .read(root_inode_addr, INode::serialized_size())
+                    .await?,
+            )?,
+        ))
     }
 
     pub async fn allocate(&self, wanted_size: usize) -> eyre::Result<u64> {
@@ -495,12 +521,380 @@ impl BruteFS {
             .ok_or_else(|| eyre::eyre!("File system controller not ready"))
     }
 
-    pub async fn fwrite(path: PathBuf, data: &[u8]) -> eyre::Result<u8> {
-        for component in path.components() {
-            let component = component.as_os_str().to_string_lossy().to_string();
+    async fn resolve_path(&self, path: &Path) -> eyre::Result<(u64, INode)> {
+        let components = path
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().to_string())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>();
+
+        let (mut inode_addr, mut inode) = self.get_root_inode().await?;
+        if components.is_empty() {
+            return Ok((inode_addr, inode));
         }
 
-        todo!()
+        for component in components {
+            match inode.kind {
+                INodeKind::Directory => {
+                    let payload = self.read_full_data_from_extent(inode.extent_addr).await?;
+                    let directory = Directory::deserialize(&payload)?;
+                    let mut found = None;
+                    for (name, child_addr) in directory.entries {
+                        if name == component {
+                            found = Some(child_addr);
+                            break;
+                        }
+                    }
+
+                    let child_addr = found.ok_or_else(|| {
+                        eyre::eyre!("Path component '{}' does not exist", component)
+                    })?;
+                    inode_addr = child_addr;
+                    inode = INode::deserialize(
+                        &self
+                            .ctrl
+                            .read(child_addr as usize, INode::serialized_size())
+                            .await?,
+                    )?;
+                }
+                INodeKind::File => {
+                    eyre::bail!("Encountered file while traversing path");
+                }
+                INodeKind::Symlink => {
+                    todo!()
+                }
+            }
+        }
+
+        Ok((inode_addr, inode))
+    }
+
+    async fn resolve_parent(&self, path: &Path) -> eyre::Result<(u64, INode, String)> {
+        let parent = path.parent().ok_or_else(|| eyre::eyre!("Missing parent"))?;
+        let filename = path
+            .file_name()
+            .ok_or_else(|| eyre::eyre!("Missing filename"))?
+            .to_string_lossy()
+            .to_string();
+        let (addr, inode) = self.resolve_path(parent).await?;
+        Ok((addr, inode, filename))
+    }
+
+    pub async fn ls(&self, path: PathBuf) -> eyre::Result<Vec<String>> {
+        let (_, inode) = self.resolve_path(&path).await?;
+        match inode.kind {
+            INodeKind::Directory => {
+                let payload = self.read_full_data_from_extent(inode.extent_addr).await?;
+                let directory = Directory::deserialize(&payload)?;
+                Ok(directory
+                    .entries
+                    .into_iter()
+                    .map(|(name, _)| name)
+                    .collect())
+            }
+            INodeKind::File => {
+                eyre::bail!("Cannot ls a file");
+            }
+            INodeKind::Symlink => {
+                todo!()
+            }
+        }
+    }
+
+    pub async fn fwrite(&self, path: PathBuf, data: Vec<u8>, opt: WriteOption) -> eyre::Result<()> {
+        let (parent_addr, mut parent_inode, filename) = self.resolve_parent(&path).await?;
+        let payload = self
+            .read_full_data_from_extent(parent_inode.extent_addr)
+            .await?;
+
+        let mut directory = Directory::deserialize(&payload)?;
+
+        // existing?
+        for (name, inode_addr) in &directory.entries {
+            if name == &filename {
+                let mut inode = INode::deserialize(
+                    &self
+                        .ctrl
+                        .read(*inode_addr as usize, INode::serialized_size())
+                        .await?,
+                )?;
+                match inode.kind {
+                    INodeKind::File => {
+                        if !opt.overwrite {
+                            eyre::bail!("File already exists");
+                        }
+
+                        self.free_full_extent(inode.extent_addr).await?;
+
+                        let extent = Extent {
+                            next: MaybeU64::None,
+                            data,
+                        };
+                        let extent_addr = self.allocate(extent.serialized_size()).await?;
+
+                        self.ctrl
+                            .write(extent_addr as usize, &extent.serialize()?)
+                            .await?;
+                        inode.extent_addr = MaybeU64::Some(extent_addr);
+                        inode.mtime = utc_now_u64();
+                        self.ctrl
+                            .write(*inode_addr as usize, &inode.serialize()?)
+                            .await?;
+                        return Ok(());
+                    }
+                    _ => eyre::bail!("Path is not file"),
+                }
+            }
+        }
+
+        // create new file
+        let extent = Extent {
+            next: MaybeU64::None,
+            data,
+        };
+
+        let extent_addr = self.allocate(extent.serialized_size()).await?;
+        self.ctrl
+            .write(extent_addr as usize, &extent.serialize()?)
+            .await?;
+
+        let inode = INode {
+            ctime: utc_now_u64(),
+            mtime: utc_now_u64(),
+            utime: utc_now_u64(),
+            extent_addr: MaybeU64::Some(extent_addr),
+            kind: INodeKind::File,
+        };
+        let inode_addr = self.allocate(INode::serialized_size()).await?;
+        self.ctrl
+            .write(inode_addr as usize, &inode.serialize()?)
+            .await?;
+        directory.entries.push((filename, inode_addr));
+
+        self.free_full_extent(parent_inode.extent_addr).await?;
+
+        let new_dir_extent = Extent {
+            next: MaybeU64::None,
+            data: directory.serialize()?,
+        };
+        let new_dir_extent_addr = self.allocate(new_dir_extent.serialized_size()).await?;
+        self.ctrl
+            .write(new_dir_extent_addr as usize, &new_dir_extent.serialize()?)
+            .await?;
+        parent_inode.extent_addr = MaybeU64::Some(new_dir_extent_addr);
+
+        self.ctrl
+            .write(parent_addr as usize, &parent_inode.serialize()?)
+            .await?;
+
+        Ok(())
+    }
+
+    pub async fn mkdir(&self, path: PathBuf, recursive: bool) -> eyre::Result<()> {
+        let components = path
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().to_string())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>();
+
+        let (mut curr_addr, mut curr_inode) = self.get_root_inode().await?;
+        for component in components {
+            match curr_inode.kind {
+                INodeKind::Directory => {}
+                _ => eyre::bail!("Non-directory in mkdir path"),
+            }
+            let payload = self
+                .read_full_data_from_extent(curr_inode.extent_addr)
+                .await?;
+
+            let mut directory = Directory::deserialize(&payload)?;
+            let mut found = None;
+            for (name, inode_addr) in &directory.entries {
+                if name == &component {
+                    found = Some(*inode_addr);
+                    break;
+                }
+            }
+
+            if let Some(inode_addr) = found {
+                curr_addr = inode_addr;
+                curr_inode = INode::deserialize(
+                    &self
+                        .ctrl
+                        .read(inode_addr as usize, INode::serialized_size())
+                        .await?,
+                )?;
+                continue;
+            }
+            if !recursive {
+                eyre::bail!("Directory '{component}' does not exist");
+            }
+
+            // create new dir inode
+            let new_inode = INode {
+                ctime: utc_now_u64(),
+                mtime: utc_now_u64(),
+                utime: utc_now_u64(),
+                extent_addr: MaybeU64::None,
+                kind: INodeKind::Directory,
+            };
+
+            let inode_addr = self.allocate(INode::serialized_size()).await?;
+            self.ctrl
+                .write(inode_addr as usize, &new_inode.serialize()?)
+                .await?;
+            directory.entries.push((component.clone(), inode_addr));
+            let dir_data = directory.serialize()?;
+
+            self.free_full_extent(curr_inode.extent_addr).await?;
+
+            let extent_addr = self
+                .allocate(
+                    Extent {
+                        next: MaybeU64::None,
+                        data: dir_data,
+                    }
+                    .serialized_size(),
+                )
+                .await?;
+
+            self.ctrl
+                .write(
+                    extent_addr as usize,
+                    &Extent {
+                        next: MaybeU64::None,
+                        data: directory.serialize()?,
+                    }
+                    .serialize()?,
+                )
+                .await?;
+
+            curr_inode.extent_addr = MaybeU64::Some(extent_addr);
+            self.ctrl
+                .write(curr_addr as usize, &curr_inode.serialize()?)
+                .await?;
+
+            curr_addr = inode_addr;
+            curr_inode = new_inode;
+        }
+
+        Ok(())
+    }
+
+    pub async fn fread(&self, path: PathBuf) -> eyre::Result<Vec<u8>> {
+        let (_, inode) = self.resolve_path(&path).await?;
+        match inode.kind {
+            INodeKind::File => self.read_full_data_from_extent(inode.extent_addr).await,
+            INodeKind::Directory => {
+                eyre::bail!("Cannot fread directory");
+            }
+            INodeKind::Symlink => {
+                todo!()
+            }
+        }
+    }
+
+    pub async fn read_extent(&self, addr: u64) -> eyre::Result<Extent> {
+        let extent_header = self.ctrl.read(addr as usize, 8 + 8).await?;
+        let curr_extent_data_size = u64::from_le_bytes(extent_header[8..16].try_into()?);
+        Extent::deserialize(
+            &self
+                .ctrl
+                .read(addr as usize, 8 + 8 + curr_extent_data_size as usize)
+                .await?,
+        )
+    }
+
+    pub async fn mark_as_reusable(&self, new_slot_value: AddressSlot) -> eyre::Result<()> {
+        let mut header = self.get_header().await?;
+        let mut found = false;
+        for slot in header.extent_freed.items.iter_mut() {
+            if matches!(
+                slot,
+                AddressSlot {
+                    addr: MaybeU64::None,
+                    ..
+                }
+            ) {
+                *slot = new_slot_value;
+                found = true;
+                break;
+            }
+        }
+
+        if found {
+            self.ctrl.write(0, &header.serialize()?).await?;
+        }
+
+        return Ok(());
+    }
+
+    pub async fn free_full_extent(&self, start_extent_addr: MaybeU64) -> eyre::Result<()> {
+        let mut addr = start_extent_addr;
+        while let MaybeU64::Some(next_addr) = addr {
+            let extent = self.read_extent(next_addr).await?;
+
+            self.mark_as_reusable(AddressSlot {
+                addr: MaybeU64::Some(next_addr),
+                capacity: extent.data.len(),
+            })
+            .await?;
+
+            addr = extent.next;
+        }
+
+        Ok(())
+    }
+
+    // useful for extending dir entries
+    pub async fn append_or_allocate_extent(
+        &self,
+        start_extent_addr: MaybeU64,
+        new_extent: Extent,
+    ) -> eyre::Result<u64> {
+        let mut last_extent = None;
+        let mut addr = start_extent_addr;
+        while let MaybeU64::Some(next_addr) = addr {
+            let extent = self.read_extent(next_addr).await?;
+            addr = extent.next;
+            last_extent = Some((next_addr, extent));
+        }
+
+        let mut all_extent_start = start_extent_addr.get();
+        if let Some((prev_addr, mut prev_extent)) = last_extent {
+            // TODO: HIGHLY inefficient
+            // later just swap the address instead of a full block write
+            // for now this should work for the sane of proving correctness
+            let new_extent_addr = self.allocate(new_extent.serialized_size()).await?;
+            prev_extent.next = MaybeU64::Some(new_extent_addr);
+            self.ctrl
+                .write(prev_addr as usize, &prev_extent.serialize()?)
+                .await?;
+
+            self.ctrl
+                .write(new_extent_addr as usize, &new_extent.serialize()?)
+                .await?;
+        } else {
+            // new
+            let new_extent_addr = self.allocate(new_extent.serialized_size()).await?;
+            self.ctrl
+                .write(new_extent_addr as usize, &new_extent.serialize()?)
+                .await?;
+            all_extent_start = new_extent_addr;
+        }
+
+        Ok(all_extent_start)
+    }
+
+    pub async fn read_full_data_from_extent(&self, addr: MaybeU64) -> eyre::Result<Vec<u8>> {
+        let mut data = vec![];
+        let mut addr = addr;
+        while let MaybeU64::Some(next_addr) = addr {
+            let extent = self.read_extent(next_addr).await?;
+            addr = extent.next;
+            data.extend(extent.data);
+        }
+        Ok(data)
     }
 }
 
