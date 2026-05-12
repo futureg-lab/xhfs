@@ -1,4 +1,6 @@
-use crate::bfs::{Directory, Extent, INode, INodeKind, MaybeU64};
+use crate::bfs::{
+    AddressSlot, AddressVector, BruteFsHeader, Directory, Extent, INode, INodeKind, MaybeU64,
+};
 
 #[test]
 pub fn test_basic_binary_serialization() -> eyre::Result<()> {
@@ -41,6 +43,25 @@ pub fn test_basic_binary_serialization() -> eyre::Result<()> {
         let data = original.serialize()?;
         let reconstr = Directory::deserialize(&data)?;
         assert_eq!(original, reconstr, "Directory serde");
+    }
+
+    {
+        let mut original = BruteFsHeader {
+            version: 42,
+            extent_freed: AddressVector::allocate(11),
+        };
+        original.extent_freed.items[5] = AddressSlot {
+            addr: MaybeU64::Some(1234),
+            capacity: 444,
+        };
+        original.extent_freed.items[10] = AddressSlot {
+            addr: MaybeU64::Some(234567),
+            capacity: 4567112234,
+        };
+
+        let data = original.serialize()?;
+        let reconstr = BruteFsHeader::deserialize(&data)?;
+        assert_eq!(original, reconstr, "BruteFsHeader serde");
     }
     Ok(())
 }

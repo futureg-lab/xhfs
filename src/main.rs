@@ -3,13 +3,14 @@ use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 
 use crate::{
+    bfs::BruteFS,
     device::{Device, fs_device::FsDevice, logical::LogicalDevice},
     disk::Controller,
 };
 
+pub mod bfs;
 pub mod device;
 pub mod disk;
-pub mod bfs;
 
 #[cfg(test)]
 mod tests;
@@ -28,21 +29,23 @@ async fn main() -> eyre::Result<()> {
     let dev1 = LogicalDevice::new(
         2,
         [
-            Arc::from(FsDevice::new("A.bin", 10).await?) as Arc<dyn Device>,
-            Arc::from(FsDevice::new("B.bin", 10).await?) as Arc<dyn Device>,
+            Arc::from(FsDevice::new("A.bin", 10 * 1000 * 1000).await?) as Arc<dyn Device>,
+            Arc::from(FsDevice::new("B.bin", 10 * 1000 * 1000).await?) as Arc<dyn Device>,
         ],
     )?;
     let dev2 = LogicalDevice::new(
         2,
-        [Arc::from(FsDevice::new("C.bin", 20).await?) as Arc<dyn Device>],
+        [Arc::from(FsDevice::new("C.bin", 20 * 1000 * 1000).await?) as Arc<dyn Device>],
     )?;
 
     let ctrl = Controller::from([dev1, dev2]).await?;
     println!("Total size {:?}", ctrl.total_capacity());
-    ctrl.write(8, "ABCDEF".as_bytes()).await?;
 
-    let data = String::from_utf8(ctrl.read(8, 6).await?)?;
-    println!("{data:?}");
+    let mut bfs = BruteFS::new(ctrl)?;
+    bfs.format().await?;
+
+    // println!("from header {}", bfs.header.last_free_offset);
+    // println!("from memory {}", bfs.get_last_free_offset().await?);
 
     Ok(())
 }
