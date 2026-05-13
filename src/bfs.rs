@@ -18,6 +18,7 @@ pub enum INodeKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct INode {
     pub kind: INodeKind,
+    pub total_file_size: u64,
     pub extent_addr: MaybeU64,
     pub mtime: u64,
     pub ctime: u64,
@@ -30,6 +31,7 @@ pub struct INode {
 pub struct EntryStat {
     pub name: String,
     pub kind: INodeKind,
+    pub size: Option<usize>,
     pub mtime: u64,
     pub ctime: u64,
     pub utime: u64,
@@ -157,6 +159,7 @@ impl INode {
         buf.push(kind);
 
         buf.extend_from_slice(&self.extent_addr.serialize()?);
+        buf.extend_from_slice(&self.total_file_size.to_le_bytes());
 
         buf.extend_from_slice(&self.mtime.to_le_bytes());
         buf.extend_from_slice(&self.ctime.to_le_bytes());
@@ -179,6 +182,8 @@ impl INode {
         let mut addr_start = 1;
         let extent_addr = MaybeU64::deserialize(data[addr_start..addr_start + 8].try_into()?);
         addr_start += 8;
+        let total_file_size = u64::from_le_bytes(data[addr_start..addr_start + 8].try_into()?);
+        addr_start += 8;
 
         let mtime = u64::from_le_bytes(data[addr_start..addr_start + 8].try_into()?);
         addr_start += 8;
@@ -188,6 +193,7 @@ impl INode {
 
         Ok(INode {
             kind,
+            total_file_size,
             mtime,
             ctime,
             utime,
@@ -196,7 +202,7 @@ impl INode {
     }
 
     pub fn serialized_size() -> usize {
-        1 + 8 + 8 + 8 + 8
+        1 + 8 + 8 + 8 + 8 + 8
     }
 }
 
@@ -452,6 +458,7 @@ impl BruteFS {
             ctime: utc_now_u64(),
             mtime: utc_now_u64(),
             utime: utc_now_u64(),
+            total_file_size: 0,
             extent_addr: MaybeU64::default(),
             kind: INodeKind::Directory,
         };
@@ -775,6 +782,7 @@ impl BruteFS {
         }
 
         tracing::debug!("Creating new file");
+        let file_size = data.len() as u64;
         let extent = Extent {
             next: MaybeU64::default(),
             data,
@@ -785,10 +793,13 @@ impl BruteFS {
             .write(extent_addr as usize, &extent.serialize()?)
             .await?;
 
+        println!("File size {filename} => {file_size} B");
+
         let inode = INode {
             ctime: utc_now_u64(),
             mtime: utc_now_u64(),
             utime: utc_now_u64(),
+            total_file_size: file_size,
             extent_addr: MaybeU64::from(extent_addr),
             kind: if is_symlink {
                 INodeKind::Symlink
@@ -834,6 +845,7 @@ impl BruteFS {
         &self,
         path: P,
         content: P,
+        opt: WriteOption,
     ) -> eyre::Result<()> {
         let _ = self.resolve_parent(content.clone()).await?;
         self.blob_write(
@@ -843,7 +855,7 @@ impl BruteFS {
             }
             .serialize(),
             true,
-            WriteOption { overwrite: true },
+            opt,
         )
         .await?;
 
@@ -892,6 +904,7 @@ impl BruteFS {
                 ctime: utc_now_u64(),
                 mtime: utc_now_u64(),
                 utime: utc_now_u64(),
+                total_file_size: 0,
                 extent_addr: MaybeU64::default(),
                 kind: INodeKind::Directory,
             };
@@ -1013,6 +1026,7 @@ impl BruteFS {
             let (_, inode) = self.get_root_inode().await?;
             return Ok(Some(EntryStat {
                 name: "/".to_string(),
+                size: None,
                 kind: inode.kind,
                 mtime: inode.mtime,
                 ctime: inode.ctime,
@@ -1027,6 +1041,10 @@ impl BruteFS {
 
         Ok(Some(EntryStat {
             name,
+            size: match inode.kind {
+                INodeKind::Directory => None,
+                _ => Some(inode.total_file_size as usize),
+            },
             kind: inode.kind,
             mtime: inode.mtime,
             ctime: inode.ctime,

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 
 use crate::{
-    bfs::BruteFS,
+    bfs::{BruteFS, WriteOption},
     device::{Device, fs_device::FsDevice, logical::LogicalDevice},
     disk::Controller,
 };
@@ -54,7 +54,8 @@ async fn main() -> eyre::Result<()> {
     bfs.mkdir("/hello/baz/bbb", true).await?;
     bfs.mkdir("/world", true).await?;
     // bfs.mkdir("/world".into(), true).await?;
-    bfs.create_link("/thelink", "/hello/baz/").await?;
+    bfs.create_link("/thelink", "/hello/baz/", WriteOption { overwrite: false })
+        .await?;
     for entry in bfs.ls("/hello/baz/").await? {
         println!("{entry}");
     }

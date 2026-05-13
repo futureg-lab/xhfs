@@ -9,6 +9,7 @@ pub fn test_basic_binary_serialization() -> eyre::Result<()> {
         let original = INode {
             kind: INodeKind::Symlink,
             extent_addr: MaybeU64::from(1234),
+            total_file_size: 42,
             mtime: 567845678,
             ctime: 123457523,
             utime: 444487844,

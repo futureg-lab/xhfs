@@ -36,7 +36,7 @@ async fn test_base_allocate_brutefs() -> eyre::Result<()> {
     );
 
     {
-        let offset = 16057; // header + root INode
+        let offset = 16065; // header + root INode
         let addr = bfs.allocate(100).await?;
         assert_eq!(addr, offset, "allocate init");
         let addr = bfs.allocate(4).await?;
@@ -133,10 +133,10 @@ async fn test_brutefs_core_ops() -> eyre::Result<()> {
 
     {
         assert_eq!(bfs.count_reusable_regions().await?, 10);
-        assert_eq!(bfs.get_header().await?.extent_freed.global_offset, 20020);
+        assert_eq!(bfs.get_header().await?.extent_freed.global_offset, 20052);
 
         let _ = bfs.allocate(535).await?; // slot is 536 => 535 taken + 1 left
-        assert_eq!(bfs.get_header().await?.extent_freed.global_offset, 20020);
+        assert_eq!(bfs.get_header().await?.extent_freed.global_offset, 20052);
         assert_eq!(
             bfs.count_reusable_regions().await?,
             10,
@@ -148,7 +148,7 @@ async fn test_brutefs_core_ops() -> eyre::Result<()> {
         let _ = bfs.allocate(10000).await?;
         assert_eq!(
             bfs.get_header().await?.extent_freed.global_offset,
-            30020,
+            30052,
             "largest known fragmented region is too small, fallback to bump allocator instead"
         );
     }
@@ -224,8 +224,18 @@ async fn test_brutefs_symlinks_and_stats() -> eyre::Result<()> {
     )
     .await?;
 
-    bfs.create_link("/file.link", "/many/entries/d.txt").await?;
-    bfs.create_link("/folder.link", "/many/entries").await?;
+    bfs.create_link(
+        "/file.link",
+        "/many/entries/d.txt",
+        WriteOption { overwrite: false },
+    )
+    .await?;
+    bfs.create_link(
+        "/folder.link",
+        "/many/entries",
+        WriteOption { overwrite: false },
+    )
+    .await?;
 
     assert_eq!(
         bfs.ls("/many/entries").await?,
@@ -237,13 +247,18 @@ async fn test_brutefs_symlinks_and_stats() -> eyre::Result<()> {
         bfs.fread("/file.link").await?
     );
 
+    let dtxt_stats = bfs.stats("/many/entries/d.txt").await?.unwrap();
+    let filelink_stats = bfs.stats("/file.link").await?.unwrap();
+    let folder_stats = bfs.stats("/many/entries").await?.unwrap();
+
     assert_eq!(
-        bfs.stats("/many/entries/d.txt").await?.unwrap().kind,
-        INodeKind::File,
-        "stats should work"
+        folder_stats.size, None,
+        "size not immediately calculated for folders"
     );
+    assert_eq!(dtxt_stats.kind, INodeKind::File, "stats should work");
+    assert_eq!(dtxt_stats.size, Some(5), "should give correct data size");
     assert_eq!(
-        bfs.stats("/file.link").await?.unwrap().kind,
+        filelink_stats.kind,
         INodeKind::Symlink,
         "stats should not resolve symlink"
     );
