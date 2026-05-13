@@ -12,6 +12,7 @@ pub mod addr;
 pub mod bfs;
 pub mod device;
 pub mod disk;
+pub mod utils;
 
 #[cfg(test)]
 mod tests;
@@ -53,9 +54,17 @@ async fn main() -> eyre::Result<()> {
     bfs.mkdir("/hello/baz/bbb", true).await?;
     bfs.mkdir("/world", true).await?;
     // bfs.mkdir("/world".into(), true).await?;
+    bfs.create_link("/thelink", "/hello/baz/").await?;
     for entry in bfs.ls("/hello/baz/").await? {
         println!("{entry}");
     }
+
+    for entry in bfs.ls("/thelink").await? {
+        println!("{entry}");
+    }
+
+    println!("{:?}", bfs.stats("/thelink").await?);
+    println!("{:?}", bfs.stats("/hello/baz/").await?);
 
     Ok(())
 }

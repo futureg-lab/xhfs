@@ -1,6 +1,6 @@
 use crate::{
     addr::MaybeU64,
-    bfs::{AddressSlot, BruteFS, WriteOption},
+    bfs::{AddressSlot, BruteFS, INodeKind, WriteOption},
     device::{
         Device,
         kv_device::{KVDevice, MemoryKV},
@@ -8,7 +8,7 @@ use crate::{
     },
     disk::Controller,
 };
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
 
 async fn create_simple_memory_brute_fs(capacity: usize) -> eyre::Result<BruteFS> {
@@ -74,20 +74,11 @@ async fn test_base_allocate_brutefs() -> eyre::Result<()> {
     Ok(())
 }
 
-#[allow(unused)]
-async fn print_ls<P: Into<PathBuf>>(p: P, bfs: BruteFS) -> eyre::Result<()> {
-    for entry in bfs.ls(p).await? {
-        println!("{entry}");
-    }
-    Ok(())
-}
-
 #[tokio::test]
-async fn test_base_fs_ops() -> eyre::Result<()> {
+async fn test_brutefs_core_ops() -> eyre::Result<()> {
     let bfs = create_simple_memory_brute_fs(128 * 1000 * 1000).await?;
 
-    assert!(bfs.mkdir("/", false).await? == true, "created new");
-    assert!(bfs.mkdir("/", false).await? == false, "exists already");
+    assert!(bfs.mkdir("/", false).await? == false, "root is not new");
 
     bfs.mkdir("/hello", true).await?;
     assert!(
@@ -99,6 +90,12 @@ async fn test_base_fs_ops() -> eyre::Result<()> {
     bfs.mkdir("/hello/bar", true).await?;
     bfs.mkdir("/hello/baz/aaa", true).await?;
     bfs.mkdir("/hello/baz/bbb", true).await?;
+    bfs.fwrite(
+        "/hello/baz/123.bin",
+        vec![1, 2, 3],
+        WriteOption { overwrite: false },
+    )
+    .await?;
     bfs.mkdir("/world", true).await?;
 
     {
@@ -113,7 +110,46 @@ async fn test_base_fs_ops() -> eyre::Result<()> {
         assert_eq!(bfs.ls("/world").await?, [] as [String; 0]);
         assert_eq!(
             bfs.ls("/hello/baz/").await?,
-            ["aaa".to_string(), "bbb".to_string()]
+            ["aaa".to_string(), "bbb".to_string(), "123.bin".to_string()]
+        );
+    }
+
+    {
+        assert_eq!(bfs.count_reusable_regions().await?, 5);
+        assert!(
+            bfs.unlink("/hello/baz").await.is_err(),
+            "cannot unlink nested path"
+        );
+        assert!(
+            bfs.unlink("/hello/baz/123.bin").await.is_ok(),
+            "unlink leaf file"
+        );
+        assert!(
+            bfs.unlink("/hello/baz/aaa").await.is_ok(),
+            "unlink leaf folder"
+        );
+        assert_eq!(bfs.ls("/hello/baz/").await?, ["bbb".to_string()]);
+    }
+
+    {
+        assert_eq!(bfs.count_reusable_regions().await?, 10);
+        assert_eq!(bfs.get_header().await?.extent_freed.global_offset, 20020);
+
+        let _ = bfs.allocate(535).await?; // slot is 536 => 535 taken + 1 left
+        assert_eq!(bfs.get_header().await?.extent_freed.global_offset, 20020);
+        assert_eq!(
+            bfs.count_reusable_regions().await?,
+            10,
+            "hit a known fragmented region but did a split instead, leaving count unchanged"
+        );
+
+        // let _ = bfs.allocate(1).await?; // will most likely pick other slots not the remaining split
+
+        let _ = bfs.allocate(10000).await?;
+        assert_eq!(
+            bfs.get_header().await?.extent_freed.global_offset,
+            30020,
+            "largest known fragmented region is too small, fallback to bump allocator instead"
         );
     }
 
@@ -158,17 +194,59 @@ async fn test_base_fs_ops() -> eyre::Result<()> {
         )
         .await?;
 
+        // also prove dir entry remap works fine
         assert_eq!(
             data1,
             String::from_utf8(bfs.fread("/hello/baz/bbb/content1.txt").await?).unwrap(),
-            "reading written content 1"
+            "reading written content 1 HAS changed"
         );
         assert_eq!(
             data2,
             String::from_utf8(bfs.fread("/hello/baz/bbb/content2.txt").await?).unwrap(),
-            "reading written content 2 has unchanged"
+            "reading written content 2 remains unchanged"
         );
     }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_brutefs_symlinks_and_stats() -> eyre::Result<()> {
+    let bfs = create_simple_memory_brute_fs(128 * 1000 * 1000).await?;
+
+    bfs.mkdir("/many/entries/a", true).await?;
+    bfs.mkdir("/many/entries/b", true).await?;
+    bfs.mkdir("/many/entries/c", true).await?;
+    bfs.fwrite(
+        "/many/entries/d.txt",
+        "HELLO".as_bytes().to_vec(),
+        WriteOption { overwrite: false },
+    )
+    .await?;
+
+    bfs.create_link("/file.link", "/many/entries/d.txt").await?;
+    bfs.create_link("/folder.link", "/many/entries").await?;
+
+    assert_eq!(
+        bfs.ls("/many/entries").await?,
+        bfs.ls("/folder.link").await?
+    );
+
+    assert_eq!(
+        bfs.fread("/many/entries/d.txt").await?,
+        bfs.fread("/file.link").await?
+    );
+
+    assert_eq!(
+        bfs.stats("/many/entries/d.txt").await?.unwrap().kind,
+        INodeKind::File,
+        "stats should work"
+    );
+    assert_eq!(
+        bfs.stats("/file.link").await?.unwrap().kind,
+        INodeKind::Symlink,
+        "stats should not resolve symlink"
+    );
 
     Ok(())
 }

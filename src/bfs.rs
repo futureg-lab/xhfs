@@ -1,10 +1,12 @@
-use crate::{addr::MaybeU64, disk::Controller};
-use eyre::Context;
-use std::{
-    fmt::Debug,
-    path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+use crate::{
+    addr::MaybeU64,
+    disk::Controller,
+    utils::{join_absolute, normalize_path, path_to_string_list, u64_to_utc_datetime, utc_now_u64},
 };
+use async_recursion::async_recursion;
+use eyre::Context;
+use std::{fmt::Debug, path::PathBuf};
+use tokio::sync::Mutex;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum INodeKind {
@@ -25,6 +27,15 @@ pub struct INode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntryStat {
+    pub name: String,
+    pub kind: INodeKind,
+    pub mtime: u64,
+    pub ctime: u64,
+    pub utime: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Extent {
     /// 0 coerces to None
     pub next: MaybeU64,
@@ -34,6 +45,11 @@ pub struct Extent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Directory {
     pub entries: Vec<(String, u64)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymLink {
+    pub path: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -62,6 +78,7 @@ pub struct BruteFsHeader {
 
 pub struct BruteFS {
     header_size: usize,
+    alloc_guard: Mutex<()>,
     ctrl: Controller,
 }
 
@@ -91,7 +108,7 @@ impl INodeKind {
 impl Extent {
     pub fn serialize(&self) -> eyre::Result<Vec<u8>> {
         let mut buf = Vec::with_capacity(self.serialized_size());
-        buf.extend_from_slice(&self.data.len().to_le_bytes());
+        buf.extend_from_slice(&(self.data.len() as u64).to_le_bytes());
         buf.extend_from_slice(&self.next.serialize()?);
         buf.extend(&self.data);
 
@@ -260,6 +277,19 @@ impl Directory {
     }
 }
 
+impl SymLink {
+    pub fn serialize(&self) -> Vec<u8> {
+        normalize_path(self.path.clone()).as_bytes().to_vec()
+    }
+
+    pub fn deserialize(data: &[u8]) -> eyre::Result<Self> {
+        let path = String::from_utf8(data.try_into()?).wrap_err_with(|| eyre::eyre!("dsads"))?;
+        Ok(Self {
+            path: PathBuf::from(path),
+        })
+    }
+}
+
 impl AddressVector {
     pub fn allocate(count: usize) -> Self {
         AddressVector {
@@ -369,7 +399,11 @@ pub struct WriteOption {
 impl BruteFS {
     pub async fn from_formatted(ctrl: Controller) -> eyre::Result<Self> {
         let header_size = Self::header_template().serialize()?.len();
-        let bfs = Self { header_size, ctrl };
+        let bfs = Self {
+            header_size,
+            ctrl,
+            alloc_guard: Mutex::new(()),
+        };
         bfs.ensure_headers().await?;
         Ok(bfs)
     }
@@ -384,12 +418,7 @@ impl BruteFS {
         );
         tracing::debug!(
             "- Total known fragments: {}",
-            header
-                .extent_freed
-                .items
-                .iter()
-                .filter(|it| !it.is_free())
-                .count()
+            self.count_reusable_regions().await?
         );
 
         let capacity = self.total_capacity()?;
@@ -454,7 +483,14 @@ impl BruteFS {
         ))
     }
 
+    /// By design, a single instance mounts/owns the file system
+    /// so 'clients' will have to interface ops through that instance.
+    ///
+    /// This avoids implementing a busy flag or some crazy lock mechanism on disk
+    /// especially since locks themselves expect their implementations to be even more atomic.
     pub async fn allocate(&self, wanted_size: usize) -> eyre::Result<u64> {
+        let _ = self.alloc_guard.lock().await;
+
         tracing::debug!("Trying to allocate {wanted_size}");
         let header_raw = self.ctrl.read(0, self.header_size).await?;
         let mut header = BruteFsHeader::deserialize(&header_raw)?;
@@ -462,20 +498,18 @@ impl BruteFS {
         // TODO:
         // can be done faster with offset and online scan
         // (reusing the deserialize for loop code for AddressVector)
-
         // try reusing freed and potentially fragmented region first
         let mut addr_to_reuse = None;
 
         for slot in header.extent_freed.items.iter_mut() {
             if let Some(free_addr) = slot.addr.to_optional() {
                 if wanted_size <= slot.capacity {
-                    tracing::debug!("Found free slot at 0x{free_addr:x}");
-
+                    tracing::debug!("Found free slot at 0x{free_addr}");
                     addr_to_reuse = Some(free_addr);
 
                     let new_start = free_addr + wanted_size as u64;
                     let new_capacity = slot.capacity - wanted_size;
-                    tracing::debug!("Split space left at 0x{new_start:x} of size {new_capacity}");
+                    tracing::debug!("Split space left at 0x{new_start} of size {new_capacity}");
 
                     *slot = AddressSlot {
                         addr: if new_capacity == 0 {
@@ -521,18 +555,14 @@ impl BruteFS {
     async fn resolve_path<P: Into<PathBuf>>(&self, path: P) -> eyre::Result<(u64, INode)> {
         let path: PathBuf = path.into();
         tracing::debug!("Resolving {path:?}");
-        let components = path
-            .components()
-            .map(|c| c.as_os_str().to_string_lossy().to_string())
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>();
+        let components = path_to_string_list(path);
 
         let (mut inode_addr, mut inode) = self.get_root_inode().await?;
         if components.is_empty() {
             return Ok((inode_addr, inode));
         }
 
-        for component in components {
+        for (i, component) in components.iter().enumerate() {
             match inode.kind {
                 INodeKind::Directory => {
                     tracing::debug!(" > Enter dir {component}");
@@ -540,14 +570,14 @@ impl BruteFS {
                     let directory = Directory::deserialize(&payload)?;
                     let mut found = None;
                     for (name, child_addr) in directory.entries {
-                        if name == component {
+                        if name.eq(component) {
                             found = Some(child_addr);
                             break;
                         }
                     }
 
                     let child_addr = found.ok_or_else(|| {
-                        eyre::eyre!("Path component '{component}' does not exist")
+                        eyre::eyre!("Path '{}' does not exist", join_absolute(&components[..=i]))
                     })?;
                     inode_addr = child_addr;
                     inode = INode::deserialize(
@@ -558,10 +588,16 @@ impl BruteFS {
                     )?;
                 }
                 INodeKind::File => {
-                    eyre::bail!("Encountered file while traversing path");
+                    eyre::bail!(
+                        "Encountered file while traversing path '{}'",
+                        join_absolute(&components[..=i])
+                    );
                 }
                 INodeKind::Symlink => {
-                    todo!()
+                    eyre::bail!(
+                        "Encountered a symbolic link while traversing path '{}'",
+                        join_absolute(&components[..=i])
+                    );
                 }
             }
         }
@@ -569,7 +605,11 @@ impl BruteFS {
         Ok((inode_addr, inode))
     }
 
-    async fn resolve_parent(&self, path: &Path) -> eyre::Result<(u64, INode, String)> {
+    async fn resolve_parent<P: Into<PathBuf>>(
+        &self,
+        path: P,
+    ) -> eyre::Result<(u64, INode, String)> {
+        let path: PathBuf = path.into();
         tracing::debug!("Resolving parent of {path:?}");
         let parent = path.parent().ok_or_else(|| eyre::eyre!("Missing parent"))?;
         let filename = path
@@ -581,8 +621,10 @@ impl BruteFS {
         Ok((addr, inode, filename))
     }
 
+    #[async_recursion(?Send)]
     pub async fn ls<P: Into<PathBuf>>(&self, path: P) -> eyre::Result<Vec<String>> {
-        let (_, inode) = self.resolve_path(path).await?;
+        let path: PathBuf = path.into();
+        let (_, inode) = self.resolve_path(&path).await?;
         match inode.kind {
             INodeKind::Directory => {
                 let payload = self.read_full_data_from_extent(inode.extent_addr).await?;
@@ -597,15 +639,93 @@ impl BruteFS {
                 eyre::bail!("Cannot ls a file");
             }
             INodeKind::Symlink => {
-                todo!()
+                tracing::debug!("Trying to list dir entries from symlink");
+                let raw_path = self.read_full_data_from_extent(inode.extent_addr).await?;
+                let symlink = SymLink::deserialize(&raw_path)?;
+                tracing::debug!(
+                    " {} *=> {}",
+                    normalize_path(&path),
+                    normalize_path(&symlink.path)
+                );
+                if symlink.path == path {
+                    tracing::warn!("Invalid fs state: Symlink pointing to itself detected");
+                    eyre::bail!("Symlink pointing to itself detected");
+                }
+                self.ls(symlink.path).await
             }
         }
     }
 
-    pub async fn fwrite<P: Into<PathBuf>>(
+    pub async fn unlink<P: Into<PathBuf>>(&self, path: P) -> eyre::Result<()> {
+        let path: PathBuf = path.into();
+        let (parent_addr, mut parent_inode, filename) = self.resolve_parent(&path).await?;
+        let payload = self
+            .read_full_data_from_extent(parent_inode.extent_addr)
+            .await?;
+
+        let mut directory = Directory::deserialize(&payload)?;
+        let entry_index = directory
+            .entries
+            .iter()
+            .position(|(name, _)| name == &filename)
+            .ok_or_else(|| eyre::eyre!("Path does not exist"))?;
+
+        let (_, inode_addr) = directory.entries.remove(entry_index);
+        let inode = INode::deserialize(
+            &self
+                .ctrl
+                .read(inode_addr as usize, INode::serialized_size())
+                .await?,
+        )?;
+
+        match inode.kind {
+            INodeKind::File | INodeKind::Symlink => {
+                self.free_full_extent(inode.extent_addr).await?;
+            }
+            INodeKind::Directory => {
+                let dir_payload = self.read_full_data_from_extent(inode.extent_addr).await?;
+                let dir = Directory::deserialize(&dir_payload)?;
+                if !dir.entries.is_empty() {
+                    eyre::bail!("Directory is not empty");
+                }
+
+                self.free_full_extent(inode.extent_addr).await?;
+            }
+        }
+
+        self.mark_as_reusable(AddressSlot {
+            addr: MaybeU64::from(inode_addr),
+            capacity: INode::serialized_size(),
+        })
+        .await?;
+
+        tracing::debug!("Rewrite parent directory entries");
+        self.free_full_extent(parent_inode.extent_addr).await?;
+
+        let new_dir_extent = Extent {
+            next: MaybeU64::default(),
+            data: directory.serialize()?,
+        };
+        let new_dir_extent_addr = self.allocate(new_dir_extent.serialized_size()).await?;
+        self.ctrl
+            .write(new_dir_extent_addr as usize, &new_dir_extent.serialize()?)
+            .await?;
+
+        parent_inode.extent_addr = MaybeU64::from(new_dir_extent_addr);
+        parent_inode.mtime = utc_now_u64();
+
+        self.ctrl
+            .write(parent_addr as usize, &parent_inode.serialize()?)
+            .await?;
+
+        Ok(())
+    }
+
+    async fn blob_write<P: Into<PathBuf>>(
         &self,
         path: P,
         data: Vec<u8>,
+        is_symlink: bool,
         opt: WriteOption,
     ) -> eyre::Result<()> {
         let path: PathBuf = path.into();
@@ -615,9 +735,9 @@ impl BruteFS {
             .await?;
 
         let mut directory = Directory::deserialize(&payload)?;
-
-        // existing?
+        let mut walked = vec![];
         for (name, inode_addr) in &directory.entries {
+            walked.push(name.to_string());
             if name == &filename {
                 let mut inode = INode::deserialize(
                     &self
@@ -626,9 +746,9 @@ impl BruteFS {
                         .await?,
                 )?;
                 match inode.kind {
-                    INodeKind::File => {
+                    INodeKind::File | INodeKind::Symlink => {
                         if !opt.overwrite {
-                            eyre::bail!("File already exists");
+                            eyre::bail!("File '{}' already exists", join_absolute(&walked));
                         }
 
                         self.free_full_extent(inode.extent_addr).await?;
@@ -649,7 +769,7 @@ impl BruteFS {
                             .await?;
                         return Ok(());
                     }
-                    _ => eyre::bail!("Path is not file"),
+                    _ => eyre::bail!("Path '{}' is not file", join_absolute(&walked)),
                 }
             }
         }
@@ -670,7 +790,11 @@ impl BruteFS {
             mtime: utc_now_u64(),
             utime: utc_now_u64(),
             extent_addr: MaybeU64::from(extent_addr),
-            kind: INodeKind::File,
+            kind: if is_symlink {
+                INodeKind::Symlink
+            } else {
+                INodeKind::File
+            },
         };
         let inode_addr = self.allocate(INode::serialized_size()).await?;
         self.ctrl
@@ -697,18 +821,41 @@ impl BruteFS {
         Ok(())
     }
 
+    pub async fn fwrite<P: Into<PathBuf>>(
+        &self,
+        path: P,
+        data: Vec<u8>,
+        opt: WriteOption,
+    ) -> eyre::Result<()> {
+        self.blob_write(path, data, false, opt).await
+    }
+
+    pub async fn create_link<P: Into<PathBuf> + Clone>(
+        &self,
+        path: P,
+        content: P,
+    ) -> eyre::Result<()> {
+        let _ = self.resolve_parent(content.clone()).await?;
+        self.blob_write(
+            path,
+            SymLink {
+                path: content.into(),
+            }
+            .serialize(),
+            true,
+            WriteOption { overwrite: true },
+        )
+        .await?;
+
+        Ok(())
+    }
+
     pub async fn mkdir<P: Into<PathBuf>>(&self, path: P, recursive: bool) -> eyre::Result<bool> {
-        let components = path
-            .into()
-            .components()
-            .map(|c| c.as_os_str().to_string_lossy().to_string())
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>();
-        let last_comp_idx = components.len() - 1;
+        let components = path_to_string_list(path);
 
         let mut created_new = false;
         let (mut curr_addr, mut curr_inode) = self.get_root_inode().await?;
-        for (i, component) in components.into_iter().enumerate() {
+        for component in components.into_iter() {
             match curr_inode.kind {
                 INodeKind::Directory => {}
                 _ => eyre::bail!("Non-directory in mkdir path"),
@@ -736,7 +883,7 @@ impl BruteFS {
                 )?;
                 continue;
             }
-            if !recursive && i != last_comp_idx {
+            if !recursive {
                 eyre::bail!("Directory '{component}' does not exist");
             }
 
@@ -793,15 +940,29 @@ impl BruteFS {
         Ok(created_new)
     }
 
+    #[async_recursion(?Send)]
     pub async fn fread<P: Into<PathBuf>>(&self, path: P) -> eyre::Result<Vec<u8>> {
-        let (_, inode) = self.resolve_path(path).await?;
+        let path: PathBuf = path.into();
+        let (_, inode) = self.resolve_path(&path).await?;
         match inode.kind {
             INodeKind::File => self.read_full_data_from_extent(inode.extent_addr).await,
             INodeKind::Directory => {
                 eyre::bail!("Cannot fread directory");
             }
             INodeKind::Symlink => {
-                todo!()
+                tracing::debug!("Trying to read file from symlink");
+                let raw_path = self.read_full_data_from_extent(inode.extent_addr).await?;
+                let symlink = SymLink::deserialize(&raw_path)?;
+                tracing::debug!(
+                    " {} *=> {}",
+                    normalize_path(&path),
+                    normalize_path(&symlink.path)
+                );
+                if symlink.path == path {
+                    tracing::warn!("Invalid fs state: Symlink pointing to itself detected");
+                    eyre::bail!("Symlink pointing to itself detected");
+                }
+                self.fread(symlink.path).await
             }
         }
     }
@@ -819,7 +980,7 @@ impl BruteFS {
 
     pub async fn mark_as_reusable(&self, new_slot_value: AddressSlot) -> eyre::Result<()> {
         tracing::debug!(
-            "Marking slot {:x} of size {} as reusable",
+            "Marking slot 0x{:x} of size {} as reusable",
             new_slot_value.addr.get(),
             new_slot_value.capacity
         );
@@ -840,8 +1001,51 @@ impl BruteFS {
         return Ok(());
     }
 
+    pub async fn exists<P: Into<PathBuf>>(&self, path: P) -> eyre::Result<bool> {
+        Ok(self.stats(path).await?.is_some())
+    }
+
+    pub async fn stats<P: Into<PathBuf>>(&self, path: P) -> eyre::Result<Option<EntryStat>> {
+        let path: PathBuf = path.into();
+        let components = path_to_string_list(path.clone());
+
+        if components.is_empty() {
+            let (_, inode) = self.get_root_inode().await?;
+            return Ok(Some(EntryStat {
+                name: "/".to_string(),
+                kind: inode.kind,
+                mtime: inode.mtime,
+                ctime: inode.ctime,
+                utime: inode.utime,
+            }));
+        }
+        let (_, inode) = match self.resolve_path(path).await {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
+        };
+        let name = components.last().unwrap().clone();
+
+        Ok(Some(EntryStat {
+            name,
+            kind: inode.kind,
+            mtime: inode.mtime,
+            ctime: inode.ctime,
+            utime: inode.utime,
+        }))
+    }
+
+    pub async fn count_reusable_regions(&self) -> eyre::Result<usize> {
+        let header = self.get_header().await?;
+        return Ok(header
+            .extent_freed
+            .items
+            .iter()
+            .filter(|slot| !slot.is_free())
+            .count());
+    }
+
     pub async fn free_full_extent(&self, start_extent_addr: MaybeU64) -> eyre::Result<()> {
-        tracing::debug!("Freeing extent at {:x}", start_extent_addr.get());
+        tracing::debug!("Freeing extent at 0x{:x}", start_extent_addr.get());
         let mut addr = start_extent_addr;
         while let Some(next_addr) = addr.to_optional() {
             let extent = self.read_extent(next_addr).await?;
@@ -902,22 +1106,11 @@ impl BruteFS {
         let mut data = vec![];
         let mut addr = addr;
         while let Some(next_addr) = addr.to_optional() {
-            tracing::debug!("Resolving extent {next_addr:x}");
+            tracing::debug!("Resolving extent 0x{next_addr:x}");
             let extent = self.read_extent(next_addr).await?;
             addr = extent.next;
             data.extend(extent.data);
         }
         Ok(data)
     }
-}
-
-fn utc_now_u64() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("Time went backwards")
-        .as_secs()
-}
-
-fn u64_to_utc_datetime(timestamp: u64) -> chrono::DateTime<chrono::Utc> {
-    chrono::DateTime::<chrono::Utc>::from_timestamp(timestamp as i64, 0).expect("Invalid timestamp")
 }
