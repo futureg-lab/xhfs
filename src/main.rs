@@ -8,6 +8,7 @@ use crate::{
     disk::Controller,
 };
 
+pub mod addr;
 pub mod bfs;
 pub mod device;
 pub mod disk;
@@ -18,7 +19,7 @@ mod tests;
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
     let env_filter = EnvFilter::try_from_default_env()
-        .or_else(|_| EnvFilter::try_new("brutefs=DEBUG"))
+        .or_else(|_| EnvFilter::try_new("brutefs=WARN"))
         .unwrap();
 
     tracing_subscriber::fmt()
@@ -41,11 +42,20 @@ async fn main() -> eyre::Result<()> {
     let ctrl = Controller::from([dev1, dev2]).await?;
     println!("Total size {:?}", ctrl.total_capacity());
 
-    let mut bfs = BruteFS::new(ctrl)?;
-    bfs.format().await?;
-
-    // println!("from header {}", bfs.header.last_free_offset);
-    // println!("from memory {}", bfs.get_last_free_offset().await?);
+    let bfs = BruteFS::format_new(ctrl).await?;
+    println!("Root {:?}", bfs.get_root_inode().await?);
+    bfs.mkdir("/", true).await?;
+    println!("----");
+    bfs.mkdir("/hello", true).await?;
+    bfs.mkdir("/hello/foo", true).await?;
+    bfs.mkdir("/hello/bar", true).await?;
+    bfs.mkdir("/hello/baz/aaa", true).await?;
+    bfs.mkdir("/hello/baz/bbb", true).await?;
+    bfs.mkdir("/world", true).await?;
+    // bfs.mkdir("/world".into(), true).await?;
+    for entry in bfs.ls("/hello/baz/").await? {
+        println!("{entry}");
+    }
 
     Ok(())
 }

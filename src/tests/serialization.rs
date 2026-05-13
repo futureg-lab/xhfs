@@ -1,5 +1,6 @@
-use crate::bfs::{
-    AddressSlot, AddressVector, BruteFsHeader, Directory, Extent, INode, INodeKind, MaybeU64,
+use crate::{
+    addr::MaybeU64,
+    bfs::{AddressSlot, AddressVector, BruteFsHeader, Directory, Extent, INode, INodeKind},
 };
 
 #[test]
@@ -7,7 +8,7 @@ pub fn test_basic_binary_serialization() -> eyre::Result<()> {
     {
         let original = INode {
             kind: INodeKind::Symlink,
-            extent_addr: MaybeU64::Some(1234),
+            extent_addr: MaybeU64::from(1234),
             mtime: 567845678,
             ctime: 123457523,
             utime: 444487844,
@@ -19,12 +20,20 @@ pub fn test_basic_binary_serialization() -> eyre::Result<()> {
 
     {
         let original = Extent {
-            next: MaybeU64::Some(1234),
+            next: MaybeU64::from(1234),
+            data: vec![],
+        };
+        let data = original.serialize()?;
+        let reconstr = Extent::deserialize(&data)?;
+        assert_eq!(original, reconstr, "Extent serde 1");
+
+        let original = Extent {
+            next: MaybeU64::from(1234),
             data: vec![1, 2, 3, 4, 5, 6, 7, 8, 9],
         };
         let data = original.serialize()?;
         let reconstr = Extent::deserialize(&data)?;
-        assert_eq!(original, reconstr, "Extent serde");
+        assert_eq!(original, reconstr, "Extent serde 2");
     }
 
     {
@@ -51,11 +60,11 @@ pub fn test_basic_binary_serialization() -> eyre::Result<()> {
             extent_freed: AddressVector::allocate(11),
         };
         original.extent_freed.items[5] = AddressSlot {
-            addr: MaybeU64::Some(1234),
+            addr: MaybeU64::from(1234),
             capacity: 444,
         };
         original.extent_freed.items[10] = AddressSlot {
-            addr: MaybeU64::Some(234567),
+            addr: MaybeU64::from(234567),
             capacity: 4567112234,
         };
 

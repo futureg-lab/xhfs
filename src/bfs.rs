@@ -1,6 +1,7 @@
-use crate::disk::Controller;
+use crate::{addr::MaybeU64, disk::Controller};
 use eyre::Context;
 use std::{
+    fmt::Debug,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -10,12 +11,6 @@ pub enum INodeKind {
     File,
     Directory,
     Symlink,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MaybeU64 {
-    Some(u64),
-    None,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +40,12 @@ pub struct Directory {
 pub struct AddressSlot {
     pub addr: MaybeU64,
     pub capacity: usize,
+}
+
+impl AddressSlot {
+    pub fn is_free(&self) -> bool {
+        self.addr.is_none()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,54 +83,8 @@ impl INodeKind {
         })
     }
 
-    pub fn serialized_size(&self) -> usize {
+    pub fn serialized_size() -> usize {
         1
-    }
-}
-
-impl Default for MaybeU64 {
-    fn default() -> Self {
-        MaybeU64::None
-    }
-}
-
-impl MaybeU64 {
-    pub fn get(&self) -> u64 {
-        match self {
-            MaybeU64::Some(addr) => *addr,
-            MaybeU64::None => 0,
-        }
-    }
-
-    pub fn from(addr: u64) -> Self {
-        match addr {
-            0 => Self::None,
-            _ => Self::Some(addr),
-        }
-    }
-
-    pub fn serialize(&self) -> eyre::Result<Vec<u8>> {
-        Ok(match self {
-            MaybeU64::Some(addr) => {
-                if *addr == 0 {
-                    eyre::bail!("address cannot be both existing and be 0")
-                }
-                addr.to_le_bytes().to_vec()
-            }
-            MaybeU64::None => 0u64.to_le_bytes().to_vec(),
-        })
-    }
-
-    pub fn deserialize(data: [u8; 8]) -> MaybeU64 {
-        let addr = u64::from_le_bytes(data).try_into().unwrap();
-        match addr {
-            0 => MaybeU64::None,
-            _ => MaybeU64::Some(addr),
-        }
-    }
-
-    pub fn serialized_size(&self) -> usize {
-        8
     }
 }
 
@@ -275,9 +230,9 @@ impl Directory {
     }
 
     pub fn deserialize(data: &[u8]) -> eyre::Result<Self> {
-        // if data.is_empty() {
-        //     return Ok(Directory { entries: vec![] });
-        // }
+        if data.is_empty() {
+            return Ok(Directory { entries: vec![] });
+        }
 
         let expected_size = 8;
         let incoming_size = data.len();
@@ -408,15 +363,51 @@ impl BruteFsHeader {
 
 #[derive(Debug, Clone, Default)]
 pub struct WriteOption {
-    overwrite: bool,
+    pub overwrite: bool,
 }
 
 impl BruteFS {
-    pub fn new(ctrl: Controller) -> eyre::Result<Self> {
-        Ok(Self {
-            ctrl,
-            header_size: Self::header_template().serialize()?.len(),
-        })
+    pub async fn from_formatted(ctrl: Controller) -> eyre::Result<Self> {
+        let header_size = Self::header_template().serialize()?.len();
+        let bfs = Self { header_size, ctrl };
+        bfs.ensure_headers().await?;
+        Ok(bfs)
+    }
+
+    pub async fn ensure_headers(&self) -> eyre::Result<()> {
+        let header = self.get_header().await?;
+        tracing::debug!("brutefs version: {}", header.version);
+        tracing::debug!(
+            "- Current global offset: {} (0x{:x})",
+            header.extent_freed.global_offset,
+            header.extent_freed.global_offset,
+        );
+        tracing::debug!(
+            "- Total known fragments: {}",
+            header
+                .extent_freed
+                .items
+                .iter()
+                .filter(|it| !it.is_free())
+                .count()
+        );
+
+        let capacity = self.total_capacity()?;
+        tracing::debug!("Capacity: {capacity}");
+
+        let (ioffset, inode) = self.get_root_inode().await?;
+        tracing::debug!("Root inode offset {ioffset} (0x{ioffset:x})");
+        tracing::debug!("- Kind: {:?}", inode.kind);
+        tracing::debug!("- Creation time: {}", u64_to_utc_datetime(inode.ctime));
+        tracing::debug!("- Modification time: {}", u64_to_utc_datetime(inode.mtime));
+        tracing::debug!("- Update time: {}", u64_to_utc_datetime(inode.utime));
+        tracing::debug!(
+            "- Immediate Extent address: {} (0x{:x})",
+            inode.extent_addr.get(),
+            inode.extent_addr.get()
+        );
+
+        Ok(())
     }
 
     fn header_template() -> BruteFsHeader {
@@ -426,23 +417,24 @@ impl BruteFS {
         }
     }
 
-    pub async fn format(&mut self) -> eyre::Result<()> {
+    pub async fn format_new(ctrl: Controller) -> eyre::Result<Self> {
+        let header_size = Self::header_template().serialize()?.len();
         let root = INode {
             ctime: utc_now_u64(),
             mtime: utc_now_u64(),
             utime: utc_now_u64(),
-            extent_addr: MaybeU64::None,
+            extent_addr: MaybeU64::default(),
             kind: INodeKind::Directory,
         };
 
         let root_raw = root.serialize()?;
-        self.ctrl.write(self.header_size, &root_raw).await?;
+        ctrl.write(header_size, &root_raw).await?;
 
         let mut header = Self::header_template();
-        header.extent_freed.global_offset = (self.header_size + root_raw.len()) as u64;
-        self.ctrl.write(0, &header.serialize()?).await?;
+        header.extent_freed.global_offset = (header_size + root_raw.len()) as u64;
+        ctrl.write(0, &header.serialize()?).await?;
 
-        Ok(())
+        Self::from_formatted(ctrl).await
     }
 
     pub async fn get_header(&self) -> eyre::Result<BruteFsHeader> {
@@ -463,6 +455,7 @@ impl BruteFS {
     }
 
     pub async fn allocate(&self, wanted_size: usize) -> eyre::Result<u64> {
+        tracing::debug!("Trying to allocate {wanted_size}");
         let header_raw = self.ctrl.read(0, self.header_size).await?;
         let mut header = BruteFsHeader::deserialize(&header_raw)?;
 
@@ -474,17 +467,21 @@ impl BruteFS {
         let mut addr_to_reuse = None;
 
         for slot in header.extent_freed.items.iter_mut() {
-            if let MaybeU64::Some(free_addr) = slot.addr {
+            if let Some(free_addr) = slot.addr.to_optional() {
                 if wanted_size <= slot.capacity {
+                    tracing::debug!("Found free slot at 0x{free_addr:x}");
+
                     addr_to_reuse = Some(free_addr);
 
                     let new_start = free_addr + wanted_size as u64;
                     let new_capacity = slot.capacity - wanted_size;
+                    tracing::debug!("Split space left at 0x{new_start:x} of size {new_capacity}");
+
                     *slot = AddressSlot {
                         addr: if new_capacity == 0 {
-                            MaybeU64::None
+                            MaybeU64::default()
                         } else {
-                            MaybeU64::Some(new_start)
+                            MaybeU64::from(new_start)
                         },
                         capacity: new_capacity,
                     };
@@ -521,7 +518,9 @@ impl BruteFS {
             .ok_or_else(|| eyre::eyre!("File system controller not ready"))
     }
 
-    async fn resolve_path(&self, path: &Path) -> eyre::Result<(u64, INode)> {
+    async fn resolve_path<P: Into<PathBuf>>(&self, path: P) -> eyre::Result<(u64, INode)> {
+        let path: PathBuf = path.into();
+        tracing::debug!("Resolving {path:?}");
         let components = path
             .components()
             .map(|c| c.as_os_str().to_string_lossy().to_string())
@@ -536,6 +535,7 @@ impl BruteFS {
         for component in components {
             match inode.kind {
                 INodeKind::Directory => {
+                    tracing::debug!(" > Enter dir {component}");
                     let payload = self.read_full_data_from_extent(inode.extent_addr).await?;
                     let directory = Directory::deserialize(&payload)?;
                     let mut found = None;
@@ -547,7 +547,7 @@ impl BruteFS {
                     }
 
                     let child_addr = found.ok_or_else(|| {
-                        eyre::eyre!("Path component '{}' does not exist", component)
+                        eyre::eyre!("Path component '{component}' does not exist")
                     })?;
                     inode_addr = child_addr;
                     inode = INode::deserialize(
@@ -570,6 +570,7 @@ impl BruteFS {
     }
 
     async fn resolve_parent(&self, path: &Path) -> eyre::Result<(u64, INode, String)> {
+        tracing::debug!("Resolving parent of {path:?}");
         let parent = path.parent().ok_or_else(|| eyre::eyre!("Missing parent"))?;
         let filename = path
             .file_name()
@@ -580,8 +581,8 @@ impl BruteFS {
         Ok((addr, inode, filename))
     }
 
-    pub async fn ls(&self, path: PathBuf) -> eyre::Result<Vec<String>> {
-        let (_, inode) = self.resolve_path(&path).await?;
+    pub async fn ls<P: Into<PathBuf>>(&self, path: P) -> eyre::Result<Vec<String>> {
+        let (_, inode) = self.resolve_path(path).await?;
         match inode.kind {
             INodeKind::Directory => {
                 let payload = self.read_full_data_from_extent(inode.extent_addr).await?;
@@ -601,7 +602,13 @@ impl BruteFS {
         }
     }
 
-    pub async fn fwrite(&self, path: PathBuf, data: Vec<u8>, opt: WriteOption) -> eyre::Result<()> {
+    pub async fn fwrite<P: Into<PathBuf>>(
+        &self,
+        path: P,
+        data: Vec<u8>,
+        opt: WriteOption,
+    ) -> eyre::Result<()> {
+        let path: PathBuf = path.into();
         let (parent_addr, mut parent_inode, filename) = self.resolve_parent(&path).await?;
         let payload = self
             .read_full_data_from_extent(parent_inode.extent_addr)
@@ -627,7 +634,7 @@ impl BruteFS {
                         self.free_full_extent(inode.extent_addr).await?;
 
                         let extent = Extent {
-                            next: MaybeU64::None,
+                            next: MaybeU64::default(),
                             data,
                         };
                         let extent_addr = self.allocate(extent.serialized_size()).await?;
@@ -635,7 +642,7 @@ impl BruteFS {
                         self.ctrl
                             .write(extent_addr as usize, &extent.serialize()?)
                             .await?;
-                        inode.extent_addr = MaybeU64::Some(extent_addr);
+                        inode.extent_addr = MaybeU64::from(extent_addr);
                         inode.mtime = utc_now_u64();
                         self.ctrl
                             .write(*inode_addr as usize, &inode.serialize()?)
@@ -647,9 +654,9 @@ impl BruteFS {
             }
         }
 
-        // create new file
+        tracing::debug!("Creating new file");
         let extent = Extent {
-            next: MaybeU64::None,
+            next: MaybeU64::default(),
             data,
         };
 
@@ -662,7 +669,7 @@ impl BruteFS {
             ctime: utc_now_u64(),
             mtime: utc_now_u64(),
             utime: utc_now_u64(),
-            extent_addr: MaybeU64::Some(extent_addr),
+            extent_addr: MaybeU64::from(extent_addr),
             kind: INodeKind::File,
         };
         let inode_addr = self.allocate(INode::serialized_size()).await?;
@@ -674,14 +681,14 @@ impl BruteFS {
         self.free_full_extent(parent_inode.extent_addr).await?;
 
         let new_dir_extent = Extent {
-            next: MaybeU64::None,
+            next: MaybeU64::default(),
             data: directory.serialize()?,
         };
         let new_dir_extent_addr = self.allocate(new_dir_extent.serialized_size()).await?;
         self.ctrl
             .write(new_dir_extent_addr as usize, &new_dir_extent.serialize()?)
             .await?;
-        parent_inode.extent_addr = MaybeU64::Some(new_dir_extent_addr);
+        parent_inode.extent_addr = MaybeU64::from(new_dir_extent_addr);
 
         self.ctrl
             .write(parent_addr as usize, &parent_inode.serialize()?)
@@ -690,15 +697,18 @@ impl BruteFS {
         Ok(())
     }
 
-    pub async fn mkdir(&self, path: PathBuf, recursive: bool) -> eyre::Result<()> {
+    pub async fn mkdir<P: Into<PathBuf>>(&self, path: P, recursive: bool) -> eyre::Result<bool> {
         let components = path
+            .into()
             .components()
             .map(|c| c.as_os_str().to_string_lossy().to_string())
             .filter(|s| !s.is_empty())
             .collect::<Vec<_>>();
+        let last_comp_idx = components.len() - 1;
 
+        let mut created_new = false;
         let (mut curr_addr, mut curr_inode) = self.get_root_inode().await?;
-        for component in components {
+        for (i, component) in components.into_iter().enumerate() {
             match curr_inode.kind {
                 INodeKind::Directory => {}
                 _ => eyre::bail!("Non-directory in mkdir path"),
@@ -726,16 +736,16 @@ impl BruteFS {
                 )?;
                 continue;
             }
-            if !recursive {
+            if !recursive && i != last_comp_idx {
                 eyre::bail!("Directory '{component}' does not exist");
             }
 
-            // create new dir inode
+            tracing::debug!("Creating new dir inode at {component}");
             let new_inode = INode {
                 ctime: utc_now_u64(),
                 mtime: utc_now_u64(),
                 utime: utc_now_u64(),
-                extent_addr: MaybeU64::None,
+                extent_addr: MaybeU64::default(),
                 kind: INodeKind::Directory,
             };
 
@@ -743,6 +753,8 @@ impl BruteFS {
             self.ctrl
                 .write(inode_addr as usize, &new_inode.serialize()?)
                 .await?;
+
+            created_new = true;
             directory.entries.push((component.clone(), inode_addr));
             let dir_data = directory.serialize()?;
 
@@ -751,7 +763,7 @@ impl BruteFS {
             let extent_addr = self
                 .allocate(
                     Extent {
-                        next: MaybeU64::None,
+                        next: MaybeU64::default(),
                         data: dir_data,
                     }
                     .serialized_size(),
@@ -762,14 +774,14 @@ impl BruteFS {
                 .write(
                     extent_addr as usize,
                     &Extent {
-                        next: MaybeU64::None,
+                        next: MaybeU64::default(),
                         data: directory.serialize()?,
                     }
                     .serialize()?,
                 )
                 .await?;
 
-            curr_inode.extent_addr = MaybeU64::Some(extent_addr);
+            curr_inode.extent_addr = MaybeU64::from(extent_addr);
             self.ctrl
                 .write(curr_addr as usize, &curr_inode.serialize()?)
                 .await?;
@@ -778,11 +790,11 @@ impl BruteFS {
             curr_inode = new_inode;
         }
 
-        Ok(())
+        Ok(created_new)
     }
 
-    pub async fn fread(&self, path: PathBuf) -> eyre::Result<Vec<u8>> {
-        let (_, inode) = self.resolve_path(&path).await?;
+    pub async fn fread<P: Into<PathBuf>>(&self, path: P) -> eyre::Result<Vec<u8>> {
+        let (_, inode) = self.resolve_path(path).await?;
         match inode.kind {
             INodeKind::File => self.read_full_data_from_extent(inode.extent_addr).await,
             INodeKind::Directory => {
@@ -795,8 +807,8 @@ impl BruteFS {
     }
 
     pub async fn read_extent(&self, addr: u64) -> eyre::Result<Extent> {
-        let extent_header = self.ctrl.read(addr as usize, 8 + 8).await?;
-        let curr_extent_data_size = u64::from_le_bytes(extent_header[8..16].try_into()?);
+        let extent_header = self.ctrl.read(addr as usize, 8).await?;
+        let curr_extent_data_size = u64::from_le_bytes(extent_header[0..8].try_into()?);
         Extent::deserialize(
             &self
                 .ctrl
@@ -806,16 +818,15 @@ impl BruteFS {
     }
 
     pub async fn mark_as_reusable(&self, new_slot_value: AddressSlot) -> eyre::Result<()> {
+        tracing::debug!(
+            "Marking slot {:x} of size {} as reusable",
+            new_slot_value.addr.get(),
+            new_slot_value.capacity
+        );
         let mut header = self.get_header().await?;
         let mut found = false;
         for slot in header.extent_freed.items.iter_mut() {
-            if matches!(
-                slot,
-                AddressSlot {
-                    addr: MaybeU64::None,
-                    ..
-                }
-            ) {
+            if slot.is_free() {
                 *slot = new_slot_value;
                 found = true;
                 break;
@@ -830,12 +841,13 @@ impl BruteFS {
     }
 
     pub async fn free_full_extent(&self, start_extent_addr: MaybeU64) -> eyre::Result<()> {
+        tracing::debug!("Freeing extent at {:x}", start_extent_addr.get());
         let mut addr = start_extent_addr;
-        while let MaybeU64::Some(next_addr) = addr {
+        while let Some(next_addr) = addr.to_optional() {
             let extent = self.read_extent(next_addr).await?;
 
             self.mark_as_reusable(AddressSlot {
-                addr: MaybeU64::Some(next_addr),
+                addr: MaybeU64::from(next_addr),
                 capacity: extent.data.len(),
             })
             .await?;
@@ -854,7 +866,7 @@ impl BruteFS {
     ) -> eyre::Result<u64> {
         let mut last_extent = None;
         let mut addr = start_extent_addr;
-        while let MaybeU64::Some(next_addr) = addr {
+        while let Some(next_addr) = addr.to_optional() {
             let extent = self.read_extent(next_addr).await?;
             addr = extent.next;
             last_extent = Some((next_addr, extent));
@@ -866,7 +878,7 @@ impl BruteFS {
             // later just swap the address instead of a full block write
             // for now this should work for the sane of proving correctness
             let new_extent_addr = self.allocate(new_extent.serialized_size()).await?;
-            prev_extent.next = MaybeU64::Some(new_extent_addr);
+            prev_extent.next = MaybeU64::from(new_extent_addr);
             self.ctrl
                 .write(prev_addr as usize, &prev_extent.serialize()?)
                 .await?;
@@ -889,7 +901,8 @@ impl BruteFS {
     pub async fn read_full_data_from_extent(&self, addr: MaybeU64) -> eyre::Result<Vec<u8>> {
         let mut data = vec![];
         let mut addr = addr;
-        while let MaybeU64::Some(next_addr) = addr {
+        while let Some(next_addr) = addr.to_optional() {
+            tracing::debug!("Resolving extent {next_addr:x}");
             let extent = self.read_extent(next_addr).await?;
             addr = extent.next;
             data.extend(extent.data);

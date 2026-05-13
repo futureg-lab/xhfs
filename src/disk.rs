@@ -51,6 +51,7 @@ impl Controller {
     }
 
     pub async fn write(&self, mut logical_addr: usize, data: &[u8]) -> eyre::Result<()> {
+        tracing::debug!(" Writting {} bytes at 0x{:x}", data.len(), logical_addr);
         let mut plan = vec![];
         let mut remaining = data;
         while !remaining.is_empty() {
@@ -79,6 +80,7 @@ impl Controller {
     }
 
     pub async fn read(&self, mut logical_addr: usize, mut size: usize) -> eyre::Result<Vec<u8>> {
+        tracing::debug!(" Reading {size} bytes at 0x{logical_addr:x}");
         let mut buf = Vec::with_capacity(size);
 
         while size > 0 {
