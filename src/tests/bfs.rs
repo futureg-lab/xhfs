@@ -1,13 +1,12 @@
 use crate::{
     addr::MaybeU64,
     bfs::{AddressSlot, BruteFS, INodeKind, WriteOption},
-    crypto::Crypto,
+    device::disk::Controller,
     device::{
         Device,
         kv_device::{KVDevice, MemoryKV},
         logical::LogicalDevice,
     },
-    disk::Controller,
 };
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
@@ -212,7 +211,7 @@ async fn test_brutefs_core_ops() -> eyre::Result<()> {
 }
 
 #[tokio::test]
-async fn test_brutefs_symlinks_and_stats() -> eyre::Result<()> {
+async fn test_brutefs_ref_manips_and_stats() -> eyre::Result<()> {
     let bfs = create_simple_memory_brute_fs(128 * 1000 * 1000).await?;
 
     bfs.mkdir("/many/entries/a", true).await?;
@@ -224,33 +223,44 @@ async fn test_brutefs_symlinks_and_stats() -> eyre::Result<()> {
         WriteOption { overwrite: false },
     )
     .await?;
+    bfs.fcopy(
+        "/many/entries/d.txt",
+        "/many/entries/other.txt",
+        WriteOption { overwrite: false },
+    )
+    .await?;
+    bfs.fmove("/many/entries", "/many/entries2").await?;
 
     bfs.create_link(
         "/file.link",
-        "/many/entries/d.txt",
+        "/many/entries2/d.txt",
         WriteOption { overwrite: false },
     )
     .await?;
     bfs.create_link(
         "/folder.link",
-        "/many/entries",
+        "/many/entries2",
         WriteOption { overwrite: false },
     )
     .await?;
 
     assert_eq!(
-        bfs.ls("/many/entries").await?,
+        bfs.ls("/many/entries2").await?,
         bfs.ls("/folder.link").await?
     );
 
     assert_eq!(
-        bfs.fread("/many/entries/d.txt").await?,
+        bfs.fread("/many/entries2/d.txt").await?,
         bfs.fread("/file.link").await?
     );
+    assert_eq!(
+        bfs.fread("/many/entries2/d.txt").await?,
+        bfs.fread("/many/entries2/other.txt").await?,
+    );
 
-    let dtxt_stats = bfs.stats("/many/entries/d.txt").await?.unwrap();
+    let dtxt_stats = bfs.stats("/many/entries2/d.txt").await?.unwrap();
     let filelink_stats = bfs.stats("/file.link").await?.unwrap();
-    let folder_stats = bfs.stats("/many/entries").await?.unwrap();
+    let folder_stats = bfs.stats("/many/entries2").await?.unwrap();
 
     assert_eq!(
         folder_stats.size, None,

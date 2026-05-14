@@ -1,7 +1,7 @@
 use crate::{
     addr::MaybeU64,
     crypto::Crypto,
-    disk::Controller,
+    device::disk::Controller,
     utils::{join_absolute, normalize_path, path_to_string_list, u64_to_utc_datetime, utc_now_u64},
 };
 use async_recursion::async_recursion;
@@ -413,12 +413,12 @@ impl BruteFS {
             alloc_guard: Mutex::new(()),
         };
 
-        bfs.ensure_headers().await?;
         let header = bfs.get_header().await?;
         if let Some(password) = password {
             bfs.ctrl
                 .setup_crypto(Crypto::new(&password, header.chacha20_nonce));
         }
+        bfs.ensure_headers().await?;
 
         Ok(bfs)
     }
@@ -464,7 +464,10 @@ impl BruteFS {
         let capacity = self.total_capacity()?;
         tracing::debug!("Capacity: {capacity}");
 
-        let (ioffset, inode) = self.get_root_inode().await?;
+        let (ioffset, inode) = self
+            .get_root_inode()
+            .await
+            .wrap_err_with(|| eyre::eyre!("Data is either corrupt or encrypted"))?;
         tracing::debug!("Root inode offset {ioffset} (0x{ioffset:x})");
         tracing::debug!("- Kind: {:?}", inode.kind);
         tracing::debug!("- Creation time: {}", u64_to_utc_datetime(inode.ctime));
@@ -679,16 +682,117 @@ impl BruteFS {
         }
     }
 
-    // TODO:
-    // controller layer chacha20
+    pub async fn fcopy<P: Into<PathBuf> + Clone>(
+        &self,
+        src: P,
+        dest: P,
+        opt: WriteOption,
+    ) -> eyre::Result<()> {
+        let data = self.fread(src).await?;
+        let (_dst_parent_addr, _dst_parent_inode, _) = self.resolve_parent(dest.clone()).await?;
+        self.fwrite(dest, data, opt).await
+    }
 
-    // TODO: move
-    // find source inode address + struct
-    // create new inode, just update the extent address to the new one
-    // mark old i
-    // swap extent address
+    pub async fn fmove<P: Into<PathBuf>>(&self, src: P, dest: P) -> eyre::Result<()> {
+        let (src_parent_addr, mut src_parent_inode, src_name) = self.resolve_parent(src).await?;
+        let (dst_parent_addr, mut dst_parent_inode, dst_name) = self.resolve_parent(dest).await?;
 
-    // TODO: copy
+        let src_payload = self
+            .read_full_data_from_extent(src_parent_inode.extent_addr)
+            .await?;
+        let dst_payload = self
+            .read_full_data_from_extent(dst_parent_inode.extent_addr)
+            .await?;
+
+        // Same parent:
+        // we need to be careful updating dir entries as there is only one (psrc = pdst)
+        if src_parent_addr == dst_parent_addr {
+            tracing::debug!("fmove found same parent for src and dest");
+            let mut dir = Directory::deserialize(&src_payload)?;
+            if dir.entries.iter().any(|(name, _)| name == &dst_name) {
+                eyre::bail!("Destination already exists: {dst_name}");
+            }
+            let mut found_inode_addr = None;
+            dir.entries.retain(|(name, inode_addr)| {
+                if name == &src_name {
+                    found_inode_addr = Some(*inode_addr);
+                    false
+                } else {
+                    true
+                }
+            });
+            let inode_addr =
+                found_inode_addr.ok_or_else(|| eyre::eyre!("Source entry not found"))?;
+            dir.entries.push((dst_name, inode_addr));
+
+            let old_extent = src_parent_inode.extent_addr;
+            let new_ext = Extent {
+                next: MaybeU64::default(),
+                data: dir.serialize()?,
+            };
+            let addr = self.allocate(new_ext.serialized_size()).await?;
+            self.ctrl
+                .write(addr as usize, &new_ext.serialize()?)
+                .await?;
+            src_parent_inode.extent_addr = MaybeU64::from(addr);
+            self.ctrl
+                .write(src_parent_addr as usize, &src_parent_inode.serialize()?)
+                .await?;
+
+            self.free_full_extent(old_extent).await?;
+            return Ok(());
+        }
+
+        let mut src_dir = Directory::deserialize(&src_payload)?;
+        let mut dst_dir = Directory::deserialize(&dst_payload)?;
+        if dst_dir.entries.iter().any(|(name, _)| name == &dst_name) {
+            eyre::bail!("Destination already exists: {dst_name}");
+        }
+        let mut found_inode_addr = None;
+        src_dir.entries.retain(|(name, inode_addr)| {
+            if name == &src_name {
+                found_inode_addr = Some(*inode_addr);
+                false
+            } else {
+                true
+            }
+        });
+
+        let inode_addr = found_inode_addr.ok_or_else(|| eyre::eyre!("Source entry not found"))?;
+        dst_dir.entries.push((dst_name, inode_addr));
+        let old_src = src_parent_inode.extent_addr;
+        let old_dst = dst_parent_inode.extent_addr;
+        let new_src = Extent {
+            next: MaybeU64::default(),
+            data: src_dir.serialize()?,
+        };
+        let new_dst = Extent {
+            next: MaybeU64::default(),
+            data: dst_dir.serialize()?,
+        };
+
+        let src_addr = self.allocate(new_src.serialized_size()).await?;
+        self.ctrl
+            .write(src_addr as usize, &new_src.serialize()?)
+            .await?;
+        src_parent_inode.extent_addr = MaybeU64::from(src_addr);
+
+        let dst_addr = self.allocate(new_dst.serialized_size()).await?;
+        self.ctrl
+            .write(dst_addr as usize, &new_dst.serialize()?)
+            .await?;
+        dst_parent_inode.extent_addr = MaybeU64::from(dst_addr);
+
+        self.ctrl
+            .write(src_parent_addr as usize, &src_parent_inode.serialize()?)
+            .await?;
+        self.ctrl
+            .write(dst_parent_addr as usize, &dst_parent_inode.serialize()?)
+            .await?;
+
+        self.free_all([old_src, old_dst]).await?;
+        Ok(())
+    }
 
     // TODO:
     // seek(file, start, end)
@@ -724,6 +828,7 @@ impl BruteFS {
                 .await?,
         )?;
 
+        let mut maybe_garbages = vec![];
         match inode.kind {
             INodeKind::File | INodeKind::Symlink => {
                 self.free_full_extent(inode.extent_addr).await?;
@@ -735,18 +840,12 @@ impl BruteFS {
                     eyre::bail!("Directory is not empty");
                 }
 
-                self.free_full_extent(inode.extent_addr).await?;
+                maybe_garbages.push(inode.extent_addr);
             }
         }
 
-        self.mark_as_reusable(AddressSlot {
-            addr: MaybeU64::from(inode_addr),
-            capacity: INode::serialized_size(),
-        })
-        .await?;
-
         tracing::debug!("Rewrite parent directory entries");
-        let old_parent_extent_addr = parent_inode.extent_addr;
+        maybe_garbages.push(parent_inode.extent_addr);
 
         let new_dir_extent = Extent {
             next: MaybeU64::default(),
@@ -764,8 +863,13 @@ impl BruteFS {
             .write(parent_addr as usize, &parent_inode.serialize()?)
             .await?;
 
-        self.free_full_extent(old_parent_extent_addr).await?;
+        self.mark_as_reusable(AddressSlot {
+            addr: MaybeU64::from(inode_addr),
+            capacity: INode::serialized_size(),
+        })
+        .await?;
 
+        self.free_all(maybe_garbages).await?;
         Ok(())
     }
 
@@ -800,7 +904,6 @@ impl BruteFS {
                         }
 
                         let old_extent_addr = inode.extent_addr;
-
                         let extent = Extent {
                             next: MaybeU64::default(),
                             data,
@@ -857,8 +960,6 @@ impl BruteFS {
             .await?;
         directory.entries.push((filename, inode_addr));
 
-        self.free_full_extent(parent_inode.extent_addr).await?;
-
         let new_dir_extent = Extent {
             next: MaybeU64::default(),
             data: directory.serialize()?,
@@ -867,11 +968,14 @@ impl BruteFS {
         self.ctrl
             .write(new_dir_extent_addr as usize, &new_dir_extent.serialize()?)
             .await?;
+        let old_parent_extent = parent_inode.extent_addr;
         parent_inode.extent_addr = MaybeU64::from(new_dir_extent_addr);
 
         self.ctrl
             .write(parent_addr as usize, &parent_inode.serialize()?)
             .await?;
+
+        self.free_full_extent(old_parent_extent).await?;
 
         Ok(())
     }
@@ -962,8 +1066,6 @@ impl BruteFS {
             directory.entries.push((component.clone(), inode_addr));
             let dir_data = directory.serialize()?;
 
-            self.free_full_extent(curr_inode.extent_addr).await?;
-
             let extent_addr = self
                 .allocate(
                     Extent {
@@ -985,10 +1087,13 @@ impl BruteFS {
                 )
                 .await?;
 
+            let old_extent_addr = curr_inode.extent_addr;
             curr_inode.extent_addr = MaybeU64::from(extent_addr);
             self.ctrl
                 .write(curr_addr as usize, &curr_inode.serialize()?)
                 .await?;
+
+            self.free_full_extent(old_extent_addr).await?;
 
             curr_addr = inode_addr;
             curr_inode = new_inode;
@@ -1121,6 +1226,17 @@ impl BruteFS {
             addr = extent.next;
         }
 
+        Ok(())
+    }
+
+    pub async fn free_all<A>(&self, addresses: A) -> eyre::Result<()>
+    where
+        A: IntoIterator<Item = MaybeU64>,
+        A::IntoIter: ExactSizeIterator,
+    {
+        for addr in addresses {
+            self.free_full_extent(addr).await?;
+        }
         Ok(())
     }
 

@@ -1,13 +1,11 @@
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
-use crate::{
-    device::{
-        Device,
-        fs_device::FsDevice,
-        kv_device::{KVDevice, MemoryKV},
-        logical::LogicalDevice,
-    },
+use crate::device::{
+    Device,
     disk::Controller,
+    fs_device::FsDevice,
+    kv_device::{KVDevice, MemoryKV},
+    logical::LogicalDevice,
 };
 use tokio::{fs, sync::RwLock};
 

@@ -1,7 +1,6 @@
 use crate::{
     bfs::{BruteFS, WriteOption},
-    device::{Device, fs_device::FsDevice, logical::LogicalDevice},
-    disk::Controller,
+    device::{Device, disk::Controller, fs_device::FsDevice, logical::LogicalDevice},
 };
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
@@ -10,7 +9,6 @@ pub mod addr;
 pub mod bfs;
 pub mod crypto;
 pub mod device;
-pub mod disk;
 pub mod utils;
 
 #[cfg(test)]
@@ -42,7 +40,7 @@ async fn main() -> eyre::Result<()> {
     let ctrl = Controller::from([dev1, dev2]).await?;
     println!("Total size {:?}", ctrl.total_capacity());
 
-    let bfs = BruteFS::format_new(ctrl, Some("helloworld".to_string())).await?;
+    let bfs = BruteFS::format_new(ctrl.clone(), Some("helloworld".to_string())).await?;
     println!("Root {:?}", bfs.get_root_inode().await?);
     bfs.mkdir("/", true).await?;
     println!("----");
@@ -56,18 +54,23 @@ async fn main() -> eyre::Result<()> {
     bfs.create_link("/thelink", "/hello/baz/", WriteOption { overwrite: false })
         .await?;
 
-    // let bfs = BruteFS::from_formatted(ctrl, Some("helloworld".to_string())).await?;
+    let bfs = BruteFS::from_formatted(ctrl, Some("helloworld".to_string())).await?;
+    bfs.fmove("/hello/baz", "/EntrIESs").await?;
 
-    for entry in bfs.ls("/hello/baz/").await? {
+    println!("1");
+    for entry in bfs.ls("/").await? {
+        //         hello
+        // world
+        // thelink
         println!("{entry}");
     }
 
-    for entry in bfs.ls("/thelink").await? {
-        println!("{entry}");
-    }
-
-    println!("{:?}", bfs.stats("/thelink").await?);
-    println!("{:?}", bfs.stats("/hello/baz/").await?);
+    println!("2");
+    // for entry in bfs.ls("/thelink").await? {
+    //     println!("{entry}");
+    // }
+    // println!("{:?}", bfs.stats("/thelink").await?);
+    println!("{:?}", bfs.stats("/EntrIESs").await?);
 
     Ok(())
 }

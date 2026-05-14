@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 
+pub mod disk;
 pub mod fs_device;
 pub mod kv_device;
 pub mod logical;
