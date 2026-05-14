@@ -78,10 +78,10 @@ brutefs download test.txt my_physical_copy.txt
 # Features
 
 - [x] File System
-  - [x] brutefs core: fopen, fwrite, fseek, mkdir, fmove, fcopy, unlink,
-        create_link
-  - [x] native symlink support
-  - [x] extra: fprepend
+  - Encryption (ChaCha20 stream cipher)
+  - [x] brutefs core: fopen, fwrite, fseek, mkdir, fmove, fcopy, unlink
+  - [x] native symlink support: create_link
+  - [x] extra: fappend
 - [x] RAID-like configuration
   - [x] logical grouping
   - [x] replication

@@ -7,12 +7,14 @@ use crate::{
         kv_device::{KVDevice, MemoryKV},
         logical::LogicalDevice,
     },
+    utils::normalize_path,
 };
 use bytesize::ByteSize;
 use eyre::Context;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::{
     collections::{HashMap, HashSet},
+    hash::{DefaultHasher, Hash, Hasher},
     path::PathBuf,
     str::FromStr,
     sync::Arc,
@@ -34,8 +36,8 @@ pub enum DeviceConfig {
         name: String,
         slot_capacity_bytes: u64,
     },
-    #[serde(rename = "fs")]
-    Fs { name: String, path: String },
+    #[serde(rename = "file")]
+    File { name: String, path: String },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -66,9 +68,23 @@ impl DeviceConfig {
     pub fn name(&self) -> String {
         match self {
             DeviceConfig::KVMemory { name, .. } => name,
-            DeviceConfig::Fs { name, .. } => name,
+            DeviceConfig::File { name, .. } => name,
         }
         .to_owned()
+    }
+
+    pub fn payload_discriminator(&self) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        match self {
+            DeviceConfig::File { path, .. } => {
+                let path = normalize_path(path);
+                path.hash(&mut hasher);
+            }
+            DeviceConfig::KVMemory { .. } => {
+                rand::random::<u64>().hash(&mut hasher);
+            }
+        };
+        hasher.finish()
     }
 }
 
@@ -124,9 +140,13 @@ configuration:
 
     pub fn validate(&self) -> eyre::Result<()> {
         let mut device_names = HashSet::new();
+        let mut payloads = HashSet::new();
         for d in &self.devices {
             if !device_names.insert(d.name()) {
                 eyre::bail!("Duplicate device name: {}", d.name());
+            }
+            if !payloads.insert(d.payload_discriminator()) {
+                eyre::bail!("Already used payload used by {}", d.name());
             }
         }
 
@@ -146,12 +166,17 @@ configuration:
                 }
             }
         }
+
+        let mut seen_device = HashSet::new();
         for name in &self.configuration.layout {
             if !logical_names.contains(name) {
                 eyre::bail!(
                     "Layout references unknown logical device {name}, available {}",
                     Vec::from_iter(logical_names.into_iter()).join(", ")
                 );
+            }
+            if !seen_device.insert(name) {
+                eyre::bail!("Cannot use device {name} more than once in the layout");
             }
         }
 
@@ -190,7 +215,7 @@ configuration:
                         total_slots: (capacity / *slot_capacity_bytes) as usize,
                         slot_capacity: *slot_capacity_bytes as usize,
                     }) as Arc<dyn Device>,
-                    DeviceConfig::Fs { path, .. } => {
+                    DeviceConfig::File { path, .. } => {
                         Arc::new(FsDevice::new(path, capacity as usize).await?) as Arc<dyn Device>
                     }
                 };

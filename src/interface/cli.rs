@@ -101,7 +101,9 @@ pub struct DownloadCommand {
     /// Source path inside brutefs
     pub src_path: PathBuf,
     /// Local destination path
-    pub dest_path: PathBuf,
+    pub dest_path: Option<PathBuf>,
+    #[arg(short, long, default_value = "false")]
+    pub overwrite: bool,
     #[command(flatten)]
     pub global: GlobalOptions,
 }
@@ -112,7 +114,7 @@ pub struct LinkCommand {
     pub src_path: PathBuf,
     /// Destination path inside brutefs
     pub dest_path: PathBuf,
-    #[arg(long, default_value = "false")]
+    #[arg(short, long, default_value = "false")]
     pub overwrite: bool,
     #[command(flatten)]
     pub global: GlobalOptions,
@@ -178,7 +180,14 @@ impl MainCommand {
             Commands::Download(d) => {
                 let bfs = d.global.get_bfs(false).await?;
                 let data = bfs.fread(&d.src_path).await?;
-                fs::write(&d.dest_path, data).await?;
+                let dest_path = match &d.dest_path {
+                    Some(path) => path.clone(),
+                    None => d.src_path.file_name().expect("Valid filename").into(),
+                };
+                if dest_path.exists() && !d.overwrite {
+                    eyre::bail!("File {} already exists", dest_path.display());
+                }
+                fs::write(dest_path, data).await?;
             }
             Commands::Read(r) => {
                 let bfs = r.global.get_bfs(false).await?;

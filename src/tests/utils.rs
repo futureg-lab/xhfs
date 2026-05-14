@@ -1,4 +1,7 @@
-use crate::utils::{join_absolute, normalize_path, path_to_string_list};
+use crate::{
+    interface::config::Config,
+    utils::{join_absolute, normalize_path, path_to_string_list},
+};
 
 #[test]
 fn test_simple_path() {
@@ -60,4 +63,9 @@ fn test_relative_path_becomes_absolute() {
 fn test_path_to_string_list_basic() {
     let parts = path_to_string_list("/a/b/c");
     assert_eq!(parts, ["a", "b", "c"]);
+}
+
+#[test]
+fn test_config_example() {
+    assert!(Config::example().is_ok());
 }
