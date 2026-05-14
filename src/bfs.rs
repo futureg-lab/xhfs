@@ -794,18 +794,6 @@ impl BruteFS {
         Ok(())
     }
 
-    // TODO:
-    // seek(file, start, end)
-    // full extent but offset finding basically
-
-    // TODO: grow ops
-    // fappend()
-    // fprepend()
-
-    // TODO:
-    // each logical device should have ReplicaOnly
-    // log the events and retry entries that has failed to write
-
     pub async fn unlink<P: Into<PathBuf>>(&self, path: P) -> eyre::Result<()> {
         let path: PathBuf = path.into();
         let (parent_addr, mut parent_inode, filename) = self.resolve_parent(&path).await?;
@@ -1107,10 +1095,10 @@ impl BruteFS {
         let path: PathBuf = path.into();
         let (_, inode) = self.resolve_path(&path).await?;
         match inode.kind {
-            INodeKind::File => self.read_full_data_from_extent(inode.extent_addr).await,
             INodeKind::Directory => {
                 eyre::bail!("Cannot fread directory");
             }
+            INodeKind::File => self.read_full_data_from_extent(inode.extent_addr).await,
             INodeKind::Symlink => {
                 tracing::debug!("Trying to read file from symlink");
                 let raw_path = self.read_full_data_from_extent(inode.extent_addr).await?;
@@ -1127,6 +1115,80 @@ impl BruteFS {
                 self.fread(symlink.path).await
             }
         }
+    }
+
+    #[async_recursion(?Send)]
+    pub async fn fseek<P: Into<PathBuf>>(
+        &self,
+        path: P,
+        start: u64,
+        end: u64,
+    ) -> eyre::Result<Vec<u8>> {
+        let path: PathBuf = path.into();
+        let (_, inode) = self.resolve_path(&path).await?;
+        match inode.kind {
+            INodeKind::File => {
+                self.seek_full_data_from_extent(inode.extent_addr, start, end)
+                    .await
+            }
+            INodeKind::Symlink => {
+                tracing::debug!("Trying to read+seek file from symlink");
+                let raw_path = self.read_full_data_from_extent(inode.extent_addr).await?;
+                let symlink = SymLink::deserialize(&raw_path)?;
+                tracing::debug!(
+                    " {} *=> {}",
+                    normalize_path(&path),
+                    normalize_path(&symlink.path)
+                );
+                if symlink.path == path {
+                    tracing::warn!("Invalid fs state: Symlink pointing to itself detected");
+                    eyre::bail!("Symlink pointing to itself detected");
+                }
+                self.fseek(symlink.path, start, end).await
+            }
+            INodeKind::Directory => {
+                eyre::bail!("Cannot fread directory");
+            }
+        }
+    }
+
+    // TODO:
+    // fprepend?
+
+    #[async_recursion(?Send)]
+    pub async fn fappend<P: Into<PathBuf>>(&self, path: P, data: Vec<u8>) -> eyre::Result<()> {
+        let path: PathBuf = path.into();
+        let (_, inode) = self.resolve_path(&path).await?;
+        match inode.kind {
+            INodeKind::File => {
+                let new_extent = Extent {
+                    next: MaybeU64::default(),
+                    data,
+                };
+                self.append_or_allocate_extent(inode.extent_addr, new_extent)
+                    .await?;
+            }
+            INodeKind::Symlink => {
+                tracing::debug!("Trying tofappend file from symlink");
+                let raw_path = self.read_full_data_from_extent(inode.extent_addr).await?;
+                let symlink = SymLink::deserialize(&raw_path)?;
+                tracing::debug!(
+                    " {} *=> {}",
+                    normalize_path(&path),
+                    normalize_path(&symlink.path)
+                );
+                if symlink.path == path {
+                    tracing::warn!("Invalid fs state: Symlink pointing to itself detected");
+                    eyre::bail!("Symlink pointing to itself detected");
+                }
+                self.fappend(symlink.path, data).await?;
+            }
+            INodeKind::Directory => {
+                eyre::bail!("Cannot append data to directory");
+            }
+        };
+
+        Ok(())
     }
 
     pub async fn read_extent(&self, addr: u64) -> eyre::Result<Extent> {
@@ -1290,5 +1352,41 @@ impl BruteFS {
             data.extend(extent.data);
         }
         Ok(data)
+    }
+
+    pub async fn seek_full_data_from_extent(
+        &self,
+        addr: MaybeU64,
+        addr_start: u64,
+        addr_end: u64,
+    ) -> eyre::Result<Vec<u8>> {
+        let mut buf = vec![];
+        let mut cursor: u64 = 0;
+        let mut addr = addr;
+
+        while let Some(next_addr) = addr.to_optional() {
+            let extent = self.read_extent(next_addr).await?;
+            addr = extent.next;
+            let data = extent.data;
+            let extent_start = cursor;
+            let extent_end = cursor + data.len() as u64;
+
+            if extent_end <= addr_start {
+                cursor = extent_end;
+                continue;
+            }
+            if extent_start >= addr_end {
+                break;
+            }
+
+            let start_in_ext = addr_start.saturating_sub(extent_start) as usize;
+            let end_in_ext = (addr_end.saturating_sub(extent_start) as usize).min(data.len());
+            if start_in_ext < data.len() && start_in_ext < end_in_ext {
+                buf.extend_from_slice(&data[start_in_ext..end_in_ext]);
+            }
+            cursor = extent_end;
+        }
+
+        Ok(buf)
     }
 }

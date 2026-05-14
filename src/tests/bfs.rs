@@ -223,32 +223,51 @@ async fn test_brutefs_ref_manips_and_stats() -> eyre::Result<()> {
         WriteOption { overwrite: false },
     )
     .await?;
-    bfs.fcopy(
-        "/many/entries/d.txt",
-        "/many/entries/other.txt",
-        WriteOption { overwrite: false },
-    )
-    .await?;
-    bfs.fmove("/many/entries", "/many/entries2").await?;
 
-    bfs.create_link(
-        "/file.link",
-        "/many/entries2/d.txt",
-        WriteOption { overwrite: false },
-    )
-    .await?;
-    bfs.create_link(
-        "/folder.link",
-        "/many/entries2",
-        WriteOption { overwrite: false },
-    )
-    .await?;
+    {
+        // extent 1 = HELLO
+        // extent 2 = ABC
+        bfs.fappend("/many/entries/d.txt", "ABC".as_bytes().to_vec())
+            .await?;
+        assert_eq!(
+            bfs.fread("/many/entries/d.txt").await?,
+            "HELLOABC".as_bytes(),
+            "fappend works"
+        );
+        assert_eq!(
+            bfs.fseek("/many/entries/d.txt", 4, 7).await?,
+            "OAB".as_bytes(),
+            "extent boundaries are contiguous from user POV"
+        );
+    }
+
+    // non-trivial ref manips
+    {
+        bfs.fcopy(
+            "/many/entries/d.txt",
+            "/many/entries/other.txt",
+            WriteOption { overwrite: false },
+        )
+        .await?;
+        bfs.fmove("/many/entries", "/many/entries2").await?;
+        bfs.create_link(
+            "/file.link",
+            "/many/entries2/d.txt",
+            WriteOption { overwrite: false },
+        )
+        .await?;
+        bfs.create_link(
+            "/folder.link",
+            "/many/entries2",
+            WriteOption { overwrite: false },
+        )
+        .await?;
+    }
 
     assert_eq!(
         bfs.ls("/many/entries2").await?,
         bfs.ls("/folder.link").await?
     );
-
     assert_eq!(
         bfs.fread("/many/entries2/d.txt").await?,
         bfs.fread("/file.link").await?
