@@ -1,6 +1,7 @@
 use crate::{
     addr::MaybeU64,
     bfs::{AddressSlot, AddressVector, BruteFsHeader, Directory, Extent, INode, INodeKind},
+    crypto::Crypto,
 };
 
 #[test]
@@ -59,6 +60,7 @@ pub fn test_basic_binary_serialization() -> eyre::Result<()> {
         let mut original = BruteFsHeader {
             version: 42,
             extent_freed: AddressVector::allocate(11),
+            chacha20_nonce: Crypto::gen_nonce(),
         };
         original.extent_freed.items[5] = AddressSlot {
             addr: MaybeU64::from(1234),

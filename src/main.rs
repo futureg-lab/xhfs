@@ -1,15 +1,14 @@
-use std::sync::Arc;
-
-use tracing_subscriber::EnvFilter;
-
 use crate::{
     bfs::{BruteFS, WriteOption},
     device::{Device, fs_device::FsDevice, logical::LogicalDevice},
     disk::Controller,
 };
+use std::sync::Arc;
+use tracing_subscriber::EnvFilter;
 
 pub mod addr;
 pub mod bfs;
+pub mod crypto;
 pub mod device;
 pub mod disk;
 pub mod utils;
@@ -43,7 +42,7 @@ async fn main() -> eyre::Result<()> {
     let ctrl = Controller::from([dev1, dev2]).await?;
     println!("Total size {:?}", ctrl.total_capacity());
 
-    let bfs = BruteFS::format_new(ctrl).await?;
+    let bfs = BruteFS::format_new(ctrl, Some("helloworld".to_string())).await?;
     println!("Root {:?}", bfs.get_root_inode().await?);
     bfs.mkdir("/", true).await?;
     println!("----");
@@ -56,6 +55,9 @@ async fn main() -> eyre::Result<()> {
     // bfs.mkdir("/world".into(), true).await?;
     bfs.create_link("/thelink", "/hello/baz/", WriteOption { overwrite: false })
         .await?;
+
+    // let bfs = BruteFS::from_formatted(ctrl, Some("helloworld".to_string())).await?;
+
     for entry in bfs.ls("/hello/baz/").await? {
         println!("{entry}");
     }

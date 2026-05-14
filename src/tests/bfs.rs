@@ -1,6 +1,7 @@
 use crate::{
     addr::MaybeU64,
     bfs::{AddressSlot, BruteFS, INodeKind, WriteOption},
+    crypto::Crypto,
     device::{
         Device,
         kv_device::{KVDevice, MemoryKV},
@@ -22,7 +23,7 @@ async fn create_simple_memory_brute_fs(capacity: usize) -> eyre::Result<BruteFS>
     };
     let dev1 = LogicalDevice::new(2, [Arc::from(dev1) as Arc<dyn Device>])?;
     let ctrl = Controller::from([dev1]).await?;
-    BruteFS::format_new(ctrl).await
+    BruteFS::format_new(ctrl, Some("helloworld".to_string())).await
 }
 
 #[tokio::test]
@@ -36,7 +37,7 @@ async fn test_base_allocate_brutefs() -> eyre::Result<()> {
     );
 
     {
-        let offset = 16065; // header + root INode
+        let offset = 16077; // header + root INode
         let addr = bfs.allocate(100).await?;
         assert_eq!(addr, offset, "allocate init");
         let addr = bfs.allocate(4).await?;
@@ -133,10 +134,10 @@ async fn test_brutefs_core_ops() -> eyre::Result<()> {
 
     {
         assert_eq!(bfs.count_reusable_regions().await?, 10);
-        assert_eq!(bfs.get_header().await?.extent_freed.global_offset, 20052);
+        assert_eq!(bfs.get_header().await?.extent_freed.global_offset, 20616);
 
         let _ = bfs.allocate(535).await?; // slot is 536 => 535 taken + 1 left
-        assert_eq!(bfs.get_header().await?.extent_freed.global_offset, 20052);
+        assert_eq!(bfs.get_header().await?.extent_freed.global_offset, 20616);
         assert_eq!(
             bfs.count_reusable_regions().await?,
             10,
@@ -148,7 +149,7 @@ async fn test_brutefs_core_ops() -> eyre::Result<()> {
         let _ = bfs.allocate(10000).await?;
         assert_eq!(
             bfs.get_header().await?.extent_freed.global_offset,
-            30052,
+            30616,
             "largest known fragmented region is too small, fallback to bump allocator instead"
         );
     }

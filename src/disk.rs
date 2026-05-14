@@ -1,4 +1,4 @@
-use crate::device::logical::LogicalDevice;
+use crate::{crypto::Crypto, device::logical::LogicalDevice};
 
 #[derive(Clone)]
 pub struct PinnedDevice {
@@ -10,6 +10,7 @@ pub struct PinnedDevice {
 #[derive(Clone)]
 pub struct Controller {
     pinned_devices: Vec<PinnedDevice>,
+    crypto: Option<Crypto>,
 }
 
 // TODO:
@@ -40,7 +41,21 @@ impl Controller {
             });
         }
 
-        Ok(Self { pinned_devices })
+        Ok(Self {
+            pinned_devices,
+            crypto: None,
+        })
+    }
+
+    pub fn setup_crypto(&mut self, crypto: Crypto) {
+        self.crypto = Some(crypto)
+    }
+
+    pub fn encrypt_apply(&self, addr: usize, mut data: Vec<u8>) -> Vec<u8> {
+        if let Some(crypto) = &self.crypto {
+            crypto.apply(addr as u64, &mut data);
+        }
+        data
     }
 
     pub fn total_capacity(&self) -> Option<usize> {
@@ -50,7 +65,17 @@ impl Controller {
         None
     }
 
-    pub async fn write(&self, mut logical_addr: usize, data: &[u8]) -> eyre::Result<()> {
+    pub async fn write(&self, logical_addr: usize, data: &[u8]) -> eyre::Result<()> {
+        let data = self.encrypt_apply(logical_addr, data.to_vec());
+        self.raw_write(logical_addr, &data).await
+    }
+
+    pub async fn read(&self, logical_addr: usize, size: usize) -> eyre::Result<Vec<u8>> {
+        let data = self.raw_read(logical_addr, size).await?;
+        Ok(self.encrypt_apply(logical_addr, data))
+    }
+
+    pub async fn raw_write(&self, mut logical_addr: usize, data: &[u8]) -> eyre::Result<()> {
         tracing::debug!(" Writting {} bytes at 0x{:x}", data.len(), logical_addr);
         let mut plan = vec![];
         let mut remaining = data;
@@ -79,7 +104,11 @@ impl Controller {
         Ok(())
     }
 
-    pub async fn read(&self, mut logical_addr: usize, mut size: usize) -> eyre::Result<Vec<u8>> {
+    pub async fn raw_read(
+        &self,
+        mut logical_addr: usize,
+        mut size: usize,
+    ) -> eyre::Result<Vec<u8>> {
         tracing::debug!(" Reading {size} bytes at 0x{logical_addr:x}");
         let mut buf = Vec::with_capacity(size);
 

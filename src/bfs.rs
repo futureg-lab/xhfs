@@ -1,5 +1,6 @@
 use crate::{
     addr::MaybeU64,
+    crypto::Crypto,
     disk::Controller,
     utils::{join_absolute, normalize_path, path_to_string_list, u64_to_utc_datetime, utc_now_u64},
 };
@@ -76,6 +77,7 @@ pub struct AddressVector {
 pub struct BruteFsHeader {
     pub version: u8,
     pub extent_freed: AddressVector,
+    pub chacha20_nonce: [u8; 12],
 }
 
 pub struct BruteFS {
@@ -367,13 +369,14 @@ impl BruteFsHeader {
         let mut buf = Vec::with_capacity(self.serialized_size());
         buf.extend_from_slice(b"brutefs");
         buf.push(self.version);
+        buf.extend_from_slice(&self.chacha20_nonce);
         buf.extend_from_slice(&self.extent_freed.serialize()?);
         Ok(buf)
     }
 
     pub fn deserialize(data: &[u8]) -> eyre::Result<Self> {
         let magic = b"brutefs";
-        let min_expected_size = 7 + 1;
+        let min_expected_size = 7 + 1 + 12;
         let incoming_size = data.len();
         if incoming_size < min_expected_size {
             eyre::bail!(
@@ -384,16 +387,15 @@ impl BruteFsHeader {
             eyre::bail!("Invalid BruteFsHeader magic bytes");
         }
 
-        let version = data[7];
-
         Ok(Self {
-            version,
-            extent_freed: AddressVector::deserialize(&data[8..])?,
+            version: data[7],
+            chacha20_nonce: data[8..8 + 12].try_into()?,
+            extent_freed: AddressVector::deserialize(&data[8 + 12..])?,
         })
     }
 
     pub fn serialized_size(&self) -> usize {
-        7 + 1 + self.extent_freed.serialized_size()
+        7 + 1 + self.extent_freed.serialized_size() + 12
     }
 }
 
@@ -403,15 +405,47 @@ pub struct WriteOption {
 }
 
 impl BruteFS {
-    pub async fn from_formatted(ctrl: Controller) -> eyre::Result<Self> {
+    pub async fn from_formatted(ctrl: Controller, password: Option<String>) -> eyre::Result<Self> {
         let header_size = Self::header_template().serialize()?.len();
-        let bfs = Self {
+        let mut bfs = Self {
             header_size,
             ctrl,
             alloc_guard: Mutex::new(()),
         };
+
         bfs.ensure_headers().await?;
+        let header = bfs.get_header().await?;
+        if let Some(password) = password {
+            bfs.ctrl
+                .setup_crypto(Crypto::new(&password, header.chacha20_nonce));
+        }
+
         Ok(bfs)
+    }
+
+    pub async fn format_new(mut ctrl: Controller, password: Option<String>) -> eyre::Result<Self> {
+        let header_size = Self::header_template().serialize()?.len();
+        let root = INode {
+            ctime: utc_now_u64(),
+            mtime: utc_now_u64(),
+            utime: utc_now_u64(),
+            total_file_size: 0,
+            extent_addr: MaybeU64::default(),
+            kind: INodeKind::Directory,
+        };
+
+        let root_raw = root.serialize()?;
+
+        let mut header = Self::header_template();
+        header.extent_freed.global_offset = (header_size + root_raw.len()) as u64;
+        header.chacha20_nonce = Crypto::gen_nonce();
+        if let Some(password) = &password {
+            ctrl.setup_crypto(Crypto::new(password, header.chacha20_nonce));
+        }
+        ctrl.raw_write(0, &header.serialize()?).await?;
+        ctrl.write(header_size, &root_raw).await?;
+
+        Self::from_formatted(ctrl, password).await
     }
 
     pub async fn ensure_headers(&self) -> eyre::Result<()> {
@@ -449,32 +483,16 @@ impl BruteFS {
         BruteFsHeader {
             version: 1,
             extent_freed: AddressVector::allocate(1000),
+            chacha20_nonce: Default::default(),
         }
     }
 
-    pub async fn format_new(ctrl: Controller) -> eyre::Result<Self> {
-        let header_size = Self::header_template().serialize()?.len();
-        let root = INode {
-            ctime: utc_now_u64(),
-            mtime: utc_now_u64(),
-            utime: utc_now_u64(),
-            total_file_size: 0,
-            extent_addr: MaybeU64::default(),
-            kind: INodeKind::Directory,
-        };
-
-        let root_raw = root.serialize()?;
-        ctrl.write(header_size, &root_raw).await?;
-
-        let mut header = Self::header_template();
-        header.extent_freed.global_offset = (header_size + root_raw.len()) as u64;
-        ctrl.write(0, &header.serialize()?).await?;
-
-        Self::from_formatted(ctrl).await
+    pub async fn get_header(&self) -> eyre::Result<BruteFsHeader> {
+        BruteFsHeader::deserialize(&self.ctrl.raw_read(0, self.header_size).await?)
     }
 
-    pub async fn get_header(&self) -> eyre::Result<BruteFsHeader> {
-        BruteFsHeader::deserialize(&self.ctrl.read(0, self.header_size).await?)
+    pub async fn update_header(&self, header: BruteFsHeader) -> eyre::Result<()> {
+        self.ctrl.raw_write(0, &header.serialize()?).await
     }
 
     pub async fn get_root_inode(&self) -> eyre::Result<(u64, INode)> {
@@ -499,15 +517,13 @@ impl BruteFS {
         let _ = self.alloc_guard.lock().await;
 
         tracing::debug!("Trying to allocate {wanted_size}");
-        let header_raw = self.ctrl.read(0, self.header_size).await?;
-        let mut header = BruteFsHeader::deserialize(&header_raw)?;
+        let mut header = self.get_header().await?;
 
         // TODO:
         // can be done faster with offset and online scan
         // (reusing the deserialize for loop code for AddressVector)
         // try reusing freed and potentially fragmented region first
         let mut addr_to_reuse = None;
-
         for slot in header.extent_freed.items.iter_mut() {
             if let Some(free_addr) = slot.addr.to_optional() {
                 if wanted_size <= slot.capacity {
@@ -532,7 +548,7 @@ impl BruteFS {
         }
 
         if let Some(addr) = addr_to_reuse {
-            self.ctrl.write(0, &header.serialize()?).await?;
+            self.update_header(header).await?;
             return Ok(addr);
         }
 
@@ -548,7 +564,7 @@ impl BruteFS {
 
         let addr = header.extent_freed.global_offset;
         header.extent_freed.global_offset += wanted_size as u64;
-        self.ctrl.write(0, &header.serialize()?).await?;
+        self.update_header(header).await?;
 
         Ok(addr)
     }
@@ -663,6 +679,29 @@ impl BruteFS {
         }
     }
 
+    // TODO:
+    // controller layer chacha20
+
+    // TODO: move
+    // find source inode address + struct
+    // create new inode, just update the extent address to the new one
+    // mark old i
+    // swap extent address
+
+    // TODO: copy
+
+    // TODO:
+    // seek(file, start, end)
+    // full extent but offset finding basically
+
+    // TODO: grow ops
+    // fappend()
+    // fprepend()
+
+    // TODO:
+    // each logical device should have ReplicaOnly
+    // log the events and retry entries that has failed to write
+
     pub async fn unlink<P: Into<PathBuf>>(&self, path: P) -> eyre::Result<()> {
         let path: PathBuf = path.into();
         let (parent_addr, mut parent_inode, filename) = self.resolve_parent(&path).await?;
@@ -707,7 +746,7 @@ impl BruteFS {
         .await?;
 
         tracing::debug!("Rewrite parent directory entries");
-        self.free_full_extent(parent_inode.extent_addr).await?;
+        let old_parent_extent_addr = parent_inode.extent_addr;
 
         let new_dir_extent = Extent {
             next: MaybeU64::default(),
@@ -724,6 +763,8 @@ impl BruteFS {
         self.ctrl
             .write(parent_addr as usize, &parent_inode.serialize()?)
             .await?;
+
+        self.free_full_extent(old_parent_extent_addr).await?;
 
         Ok(())
     }
@@ -758,7 +799,7 @@ impl BruteFS {
                             eyre::bail!("File '{}' already exists", join_absolute(&walked));
                         }
 
-                        self.free_full_extent(inode.extent_addr).await?;
+                        let old_extent_addr = inode.extent_addr;
 
                         let extent = Extent {
                             next: MaybeU64::default(),
@@ -774,6 +815,9 @@ impl BruteFS {
                         self.ctrl
                             .write(*inode_addr as usize, &inode.serialize()?)
                             .await?;
+
+                        self.free_full_extent(old_extent_addr).await?;
+
                         return Ok(());
                     }
                     _ => eyre::bail!("Path '{}' is not file", join_absolute(&walked)),
@@ -1008,7 +1052,7 @@ impl BruteFS {
         }
 
         if found {
-            self.ctrl.write(0, &header.serialize()?).await?;
+            self.update_header(header).await?;
         }
 
         return Ok(());
