@@ -899,9 +899,7 @@ impl BruteFS {
             .await?;
 
         let mut directory = Directory::deserialize(&payload)?;
-        let mut walked = vec![];
         for (name, inode_addr) in &directory.entries {
-            walked.push(name.to_string());
             if name == &filename {
                 let mut inode = INode::deserialize(
                     &self
@@ -912,7 +910,7 @@ impl BruteFS {
                 match inode.kind {
                     INodeKind::File | INodeKind::Symlink => {
                         if !opt.overwrite {
-                            eyre::bail!("File '{}' already exists", join_absolute(&walked));
+                            eyre::bail!("File '{name}' already exists");
                         }
 
                         let old_extent_addr = inode.extent_addr;
@@ -935,7 +933,7 @@ impl BruteFS {
 
                         return Ok(());
                     }
-                    _ => eyre::bail!("Path '{}' is not file", join_absolute(&walked)),
+                    _ => eyre::bail!("Path '{name}' is not file"),
                 }
             }
         }

@@ -26,6 +26,8 @@ Consider the following configuration:
 
 ```yaml
 # brutefs.yaml
+# encrypt the drive
+# or use the cli with --password helloworld if the config and bins are made public
 password: helloworld
 devices:
     - type: file
@@ -78,7 +80,7 @@ brutefs download test.txt my_physical_copy.txt
 # Features
 
 - [x] File System
-  - Encryption (ChaCha20 stream cipher)
+  - [x] Encryption (ChaCha20 stream cipher)
   - [x] brutefs core: fopen, fwrite, fseek, mkdir, fmove, fcopy, unlink
   - [x] native symlink support: create_link
   - [x] extra: fappend

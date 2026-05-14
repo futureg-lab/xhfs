@@ -3,9 +3,13 @@ use crate::{
     interface::config::Config,
     utils::{normalize_path, u64_to_utc_datetime},
 };
+use async_recursion::async_recursion;
 use clap::{Args, Parser, Subcommand};
 use eyre::OptionExt;
-use std::path::PathBuf;
+use std::{
+    io::Write,
+    path::{Path, PathBuf},
+};
 use tokio::{
     fs,
     io::{AsyncWriteExt, stdout},
@@ -49,7 +53,7 @@ pub enum FsSubcommands {
     /// Show entry statistics
     Stats(PathCommand),
     /// Remove file or folder
-    Remove(PathCommand),
+    Rm(PathCommand),
     /// Create a new directory
     Mkdir(PathCommand),
     /// Create a link from a target
@@ -67,11 +71,15 @@ pub struct GlobalOptions {
     /// Path to config yaml
     #[arg(long, default_value = "./brutefs.yaml")]
     pub config: PathBuf,
+    #[arg(long)]
+    pub password: Option<String>,
     /// Enable debug logs
     #[arg(long)]
     pub debug: bool,
     #[arg(short, long)]
     pub verbose: bool,
+    #[arg(short, long)]
+    pub force: bool,
 }
 
 #[derive(Args, Debug)]
@@ -112,7 +120,7 @@ pub struct DownloadCommand {
 pub struct LinkCommand {
     /// Source path inside brutefs
     pub src_path: PathBuf,
-    /// Destination path inside brutefs
+    /// Link destination path inside brutefs
     pub dest_path: PathBuf,
     #[arg(short, long, default_value = "false")]
     pub overwrite: bool,
@@ -154,6 +162,8 @@ pub struct LsCommand {
     /// Directory path
     #[arg(default_value = "/", value_parser = clap::value_parser!(PathBuf))]
     pub path: PathBuf,
+    #[arg(long, default_value = "false")]
+    pub tree: bool,
     #[command(flatten)]
     pub global: GlobalOptions,
 }
@@ -162,8 +172,12 @@ impl MainCommand {
     pub async fn run(&self) -> eyre::Result<()> {
         match &self.command {
             Commands::Format(global_options) => {
-                let bfs = global_options.get_bfs(true).await?;
-                println!("Formatted {} Bytes", bfs.total_capacity()?);
+                if global_options.force || confirm_destructive_action() {
+                    let bfs = global_options.get_bfs(true).await?;
+                    println!("Formatted {} Bytes", bfs.total_capacity()?);
+                } else {
+                    println!("abort");
+                }
             }
             Commands::Write(w) => {
                 let bfs = w.global.get_bfs(false).await?;
@@ -210,11 +224,17 @@ impl MainCommand {
 impl FsCommands {
     pub async fn run(&self) -> eyre::Result<()> {
         match &self.command {
-            FsSubcommands::Ls(ls) => ls.run().await?,
+            FsSubcommands::Ls(ls) => {
+                if ls.tree {
+                    ls.tree().await?
+                } else {
+                    ls.ls().await?
+                }
+            }
             FsSubcommands::Cp(cp) => cp.run().await?,
             FsSubcommands::Mv(mv) => mv.run().await?,
             FsSubcommands::Stats(pc) => pc.stats().await?,
-            FsSubcommands::Remove(pc) => pc.rm().await?,
+            FsSubcommands::Rm(pc) => pc.rm().await?,
             FsSubcommands::Mkdir(pc) => pc.mkdir().await?,
             FsSubcommands::Ln(ln) => ln.run().await?,
         }
@@ -226,12 +246,12 @@ impl FsCommands {
 impl GlobalOptions {
     pub async fn get_bfs(&self, format_new: bool) -> eyre::Result<BruteFS> {
         let config = Config::load(self.config.clone())?;
-        config.materialize(format_new).await
+        config.materialize(format_new, self.password.clone()).await
     }
 }
 
 impl LsCommand {
-    pub async fn run(&self) -> eyre::Result<()> {
+    pub async fn ls(&self) -> eyre::Result<()> {
         let ls = self;
         let bfs = ls.global.get_bfs(false).await?;
         let entries = bfs.ls(&ls.path).await?;
@@ -269,6 +289,51 @@ impl LsCommand {
             }
         }
 
+        Ok(())
+    }
+
+    pub async fn tree(&self) -> eyre::Result<()> {
+        let ls = self;
+        let bfs = ls.global.get_bfs(false).await?;
+        self.print_tree(&bfs, &self.path, "").await?;
+        Ok(())
+    }
+
+    #[async_recursion(?Send)]
+    async fn print_tree(&self, bfs: &BruteFS, path: &Path, prefix: &str) -> eyre::Result<()> {
+        let entries = bfs.ls(path).await?;
+        let count = entries.len();
+        for (i, entry) in entries.into_iter().enumerate() {
+            let is_last = i == count - 1;
+            let connector = if is_last { "└── " } else { "├── " };
+            let full_path = path.join(&entry);
+            let stat = bfs.stats(&full_path).await?;
+
+            let mut info = String::new();
+            if self.global.verbose {
+                if let Some(ref s) = stat {
+                    let size = if matches!(s.kind, INodeKind::Directory) {
+                        "-".to_string()
+                    } else {
+                        bytesize::ByteSize(s.size.unwrap_or(0) as u64).to_string()
+                    };
+                    info = format!(
+                        " [{:<4} {:>8}]",
+                        format!("{:?}", s.kind).to_uppercase(),
+                        size
+                    );
+                }
+            }
+
+            println!("{}{}{}{}", prefix, connector, entry, info);
+
+            if let Some(s) = stat {
+                if matches!(s.kind, INodeKind::Directory) {
+                    let new_prefix = format!("{}{}", prefix, if is_last { "    " } else { "│   " });
+                    self.print_tree(bfs, &full_path, &new_prefix).await?;
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -355,13 +420,27 @@ impl LinkCommand {
     pub async fn run(&self) -> eyre::Result<()> {
         let bfs = self.global.get_bfs(false).await?;
         bfs.create_link(
-            &self.src_path,
             &self.dest_path,
+            &self.src_path,
             WriteOption {
                 overwrite: self.overwrite,
             },
         )
         .await?;
         Ok(())
+    }
+}
+
+fn confirm_destructive_action() -> bool {
+    print!("This action is destructive. Proceed? [y/N]: ");
+    std::io::stdout().flush().unwrap();
+    let mut input = String::new();
+    std::io::stdin()
+        .read_line(&mut input)
+        .expect("Failed to read line");
+
+    match input.trim().to_lowercase().as_str() {
+        "y" | "yes" => true,
+        _ => false,
     }
 }

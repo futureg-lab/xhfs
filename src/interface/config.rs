@@ -193,7 +193,11 @@ configuration:
         Ok(())
     }
 
-    pub async fn materialize(&self, format_new: bool) -> eyre::Result<BruteFS> {
+    pub async fn materialize(
+        &self,
+        format_new: bool,
+        password_override: Option<String>,
+    ) -> eyre::Result<BruteFS> {
         let mut logdev_instances = HashMap::new();
 
         for logdev in &self.configuration.logical {
@@ -245,10 +249,15 @@ configuration:
             )
         })?;
 
-        if format_new {
-            BruteFS::format_new(ctrl, self.password.clone()).await
+        let password = if password_override.is_some() {
+            password_override
         } else {
-            BruteFS::from_formatted(ctrl, self.password.clone()).await
+            self.password.clone()
+        };
+        if format_new {
+            BruteFS::format_new(ctrl, password).await
+        } else {
+            BruteFS::from_formatted(ctrl, password).await
         }
     }
 }
