@@ -405,10 +405,6 @@ impl PathCommand {
                 " Modified Time: {}",
                 u64_to_utc_datetime(stat.mtime).format("%Y-%m-%d %H:%M:%S")
             );
-            println!(
-                " Updated Time: {}",
-                u64_to_utc_datetime(stat.utime).format("%Y-%m-%d %H:%M:%S")
-            );
         } else {
             println!("Path {} does not exist", normalize_path(&self.path));
         }

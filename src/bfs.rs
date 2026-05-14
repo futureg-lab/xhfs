@@ -23,9 +23,6 @@ pub struct INode {
     pub extent_addr: MaybeU64,
     pub mtime: u64,
     pub ctime: u64,
-    pub utime: u64,
-    // pub extra_meta: INodeExtraMetadata,
-    // pub password: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,7 +32,6 @@ pub struct EntryStat {
     pub size: Option<usize>,
     pub mtime: u64,
     pub ctime: u64,
-    pub utime: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,7 +161,6 @@ impl INode {
 
         buf.extend_from_slice(&self.mtime.to_le_bytes());
         buf.extend_from_slice(&self.ctime.to_le_bytes());
-        buf.extend_from_slice(&self.utime.to_le_bytes());
 
         Ok(buf)
     }
@@ -190,21 +185,18 @@ impl INode {
         let mtime = u64::from_le_bytes(data[addr_start..addr_start + 8].try_into()?);
         addr_start += 8;
         let ctime = u64::from_le_bytes(data[addr_start..addr_start + 8].try_into()?);
-        addr_start += 8;
-        let utime = u64::from_le_bytes(data[addr_start..addr_start + 8].try_into()?);
 
         Ok(INode {
             kind,
             total_file_size,
             mtime,
             ctime,
-            utime,
             extent_addr,
         })
     }
 
     pub fn serialized_size() -> usize {
-        1 + 8 + 8 + 8 + 8 + 8
+        1 + 8 + 8 + 8 + 8
     }
 }
 
@@ -304,6 +296,48 @@ impl AddressVector {
             global_offset: 0,
             items: vec![AddressSlot::default(); count],
         }
+    }
+
+    pub fn compactify(&mut self) {
+        let original_count = self.items.len();
+        if original_count < 2 {
+            return;
+        }
+        self.items
+            .sort_by_key(|slot| slot.addr.to_optional().unwrap_or(u64::MAX));
+
+        let mut consolidated = Vec::with_capacity(original_count);
+        let mut items_iter = self.items.drain(..);
+        if let Some(first) = items_iter.next() {
+            consolidated.push(first);
+        }
+
+        for next_slot in items_iter {
+            let last_slot = consolidated.last_mut().unwrap();
+            if let (Some(last_addr), Some(next_addr)) =
+                (last_slot.addr.to_optional(), next_slot.addr.to_optional())
+            {
+                if last_addr + (last_slot.capacity as u64) == next_addr {
+                    last_slot.capacity += next_slot.capacity;
+                    continue;
+                }
+            }
+            consolidated.push(next_slot);
+        }
+
+        // greedy: smallest non-zero/usable capacity first
+        consolidated.sort_by_key(|s| {
+            if s.capacity == 0 {
+                usize::MAX
+            } else {
+                s.capacity
+            }
+        });
+
+        while consolidated.len() < original_count {
+            consolidated.push(AddressSlot::default());
+        }
+        self.items = consolidated;
     }
 
     pub fn serialize(&self) -> eyre::Result<Vec<u8>> {
@@ -428,7 +462,6 @@ impl BruteFS {
         let root = INode {
             ctime: utc_now_u64(),
             mtime: utc_now_u64(),
-            utime: utc_now_u64(),
             total_file_size: 0,
             extent_addr: MaybeU64::default(),
             kind: INodeKind::Directory,
@@ -445,7 +478,9 @@ impl BruteFS {
         ctrl.raw_write(0, &header.serialize()?).await?;
         ctrl.write(header_size, &root_raw).await?;
 
-        Self::from_formatted(ctrl, password).await
+        let bfs = Self::from_formatted(ctrl, password).await?;
+        // bfs.mkdir("/", false).await?;
+        Ok(bfs)
     }
 
     pub async fn format_headers_report(&self) -> eyre::Result<String> {
@@ -487,10 +522,6 @@ impl BruteFS {
             "- Modification time: {}\n",
             u64_to_utc_datetime(inode.mtime)
         ));
-        out.push_str(&format!(
-            "- Update time: {}\n",
-            u64_to_utc_datetime(inode.utime)
-        ));
 
         out.push_str(&format!(
             "- Immediate Extent address: {} (0x{:x})\n",
@@ -519,6 +550,8 @@ impl BruteFS {
     }
 
     pub async fn update_header(&self, header: BruteFsHeader) -> eyre::Result<()> {
+        let mut header = header;
+        header.extent_freed.compactify();
         self.ctrl.raw_write(0, &header.serialize()?).await
     }
 
@@ -955,7 +988,6 @@ impl BruteFS {
         let inode = INode {
             ctime: utc_now_u64(),
             mtime: utc_now_u64(),
-            utime: utc_now_u64(),
             total_file_size: file_size,
             extent_addr: MaybeU64::from(extent_addr),
             kind: if is_symlink {
@@ -980,6 +1012,7 @@ impl BruteFS {
             .await?;
         let old_parent_extent = parent_inode.extent_addr;
         parent_inode.extent_addr = MaybeU64::from(new_dir_extent_addr);
+        parent_inode.mtime = utc_now_u64();
 
         self.ctrl
             .write(parent_addr as usize, &parent_inode.serialize()?)
@@ -1025,6 +1058,7 @@ impl BruteFS {
 
         let mut created_new = false;
         let (mut curr_addr, mut curr_inode) = self.get_root_inode().await?;
+        let at_root = components.len() <= 1;
         for component in components.into_iter() {
             match curr_inode.kind {
                 INodeKind::Directory => {}
@@ -1053,7 +1087,7 @@ impl BruteFS {
                 )?;
                 continue;
             }
-            if !recursive {
+            if !recursive && !at_root {
                 eyre::bail!("Directory '{component}' does not exist");
             }
 
@@ -1061,7 +1095,6 @@ impl BruteFS {
             let new_inode = INode {
                 ctime: utc_now_u64(),
                 mtime: utc_now_u64(),
-                utime: utc_now_u64(),
                 total_file_size: 0,
                 extent_addr: MaybeU64::default(),
                 kind: INodeKind::Directory,
@@ -1174,6 +1207,46 @@ impl BruteFS {
         }
     }
 
+    #[async_recursion(?Send)]
+    pub async fn fread_stream<P: Into<PathBuf>>(
+        &self,
+        path: P,
+        block: u64,
+        offset: u64,
+    ) -> eyre::Result<Vec<u8>> {
+        let path: PathBuf = path.into();
+        let (_, inode) = self.resolve_path(&path).await?;
+        match inode.kind {
+            INodeKind::File => {
+                // TODO: advance by block since this is not cheap
+                // maybe instead return a stream to be consumed like
+                // stream = fread_stream(..).await
+                // while let Some(next) =  stream {
+                // self.seek_full_data_from_extent(inode.extent_addr, offset, inode.total_file_size)
+                //     .await
+                todo!()
+            }
+            INodeKind::Symlink => {
+                tracing::debug!("Trying to read+seek file from symlink");
+                let raw_path = self.read_full_data_from_extent(inode.extent_addr).await?;
+                let symlink = SymLink::deserialize(&raw_path)?;
+                tracing::debug!(
+                    " {} *=> {}",
+                    normalize_path(&path),
+                    normalize_path(&symlink.path)
+                );
+                if symlink.path == path {
+                    tracing::warn!("Invalid fs state: Symlink pointing to itself detected");
+                    eyre::bail!("Symlink pointing to itself detected");
+                }
+                self.fread_stream(symlink.path, block, offset).await
+            }
+            INodeKind::Directory => {
+                eyre::bail!("Cannot fread directory");
+            }
+        }
+    }
+
     // TODO:
     // fprepend?
 
@@ -1263,7 +1336,6 @@ impl BruteFS {
                 kind: inode.kind,
                 mtime: inode.mtime,
                 ctime: inode.ctime,
-                utime: inode.utime,
             }));
         }
         let (_, inode) = match self.resolve_path(path).await {
@@ -1281,7 +1353,6 @@ impl BruteFS {
             kind: inode.kind,
             mtime: inode.mtime,
             ctime: inode.ctime,
-            utime: inode.utime,
         }))
     }
 

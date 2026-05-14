@@ -13,7 +13,6 @@ pub fn test_basic_binary_serialization() -> eyre::Result<()> {
             total_file_size: 42,
             mtime: 567845678,
             ctime: 123457523,
-            utime: 444487844,
         };
         let data = original.serialize()?;
         let reconstr = INode::deserialize(&data)?;

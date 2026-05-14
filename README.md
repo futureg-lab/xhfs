@@ -1,7 +1,7 @@
 # brutefs
 
 A tiny, full-fledged file system that enables you to store files anywhere, on
-anything, across an arbitrary combination of devices.
+anything, across an arbitrary combination of arbitrary devices.
 
 # Concept
 

@@ -1,9 +1,9 @@
 use crate::{
     addr::MaybeU64,
-    bfs::{AddressSlot, BruteFS, INodeKind, WriteOption},
-    device::disk::Controller,
+    bfs::{AddressSlot, AddressVector, BruteFS, INodeKind, WriteOption},
     device::{
         Device,
+        disk::Controller,
         kv_device::{KVDevice, MemoryKV},
         logical::LogicalDevice,
     },
@@ -36,7 +36,7 @@ async fn test_base_allocate_brutefs() -> eyre::Result<()> {
     );
 
     {
-        let offset = 16077; // header + root INode
+        let offset = 16069; // header + root INode
         let addr = bfs.allocate(100).await?;
         assert_eq!(addr, offset, "allocate init");
         let addr = bfs.allocate(4).await?;
@@ -133,10 +133,10 @@ async fn test_brutefs_core_ops() -> eyre::Result<()> {
 
     {
         assert_eq!(bfs.count_reusable_regions().await?, 10);
-        assert_eq!(bfs.get_header().await?.extent_freed.global_offset, 20616);
+        assert_eq!(bfs.get_header().await?.extent_freed.global_offset, 20584);
 
         let _ = bfs.allocate(535).await?; // slot is 536 => 535 taken + 1 left
-        assert_eq!(bfs.get_header().await?.extent_freed.global_offset, 20616);
+        assert_eq!(bfs.get_header().await?.extent_freed.global_offset, 20584);
         assert_eq!(
             bfs.count_reusable_regions().await?,
             10,
@@ -148,7 +148,7 @@ async fn test_brutefs_core_ops() -> eyre::Result<()> {
         let _ = bfs.allocate(10000).await?;
         assert_eq!(
             bfs.get_header().await?.extent_freed.global_offset,
-            30616,
+            30584,
             "largest known fragmented region is too small, fallback to bump allocator instead"
         );
     }
@@ -294,4 +294,54 @@ async fn test_brutefs_ref_manips_and_stats() -> eyre::Result<()> {
     );
 
     Ok(())
+}
+
+#[test]
+fn test_address_vector_compactify() {
+    let mut av = AddressVector::allocate(10);
+    av.items[0] = AddressSlot {
+        // lone block
+        addr: MaybeU64::from(1000),
+        capacity: 20,
+    };
+    av.items[1] = AddressSlot {
+        // A
+        addr: MaybeU64::from(100),
+        capacity: 50,
+    };
+    av.items[2] = AddressSlot {
+        // dead slot with an address but no size
+        addr: MaybeU64::from(500),
+        capacity: 0,
+    };
+    av.items[3] = AddressSlot {
+        // B - contiguous with A
+        addr: MaybeU64::from(150),
+        capacity: 50,
+    };
+    av.items[4] = AddressSlot {
+        // C - contiguous with B
+        addr: MaybeU64::from(200),
+        capacity: 50,
+    };
+    av.items[5] = AddressSlot {
+        // lone block
+        addr: MaybeU64::from(900),
+        capacity: 5,
+    };
+
+    // slots [6..10] are default (with None == 0)
+    av.compactify();
+    assert_eq!(av.items.len(), 10, "Vector must maintain fixed size");
+
+    assert_eq!(av.items[0].capacity, 5);
+    assert_eq!(av.items[0].addr.get(), 900);
+    assert_eq!(av.items[1].capacity, 20);
+    assert_eq!(av.items[1].addr.get(), 1000);
+    assert_eq!(av.items[2].capacity, 150);
+    assert_eq!(av.items[2].addr.get(), 100);
+
+    for i in 3..10 {
+        assert_eq!(av.items[i].capacity, 0, "Slot {} should have 0 capacity", i);
+    }
 }
