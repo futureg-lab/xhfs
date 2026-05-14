@@ -491,17 +491,34 @@ impl BruteFS {
         out.push_str(&format!("brutefs version: {}\n", header.version));
 
         out.push_str(&format!(
-            "- Current global offset: {} (0x{:x})\n",
+            "- Current global offset: {} (0x{:08x})\n",
             header.extent_freed.global_offset, header.extent_freed.global_offset,
         ));
 
-        out.push_str(&format!(
-            "- Total known fragments: {}\n",
-            self.count_reusable_regions().await?
-        ));
+        let regions = self.reusable_regions().await?;
+        out.push_str(&format!("- Total known fragments: {}\n", regions.len()));
+        let show = 3;
+        out.push_str(&format!("Top {show} smallest:\n"));
+        for region in regions.iter().take(show) {
+            out.push_str(&format!(
+                "  - 0x{:08x} -- 0x{:08x} ({:>10} B)\n",
+                region.addr.get(),
+                region.addr.get() + region.capacity as u64,
+                region.capacity
+            ));
+        }
+        out.push_str(&format!("Top {show} biggest:\n"));
+        for region in regions.iter().rev().take(show) {
+            out.push_str(&format!(
+                "  - 0x{:08x} -- 0x{:08x} ({:>10} B)\n",
+                region.addr.get(),
+                region.addr.get() + region.capacity as u64,
+                region.capacity
+            ));
+        }
 
         let capacity = self.total_capacity()?;
-        out.push_str(&format!("Capacity: {}\n", capacity));
+        out.push_str(&format!("Capacity: {:>10} B\n", capacity));
 
         let (ioffset, inode) = self
             .get_root_inode()
@@ -509,7 +526,7 @@ impl BruteFS {
             .wrap_err_with(|| eyre::eyre!("Data is either corrupt or encrypted"))?;
 
         out.push_str(&format!(
-            "Root inode offset {} (0x{:x})\n",
+            "Root inode offset {} (0x{:08x})\n",
             ioffset, ioffset
         ));
 
@@ -524,7 +541,7 @@ impl BruteFS {
         ));
 
         out.push_str(&format!(
-            "- Immediate Extent address: {} (0x{:x})\n",
+            "- Immediate Extent address: {} (0x{:08x})\n",
             inode.extent_addr.get(),
             inode.extent_addr.get()
         ));
@@ -1356,14 +1373,14 @@ impl BruteFS {
         }))
     }
 
-    pub async fn count_reusable_regions(&self) -> eyre::Result<usize> {
+    pub async fn reusable_regions(&self) -> eyre::Result<Vec<AddressSlot>> {
         let header = self.get_header().await?;
         return Ok(header
             .extent_freed
             .items
-            .iter()
+            .into_iter()
             .filter(|slot| !slot.is_free())
-            .count());
+            .collect::<Vec<_>>());
     }
 
     pub async fn free_full_extent(&self, start_extent_addr: MaybeU64) -> eyre::Result<()> {

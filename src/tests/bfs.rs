@@ -115,7 +115,7 @@ async fn test_brutefs_core_ops() -> eyre::Result<()> {
     }
 
     {
-        assert_eq!(bfs.count_reusable_regions().await?, 5);
+        assert_eq!(bfs.reusable_regions().await?.len(), 5);
         assert!(
             bfs.unlink("/hello/baz").await.is_err(),
             "cannot unlink nested path"
@@ -132,13 +132,13 @@ async fn test_brutefs_core_ops() -> eyre::Result<()> {
     }
 
     {
-        assert_eq!(bfs.count_reusable_regions().await?, 10);
+        assert_eq!(bfs.reusable_regions().await?.len(), 10);
         assert_eq!(bfs.get_header().await?.extent_freed.global_offset, 20584);
 
         let _ = bfs.allocate(535).await?; // slot is 536 => 535 taken + 1 left
         assert_eq!(bfs.get_header().await?.extent_freed.global_offset, 20584);
         assert_eq!(
-            bfs.count_reusable_regions().await?,
+            bfs.reusable_regions().await?.len(),
             10,
             "hit a known fragmented region but did a split instead, leaving count unchanged"
         );
