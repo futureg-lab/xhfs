@@ -1,14 +1,12 @@
-use crate::{
-    bfs::{BruteFS, WriteOption},
-    device::{Device, disk::Controller, fs_device::FsDevice, logical::LogicalDevice},
-};
-use std::sync::Arc;
+use crate::interface::cli::MainCommand;
+use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
 pub mod addr;
 pub mod bfs;
 pub mod crypto;
 pub mod device;
+pub mod interface;
 pub mod utils;
 
 #[cfg(test)]
@@ -17,7 +15,7 @@ mod tests;
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
     let env_filter = EnvFilter::try_from_default_env()
-        .or_else(|_| EnvFilter::try_new("brutefs=WARN"))
+        .or_else(|_| EnvFilter::try_new("brutefs=ERROR"))
         .unwrap();
 
     tracing_subscriber::fmt()
@@ -25,52 +23,5 @@ async fn main() -> eyre::Result<()> {
         .without_time()
         .init();
 
-    let dev1 = LogicalDevice::new(
-        2,
-        [
-            Arc::from(FsDevice::new("A.bin", 10 * 1000 * 1000).await?) as Arc<dyn Device>,
-            Arc::from(FsDevice::new("B.bin", 10 * 1000 * 1000).await?) as Arc<dyn Device>,
-        ],
-    )?;
-    let dev2 = LogicalDevice::new(
-        2,
-        [Arc::from(FsDevice::new("C.bin", 20 * 1000 * 1000).await?) as Arc<dyn Device>],
-    )?;
-
-    let ctrl = Controller::from([dev1, dev2]).await?;
-    println!("Total size {:?}", ctrl.total_capacity());
-
-    let bfs = BruteFS::format_new(ctrl.clone(), Some("helloworld".to_string())).await?;
-    println!("Root {:?}", bfs.get_root_inode().await?);
-    bfs.mkdir("/", true).await?;
-    println!("----");
-    bfs.mkdir("/hello", true).await?;
-    bfs.mkdir("/hello/foo", true).await?;
-    bfs.mkdir("/hello/bar", true).await?;
-    bfs.mkdir("/hello/baz/aaa", true).await?;
-    bfs.mkdir("/hello/baz/bbb", true).await?;
-    bfs.mkdir("/world", true).await?;
-    // bfs.mkdir("/world".into(), true).await?;
-    bfs.create_link("/thelink", "/hello/baz/", WriteOption { overwrite: false })
-        .await?;
-
-    let bfs = BruteFS::from_formatted(ctrl, Some("helloworld".to_string())).await?;
-    bfs.fmove("/hello/baz", "/EntrIESs").await?;
-
-    println!("1");
-    for entry in bfs.ls("/").await? {
-        //         hello
-        // world
-        // thelink
-        println!("{entry}");
-    }
-
-    println!("2");
-    // for entry in bfs.ls("/thelink").await? {
-    //     println!("{entry}");
-    // }
-    // println!("{:?}", bfs.stats("/thelink").await?);
-    println!("{:?}", bfs.stats("/EntrIESs").await?);
-
-    Ok(())
+    MainCommand::parse().run().await
 }

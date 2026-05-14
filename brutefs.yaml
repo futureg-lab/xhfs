@@ -1,0 +1,29 @@
+# the drive will be encrypted
+password: helloworld
+devices:
+  - type: fs
+    name: bloc1
+    path: ./part1.bin
+  - type: fs
+    name: bloc2
+    path: ./part1-replica.bin
+  - type: fs
+    name: bloc3
+    path: ./part3.bin
+  # - type: s3
+  #   name: bloc3
+  #   key: ..
+  #  ..
+configuration:
+  logical:
+  - name: dev1
+    include: [bloc1, bloc2]
+    capacity: "2 MiB"
+    max_concurrent: 2
+  - name: dev2
+    include: [bloc3]
+    capacity: "2 MiB"
+    max_concurrent: 1
+  # Final storage layout
+  # [dev1: 0 - 2MB] [dev2: 2MiB - 4MiB]
+  layout: [dev1, dev2]

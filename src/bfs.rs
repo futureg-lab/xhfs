@@ -448,37 +448,61 @@ impl BruteFS {
         Self::from_formatted(ctrl, password).await
     }
 
-    pub async fn ensure_headers(&self) -> eyre::Result<()> {
+    pub async fn format_headers_report(&self) -> eyre::Result<String> {
+        let mut out = String::new();
+
         let header = self.get_header().await?;
-        tracing::debug!("brutefs version: {}", header.version);
-        tracing::debug!(
-            "- Current global offset: {} (0x{:x})",
-            header.extent_freed.global_offset,
-            header.extent_freed.global_offset,
-        );
-        tracing::debug!(
-            "- Total known fragments: {}",
+
+        out.push_str(&format!("brutefs version: {}\n", header.version));
+
+        out.push_str(&format!(
+            "- Current global offset: {} (0x{:x})\n",
+            header.extent_freed.global_offset, header.extent_freed.global_offset,
+        ));
+
+        out.push_str(&format!(
+            "- Total known fragments: {}\n",
             self.count_reusable_regions().await?
-        );
+        ));
 
         let capacity = self.total_capacity()?;
-        tracing::debug!("Capacity: {capacity}");
+        out.push_str(&format!("Capacity: {}\n", capacity));
 
         let (ioffset, inode) = self
             .get_root_inode()
             .await
             .wrap_err_with(|| eyre::eyre!("Data is either corrupt or encrypted"))?;
-        tracing::debug!("Root inode offset {ioffset} (0x{ioffset:x})");
-        tracing::debug!("- Kind: {:?}", inode.kind);
-        tracing::debug!("- Creation time: {}", u64_to_utc_datetime(inode.ctime));
-        tracing::debug!("- Modification time: {}", u64_to_utc_datetime(inode.mtime));
-        tracing::debug!("- Update time: {}", u64_to_utc_datetime(inode.utime));
-        tracing::debug!(
-            "- Immediate Extent address: {} (0x{:x})",
+
+        out.push_str(&format!(
+            "Root inode offset {} (0x{:x})\n",
+            ioffset, ioffset
+        ));
+
+        out.push_str(&format!("- Kind: {:?}\n", inode.kind));
+        out.push_str(&format!(
+            "- Creation time: {}\n",
+            u64_to_utc_datetime(inode.ctime)
+        ));
+        out.push_str(&format!(
+            "- Modification time: {}\n",
+            u64_to_utc_datetime(inode.mtime)
+        ));
+        out.push_str(&format!(
+            "- Update time: {}\n",
+            u64_to_utc_datetime(inode.utime)
+        ));
+
+        out.push_str(&format!(
+            "- Immediate Extent address: {} (0x{:x})\n",
             inode.extent_addr.get(),
             inode.extent_addr.get()
-        );
+        ));
 
+        Ok(out)
+    }
+
+    pub async fn ensure_headers(&self) -> eyre::Result<()> {
+        tracing::debug!("{}", self.format_headers_report().await?);
         Ok(())
     }
 
@@ -928,7 +952,7 @@ impl BruteFS {
             .write(extent_addr as usize, &extent.serialize()?)
             .await?;
 
-        println!("File size {filename} => {file_size} B");
+        // println!("File size {filename} => {file_size} B");
 
         let inode = INode {
             ctime: utc_now_u64(),
