@@ -8,7 +8,7 @@ use crate::{
 use clap::{Args, Parser, Subcommand};
 use std::{io::Write, path::PathBuf};
 use tokio::{
-    fs,
+    fs::{self, File},
     io::{AsyncWriteExt, stdout},
 };
 
@@ -28,8 +28,8 @@ pub struct MainCommand {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// Write local file into brutefs
-    Write(WriteCommand),
+    /// Upload local file into brutefs
+    Upload(UploadCommand),
     /// Download file from brutefs into local filesystem
     Download(DownloadCommand),
     /// Read the file immediately and print to stdout
@@ -71,13 +71,17 @@ pub struct PathCommand {
 }
 
 #[derive(Args, Debug)]
-pub struct WriteCommand {
+pub struct UploadCommand {
     /// Local source file
     pub src_path: PathBuf,
     /// Destination path inside brutefs
     pub dest_path: PathBuf,
-    #[arg(long, default_value = "false")]
+    #[arg(short, long, default_value = "false")]
     pub overwrite: bool,
+    #[arg(short, long, default_value = "1024")]
+    pub block_size: usize,
+    #[arg(long, default_value = "false")]
+    pub single_block: bool,
     #[command(flatten)]
     pub global: GlobalOptions,
 }
@@ -105,17 +109,30 @@ impl MainCommand {
                     println!("abort");
                 }
             }
-            Commands::Write(w) => {
-                let bfs = w.global.get_bfs().await?;
-                let data = fs::read(&w.src_path).await?;
-                bfs.fwrite(
-                    &w.dest_path,
-                    data,
-                    WriteOption {
-                        overwrite: w.overwrite,
-                    },
-                )
-                .await?;
+            Commands::Upload(u) => {
+                let bfs = u.global.get_bfs().await?;
+                let data = fs::read(&u.src_path).await?;
+                if u.single_block {
+                    bfs.fwrite(
+                        &u.dest_path,
+                        data,
+                        WriteOption {
+                            overwrite: u.overwrite,
+                        },
+                    )
+                    .await?;
+                } else {
+                    let file = File::open(&u.src_path).await?;
+                    bfs.fwrite_stream(
+                        &u.dest_path,
+                        file,
+                        u.block_size,
+                        WriteOption {
+                            overwrite: u.overwrite,
+                        },
+                    )
+                    .await?;
+                }
             }
             Commands::Download(d) => {
                 let bfs = d.global.get_bfs().await?;

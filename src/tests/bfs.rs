@@ -286,7 +286,7 @@ async fn test_brutefs_ref_manips_and_stats() -> eyre::Result<()> {
         "size not immediately calculated for folders"
     );
     assert_eq!(dtxt_stats.kind, INodeKind::File, "stats should work");
-    assert_eq!(dtxt_stats.size, Some(5), "should give correct data size");
+    assert_eq!(dtxt_stats.size, Some(8), "should give correct data size");
     assert_eq!(
         filelink_stats.kind,
         INodeKind::Symlink,

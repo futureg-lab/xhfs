@@ -8,9 +8,13 @@ use async_recursion::async_recursion;
 use eyre::Context;
 use std::{
     fmt::{Debug, Display},
+    io::SeekFrom,
     path::PathBuf,
 };
-use tokio::sync::Mutex;
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt},
+    sync::Mutex,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum INodeKind {
@@ -64,6 +68,76 @@ pub struct AddressSlot {
 pub struct RegionSlot {
     pub start: MaybeU64,
     pub end: MaybeU64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BruteFsError {
+    Insufficient {
+        wanted: usize,
+        max_slot_size: usize,
+        left_contiguous: usize,
+    },
+    Error {
+        err: String,
+    },
+}
+
+impl Display for BruteFsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BruteFsError::Insufficient {
+                wanted,
+                max_slot_size,
+                left_contiguous,
+            } => {
+                write!(
+                    f,
+                    "Insufficient space, operation requires {wanted} B, max fragment available {max_slot_size} B, max contiguous bloc {left_contiguous}"
+                )
+            }
+            BruteFsError::Error { err } => write!(f, "{err}"),
+        }
+    }
+}
+
+impl BruteFsError {
+    pub fn from_error(error: impl std::error::Error) -> BruteFsError {
+        BruteFsError::Error {
+            err: error.to_string(),
+        }
+    }
+    pub fn from_report(error: eyre::Report) -> BruteFsError {
+        BruteFsError::Error {
+            err: error.to_string(),
+        }
+    }
+}
+
+impl From<eyre::Report> for BruteFsError {
+    fn from(value: eyre::Report) -> Self {
+        BruteFsError::Error {
+            err: value.to_string(),
+        }
+    }
+}
+
+impl From<Box<dyn std::error::Error + Send + Sync>> for BruteFsError {
+    fn from(value: Box<dyn std::error::Error + Send + Sync>) -> Self {
+        BruteFsError::Error {
+            err: value.to_string(),
+        }
+    }
+}
+
+impl std::error::Error for BruteFsError {}
+
+macro_rules! bfs_bail {
+    ($msg:literal $(,)?) => {
+        return Err(BruteFsError::Error{ err: $msg.into() })
+    };
+    ($fmt:expr, $($arg:tt)*) => {
+        return Err(BruteFsError::Error { err: format!($fmt, $($arg)*) })
+    };
 }
 
 impl AddressSlot {
@@ -554,7 +628,7 @@ impl BruteFS {
         out.push_str(&format!("- Total known fragments: {}\n", regions.len()));
         let show = 3;
         out.push_str(&format!("Top {show} smallest:\n"));
-        for region in regions.iter().take(show) {
+        for region in regions.iter().take(show).filter(|r| r.capacity > 0) {
             out.push_str(&region.to_string());
         }
         out.push_str(&format!("Top {show} biggest:\n"));
@@ -563,7 +637,9 @@ impl BruteFS {
         }
 
         let capacity = self.total_capacity()?;
-        out.push_str(&format!("Capacity: {:>10} B\n", capacity));
+        let rem_capacity = self.total_remaining_capacity().await?;
+        out.push_str(&format!("Capacity:  {capacity:>10} B\n"));
+        out.push_str(&format!("Remaining: {rem_capacity:>10} B\n"));
 
         let (ioffset, inode) = self
             .get_root_inode()
@@ -617,19 +693,17 @@ impl BruteFS {
     ///
     /// This avoids implementing a busy flag or some crazy lock mechanism on disk
     /// especially since locks themselves expect their implementations to be even more atomic.
-    pub async fn allocate(&self, wanted_size: usize) -> eyre::Result<u64> {
+    pub async fn allocate(&self, wanted_size: usize) -> Result<u64, BruteFsError> {
         let _ = self.alloc_guard.lock().await;
 
         tracing::debug!("Trying to allocate {wanted_size}");
         let mut header = self.get_header().await?;
 
-        // TODO:
-        // can be done faster with offset and online scan
-        // (reusing the deserialize for loop code for AddressVector)
-        // try reusing freed and potentially fragmented region first
         let mut addr_to_reuse = None;
+        let mut max_slot_size_seen = 0;
         for slot in header.extent_freed.items.iter_mut() {
             if let Some(free_addr) = slot.addr.to_optional() {
+                max_slot_size_seen = max_slot_size_seen.max(slot.capacity);
                 if wanted_size <= slot.capacity {
                     tracing::debug!("Found free slot at 0x{free_addr}");
                     addr_to_reuse = Some(free_addr);
@@ -663,7 +737,11 @@ impl BruteFS {
             .total_capacity()?
             .saturating_sub(header.extent_freed.global_offset as usize);
         if remaining < wanted_size {
-            eyre::bail!("Could not allocate {wanted_size} bytes, only {remaining} left");
+            return Err(BruteFsError::Insufficient {
+                wanted: wanted_size,
+                max_slot_size: max_slot_size_seen,
+                left_contiguous: remaining,
+            });
         }
 
         let addr = header.extent_freed.global_offset;
@@ -677,6 +755,26 @@ impl BruteFS {
         self.ctrl
             .total_capacity()
             .ok_or_else(|| eyre::eyre!("File system controller not ready"))
+    }
+
+    pub async fn total_remaining_capacity(&self) -> eyre::Result<usize> {
+        let mut total = self.total_capacity()?;
+        let header = self.get_header().await?;
+        let global_offset = self.get_header().await?.extent_freed.global_offset;
+        let left_contiguous = total.saturating_sub(global_offset as usize);
+        let reusable_total = self
+            .reusable_regions()
+            .await?
+            .iter()
+            .map(|c| c.capacity)
+            .sum::<usize>();
+
+        total = total.saturating_sub(left_contiguous);
+        total = total.saturating_sub(header.serialized_size());
+
+        total = total.saturating_add(reusable_total);
+
+        Ok(total)
     }
 
     pub async fn resolve_path<P: Into<PathBuf>>(&self, path: P) -> eyre::Result<(u64, INode)> {
@@ -788,7 +886,7 @@ impl BruteFS {
         src: P,
         dest: P,
         opt: WriteOption,
-    ) -> eyre::Result<()> {
+    ) -> Result<(), BruteFsError> {
         let data = self.fread(src).await?;
         let (_dst_parent_addr, _dst_parent_inode, _) = self.resolve_parent(dest.clone()).await?;
         self.fwrite(dest, data, opt).await
@@ -968,7 +1066,16 @@ impl BruteFS {
         data: Vec<u8>,
         is_symlink: bool,
         opt: WriteOption,
-    ) -> eyre::Result<()> {
+    ) -> Result<(), BruteFsError> {
+        let remaining = self.total_remaining_capacity().await?;
+        let inp_len = data.len();
+        if inp_len > remaining {
+            return Err(BruteFsError::from_report(eyre::eyre!(
+                "Insufficient space, operation requires {} B more",
+                inp_len.saturating_sub(remaining)
+            )));
+        }
+
         let path: PathBuf = path.into();
         let (parent_addr, mut parent_inode, filename) = self.resolve_parent(&path).await?;
         let payload = self
@@ -987,7 +1094,9 @@ impl BruteFS {
                 match inode.kind {
                     INodeKind::File | INodeKind::Symlink => {
                         if !opt.overwrite {
-                            eyre::bail!("File '{name}' already exists");
+                            return Err(BruteFsError::from_report(eyre::eyre!(
+                                "File '{name}' already exists"
+                            )));
                         }
 
                         let old_extent_addr = inode.extent_addr;
@@ -1010,7 +1119,11 @@ impl BruteFS {
 
                         return Ok(());
                     }
-                    _ => eyre::bail!("Path '{name}' is not file"),
+                    _ => {
+                        return Err(BruteFsError::from_report(eyre::eyre!(
+                            "Path '{name}' is not file"
+                        )));
+                    }
                 }
             }
         }
@@ -1072,10 +1185,57 @@ impl BruteFS {
         path: P,
         data: Vec<u8>,
         opt: WriteOption,
-    ) -> eyre::Result<()> {
+    ) -> Result<(), BruteFsError> {
         self.blob_write(path, data, false, opt).await
     }
 
+    pub async fn fwrite_stream<P, R>(
+        &self,
+        path: P,
+        mut stream: R,
+        mut block_size: usize,
+        opt: WriteOption,
+    ) -> eyre::Result<()>
+    where
+        P: Into<PathBuf>,
+        R: AsyncRead + AsyncSeek + Unpin,
+    {
+        let path: PathBuf = path.into();
+        self.fwrite(&path, vec![], opt).await?;
+        let mut buf = vec![0u8; block_size];
+        let mut pos = stream.stream_position().await?;
+        loop {
+            if buf.len() != block_size {
+                buf.resize(block_size, 0);
+            }
+
+            let n = stream.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+
+            let chunk = &buf[..n];
+            match self.fappend(&path, chunk.to_vec()).await {
+                Ok(_) => {
+                    pos += n as u64;
+                }
+                Err(e) => {
+                    if let BruteFsError::Insufficient { max_slot_size, .. } = e {
+                        let new_size = max_slot_size.saturating_sub(16);
+                        if new_size == 0 {
+                            return Err(e.into());
+                        }
+                        block_size = new_size;
+                        stream.seek(SeekFrom::Start(pos)).await?;
+                        continue;
+                    }
+                    return Err(e.into());
+                }
+            }
+        }
+
+        Ok(())
+    }
     pub async fn create_link<P: Into<PathBuf> + Clone>(
         &self,
         path: P,
@@ -1191,13 +1351,13 @@ impl BruteFS {
     }
 
     #[async_recursion(?Send)]
-    pub async fn fread<P: Into<PathBuf>>(&self, path: P) -> eyre::Result<Vec<u8>> {
+    pub async fn fread<P: Into<PathBuf>>(&self, path: P) -> Result<Vec<u8>, BruteFsError> {
         let path: PathBuf = path.into();
         let (_, inode) = self.resolve_path(&path).await?;
         match inode.kind {
-            INodeKind::Directory => {
-                eyre::bail!("Cannot fread directory");
-            }
+            INodeKind::Directory => Err(BruteFsError::from_report(eyre::eyre!(
+                "Cannot fread directory"
+            ))),
             INodeKind::File => self.read_full_data_from_extent(inode.extent_addr).await,
             INodeKind::Symlink => {
                 tracing::debug!("Trying to read file from symlink");
@@ -1210,7 +1370,9 @@ impl BruteFS {
                 );
                 if symlink.path == path {
                     tracing::warn!("Invalid fs state: Symlink pointing to itself detected");
-                    eyre::bail!("Symlink pointing to itself detected");
+                    return Err(BruteFsError::from_report(eyre::eyre!(
+                        "Symlink pointing to itself detected"
+                    )));
                 }
                 self.fread(symlink.path).await
             }
@@ -1296,17 +1458,23 @@ impl BruteFS {
     // fprepend?
 
     #[async_recursion(?Send)]
-    pub async fn fappend<P: Into<PathBuf>>(&self, path: P, data: Vec<u8>) -> eyre::Result<()> {
+    pub async fn fappend<P: Into<PathBuf>>(
+        &self,
+        path: P,
+        data: Vec<u8>,
+    ) -> Result<(), BruteFsError> {
         let path: PathBuf = path.into();
-        let (_, inode) = self.resolve_path(&path).await?;
+        let (iaddr, mut inode) = self.resolve_path(&path).await?;
         match inode.kind {
             INodeKind::File => {
+                inode.total_file_size += data.len() as u64;
                 let new_extent = Extent {
                     next: MaybeU64::default(),
                     data,
                 };
                 self.append_or_allocate_extent(inode.extent_addr, new_extent)
                     .await?;
+                self.update_inode(iaddr, inode).await?;
             }
             INodeKind::Symlink => {
                 tracing::debug!("Trying tofappend file from symlink");
@@ -1319,32 +1487,37 @@ impl BruteFS {
                 );
                 if symlink.path == path {
                     tracing::warn!("Invalid fs state: Symlink pointing to itself detected");
-                    eyre::bail!("Symlink pointing to itself detected");
+                    bfs_bail!("Symlink pointing to itself detected");
                 }
                 self.fappend(symlink.path, data).await?;
             }
             INodeKind::Directory => {
-                eyre::bail!("Cannot append data to directory");
+                bfs_bail!("Cannot append data to directory");
             }
         };
 
         Ok(())
     }
 
-    pub async fn update_mtime(&self, addr: u64, mut inode: INode) -> eyre::Result<()> {
+    pub async fn update_inode(&self, addr: u64, mut inode: INode) -> eyre::Result<()> {
         inode.mtime = utc_now_u64();
         self.ctrl.write(addr as usize, &inode.serialize()?).await
     }
 
-    pub async fn read_extent(&self, addr: u64) -> eyre::Result<Extent> {
+    pub async fn read_extent(&self, addr: u64) -> Result<Extent, BruteFsError> {
         let extent_header = self.ctrl.read(addr as usize, 8).await?;
-        let curr_extent_data_size = u64::from_le_bytes(extent_header[0..8].try_into()?);
-        Extent::deserialize(
+        let curr_extent_data_size = u64::from_le_bytes(
+            extent_header[0..8]
+                .try_into()
+                .map_err(BruteFsError::from_error)?,
+        );
+        let out = Extent::deserialize(
             &self
                 .ctrl
                 .read(addr as usize, 8 + 8 + curr_extent_data_size as usize)
                 .await?,
-        )
+        )?;
+        Ok(out)
     }
 
     pub async fn read_extent_metadata(&self, addr: u64) -> eyre::Result<(RegionSlot, AddressSlot)> {
@@ -1428,7 +1601,7 @@ impl BruteFS {
             .extent_freed
             .items
             .into_iter()
-            .filter(|slot| !slot.is_free())
+            .filter(|slot| !slot.is_free() && slot.capacity > 0)
             .collect::<Vec<_>>());
     }
 
@@ -1466,7 +1639,7 @@ impl BruteFS {
         &self,
         start_extent_addr: MaybeU64,
         new_extent: Extent,
-    ) -> eyre::Result<u64> {
+    ) -> Result<u64, BruteFsError> {
         let mut last_extent = None;
         let mut addr = start_extent_addr;
         while let Some(next_addr) = addr.to_optional() {
@@ -1501,7 +1674,10 @@ impl BruteFS {
         Ok(all_extent_start)
     }
 
-    pub async fn read_full_data_from_extent(&self, mut addr: MaybeU64) -> eyre::Result<Vec<u8>> {
+    pub async fn read_full_data_from_extent(
+        &self,
+        mut addr: MaybeU64,
+    ) -> Result<Vec<u8>, BruteFsError> {
         let mut data = vec![];
         while let Some(next_addr) = addr.to_optional() {
             tracing::debug!("Resolving extent 0x{next_addr:x}");
