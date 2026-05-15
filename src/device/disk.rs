@@ -85,7 +85,7 @@ impl Controller {
                 .iter()
                 .find(|d| logical_addr >= d.start && logical_addr < d.end)
             else {
-                eyre::bail!("No device address range covers address {logical_addr}");
+                eyre::bail!("No device range covers address 0x{logical_addr:x}");
             };
 
             let local_offset = logical_addr - pinned.start;
@@ -118,7 +118,7 @@ impl Controller {
                 .iter()
                 .find(|d| logical_addr >= d.start && logical_addr < d.end)
             else {
-                eyre::bail!("No device address range covers address {logical_addr}");
+                eyre::bail!("No device range covers address 0x{logical_addr:x}");
             };
 
             let local_offset = logical_addr - pinned.start;
