@@ -1,4 +1,5 @@
 use crate::{
+    addr::MaybeU64,
     bfs::{BruteFS, INodeKind, WriteOption},
     interface::config::Config,
     utils::{normalize_path, u64_to_utc_datetime},
@@ -40,6 +41,8 @@ pub enum Commands {
     Infos(GlobalOptions),
     /// brutefs operations
     X(FsCommands),
+    /// Inspect operations
+    Inspect(InspectCommands),
 }
 
 #[derive(Subcommand, Debug)]
@@ -168,19 +171,93 @@ pub struct LsCommand {
     pub global: GlobalOptions,
 }
 
+#[derive(Args, Debug)]
+pub struct InspectCommands {
+    #[command(subcommand)]
+    pub command: InspectSubcommands,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum InspectSubcommands {
+    /// Inspect inode
+    Inode(InodeInspect),
+    /// Inspect extent block
+    Extent(ExtentInspect),
+    /// Dump block
+    Dump(DumpBlock),
+    /// Display a view of a block
+    View(ViewBlock),
+}
+
+#[derive(Args, Debug)]
+pub struct InodeInspect {
+    /// Entry path
+    #[arg(default_value = "/", value_parser = clap::value_parser!(PathBuf))]
+    pub path: PathBuf,
+    #[command(flatten)]
+    pub global: GlobalOptions,
+}
+
+#[derive(Args, Debug)]
+pub struct ExtentInspect {
+    /// Extent address
+    #[arg(value_parser = parse_hex_or_decimal)]
+    pub address: u64,
+    /// Maximum extent to resolve
+    #[arg(long, short)]
+    pub max_follow: u32,
+    #[command(flatten)]
+    pub global: GlobalOptions,
+}
+
+#[derive(Args, Debug)]
+pub struct DumpBlock {
+    /// Start address
+    #[arg(value_parser = parse_hex_or_decimal)]
+    pub start_address: u64,
+    /// End address
+    #[arg(value_parser = parse_hex_or_decimal)]
+    pub end_address: u64,
+    /// Local destination path
+    pub dest_path: PathBuf,
+    /// Raw block (encrypted)
+    #[arg(long, default_value = "false")]
+    pub raw: bool,
+    #[arg(short, long, default_value = "false")]
+    pub overwrite: bool,
+    #[command(flatten)]
+    pub global: GlobalOptions,
+}
+
+#[derive(Args, Debug)]
+pub struct ViewBlock {
+    /// Start address
+    #[arg(value_parser = parse_hex_or_decimal)]
+    pub start_address: u64,
+    /// End address
+    #[arg(value_parser = parse_hex_or_decimal)]
+    pub end_address: u64,
+    #[arg(long, default_value = "false")]
+    pub raw: bool,
+    #[arg(short, long, default_value = "8")]
+    pub columns: usize,
+    #[command(flatten)]
+    pub global: GlobalOptions,
+}
+
 impl MainCommand {
     pub async fn run(&self) -> eyre::Result<()> {
         match &self.command {
             Commands::Format(global_options) => {
                 if global_options.force || confirm_destructive_action() {
-                    let bfs = global_options.get_bfs(true).await?;
+                    let bfs = global_options.format_and_get_bfs().await?;
                     println!("Formatted {} Bytes", bfs.total_capacity()?);
                 } else {
                     println!("abort");
                 }
             }
             Commands::Write(w) => {
-                let bfs = w.global.get_bfs(false).await?;
+                let bfs = w.global.get_bfs().await?;
                 let data = fs::read(&w.src_path).await?;
                 bfs.fwrite(
                     &w.dest_path,
@@ -192,7 +269,7 @@ impl MainCommand {
                 .await?;
             }
             Commands::Download(d) => {
-                let bfs = d.global.get_bfs(false).await?;
+                let bfs = d.global.get_bfs().await?;
                 let data = bfs.fread(&d.src_path).await?;
                 let dest_path = match &d.dest_path {
                     Some(path) => path.clone(),
@@ -204,7 +281,7 @@ impl MainCommand {
                 fs::write(dest_path, data).await?;
             }
             Commands::Read(r) => {
-                let bfs = r.global.get_bfs(false).await?;
+                let bfs = r.global.get_bfs().await?;
                 let data = bfs.fread(&r.path).await?;
                 let mut out = stdout();
                 out.write_all(&data).await?;
@@ -212,9 +289,10 @@ impl MainCommand {
             }
             Commands::X(x) => x.run().await?,
             Commands::Infos(global_options) => {
-                let bfs = global_options.get_bfs(false).await?;
+                let bfs = global_options.get_bfs().await?;
                 println!("{}", bfs.format_headers_report().await?);
             }
+            Commands::Inspect(i) => i.command.run().await?,
         }
 
         Ok(())
@@ -244,16 +322,21 @@ impl FsCommands {
 }
 
 impl GlobalOptions {
-    pub async fn get_bfs(&self, format_new: bool) -> eyre::Result<BruteFS> {
+    pub async fn format_and_get_bfs(&self) -> eyre::Result<BruteFS> {
         let config = Config::load(self.config.clone())?;
-        config.materialize(format_new, self.password.clone()).await
+        config.materialize(true, self.password.clone()).await
+    }
+
+    pub async fn get_bfs(&self) -> eyre::Result<BruteFS> {
+        let config = Config::load(self.config.clone())?;
+        config.materialize(false, self.password.clone()).await
     }
 }
 
 impl LsCommand {
     pub async fn ls(&self) -> eyre::Result<()> {
         let ls = self;
-        let bfs = ls.global.get_bfs(false).await?;
+        let bfs = ls.global.get_bfs().await?;
         let entries = bfs.ls(&ls.path).await?;
         for entry in entries {
             let full_path = ls.path.join(&entry);
@@ -294,7 +377,7 @@ impl LsCommand {
 
     pub async fn tree(&self) -> eyre::Result<()> {
         let ls = self;
-        let bfs = ls.global.get_bfs(false).await?;
+        let bfs = ls.global.get_bfs().await?;
         self.print_tree(&bfs, &self.path, "").await?;
         Ok(())
     }
@@ -341,7 +424,7 @@ impl LsCommand {
 impl CopyCommand {
     pub async fn run(&self) -> eyre::Result<()> {
         let cp = self;
-        let bfs = cp.global.get_bfs(false).await?;
+        let bfs = cp.global.get_bfs().await?;
         bfs.fcopy(
             &cp.src,
             &cp.dest,
@@ -357,7 +440,7 @@ impl CopyCommand {
 impl MoveCommand {
     pub async fn run(&self) -> eyre::Result<()> {
         let cp = self;
-        let bfs = cp.global.get_bfs(false).await?;
+        let bfs = cp.global.get_bfs().await?;
         bfs.fmove(&cp.src, &cp.dest).await?;
         Ok(())
     }
@@ -365,13 +448,13 @@ impl MoveCommand {
 
 impl PathCommand {
     pub async fn mkdir(&self) -> eyre::Result<()> {
-        let bfs = self.global.get_bfs(false).await?;
+        let bfs = self.global.get_bfs().await?;
         bfs.mkdir(&self.path, self.recursive).await?;
         Ok(())
     }
 
     pub async fn rm(&self) -> eyre::Result<()> {
-        let bfs = self.global.get_bfs(false).await?;
+        let bfs = self.global.get_bfs().await?;
         if self.recursive {
             eyre::bail!("Recursive option not supported yet for unlink");
         }
@@ -380,7 +463,7 @@ impl PathCommand {
     }
 
     pub async fn stats(&self) -> eyre::Result<()> {
-        let bfs = self.global.get_bfs(false).await?;
+        let bfs = self.global.get_bfs().await?;
         let stat = bfs.stats(&self.path).await?;
         if let Some(stat) = stat {
             let (kind, size_str) = match stat.kind {
@@ -414,7 +497,7 @@ impl PathCommand {
 
 impl LinkCommand {
     pub async fn run(&self) -> eyre::Result<()> {
-        let bfs = self.global.get_bfs(false).await?;
+        let bfs = self.global.get_bfs().await?;
         bfs.create_link(
             &self.dest_path,
             &self.src_path,
@@ -423,6 +506,60 @@ impl LinkCommand {
             },
         )
         .await?;
+        Ok(())
+    }
+}
+
+impl InspectSubcommands {
+    pub async fn run(&self) -> eyre::Result<()> {
+        match self {
+            InspectSubcommands::Inode(i) => {
+                let bfs = i.global.get_bfs().await?;
+                let (addr, inode) = bfs.resolve_path(&i.path).await?;
+                println!("Offset {addr} (0x{addr:08x})\n");
+                println!("{inode}");
+            }
+            InspectSubcommands::Extent(e) => {
+                let bfs = e.global.get_bfs().await?;
+                let meta_exts = bfs
+                    .find_full_extent_metadata(MaybeU64::from(e.address), Some(e.max_follow))
+                    .await?;
+                for (i, ext) in meta_exts.iter().enumerate() {
+                    println!("#{} :: {}", i + 1, ext);
+                }
+            }
+            InspectSubcommands::Dump(d) => {
+                let bfs = d.global.get_bfs().await?;
+                let size = d.end_address.saturating_sub(d.start_address);
+                let blob = if d.raw {
+                    bfs.ctrl
+                        .raw_read(d.start_address as usize, size as usize)
+                        .await?
+                } else {
+                    bfs.ctrl
+                        .read(d.start_address as usize, size as usize)
+                        .await?
+                };
+                if d.dest_path.exists() && !d.overwrite {
+                    eyre::bail!("File {} already exists", d.dest_path.display());
+                }
+                fs::write(&d.dest_path, blob).await?;
+            }
+            InspectSubcommands::View(v) => {
+                let bfs = v.global.get_bfs().await?;
+                let size = v.end_address.saturating_sub(v.start_address);
+                let blob = if v.raw {
+                    bfs.ctrl
+                        .raw_read(v.start_address as usize, size as usize)
+                        .await?
+                } else {
+                    bfs.ctrl
+                        .read(v.start_address as usize, size as usize)
+                        .await?
+                };
+                hex_view(&blob, v.columns)?;
+            }
+        }
         Ok(())
     }
 }
@@ -439,4 +576,43 @@ fn confirm_destructive_action() -> bool {
         "y" | "yes" => true,
         _ => false,
     }
+}
+
+fn parse_hex_or_decimal(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    if let Some(hex_str) = s.strip_prefix("0x") {
+        u64::from_str_radix(hex_str, 16).map_err(|e| format!("Invalid hex: {e}"))
+    } else if let Some(hex_str) = s.strip_prefix("0X") {
+        u64::from_str_radix(hex_str, 16).map_err(|e| format!("Invalid hex: {e}"))
+    } else {
+        s.parse::<u64>().map_err(|e| format!("Invalid number: {e}"))
+    }
+}
+
+pub fn hex_view(data: &[u8], cols: usize) -> eyre::Result<()> {
+    if cols == 0 {
+        eyre::bail!("number of columns must be > 0");
+    }
+
+    for (row_idx, chunk) in data.chunks(cols).enumerate() {
+        let offset = row_idx * cols;
+        print!("{:08x}: ", offset);
+        let hex_part: String = chunk.iter().map(|b| format!("{:02x} ", b)).collect();
+        let padding = cols.saturating_sub(chunk.len()) * 3;
+        print!("{hex_part}{:width$}| ", "", width = padding);
+        let ascii: String = chunk
+            .iter()
+            .map(|b| {
+                let c = *b as char;
+                if c.is_ascii_graphic() || c == ' ' {
+                    c
+                } else {
+                    '.'
+                }
+            })
+            .collect();
+        println!("{ascii}");
+    }
+
+    Ok(())
 }

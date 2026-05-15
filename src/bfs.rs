@@ -6,7 +6,10 @@ use crate::{
 };
 use async_recursion::async_recursion;
 use eyre::Context;
-use std::{fmt::Debug, path::PathBuf};
+use std::{
+    fmt::{Debug, Display},
+    path::PathBuf,
+};
 use tokio::sync::Mutex;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,9 +60,40 @@ pub struct AddressSlot {
     pub capacity: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RegionSlot {
+    pub start: MaybeU64,
+    pub end: MaybeU64,
+}
+
 impl AddressSlot {
     pub fn is_free(&self) -> bool {
         self.addr.is_none()
+    }
+}
+
+impl Display for AddressSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            RegionSlot {
+                start: self.addr,
+                end: MaybeU64::from(self.addr.get() + self.capacity as u64)
+            }
+        )
+    }
+}
+
+impl Display for RegionSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "  - 0x{:08x} -- 0x{:08x} ({:>10} B)\n",
+            self.start.get(),
+            self.end.get(),
+            self.end.get().saturating_sub(self.start.get())
+        )
     }
 }
 
@@ -79,7 +113,7 @@ pub struct BruteFsHeader {
 pub struct BruteFS {
     header_size: usize,
     alloc_guard: Mutex<()>,
-    ctrl: Controller,
+    pub ctrl: Controller,
 }
 
 impl INodeKind {
@@ -197,6 +231,27 @@ impl INode {
 
     pub fn serialized_size() -> usize {
         1 + 8 + 8 + 8 + 8
+    }
+}
+
+impl Display for INode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "- Kind: {:?}\n", self.kind)?;
+        if !matches!(self.kind, INodeKind::Directory) {
+            write!(f, "- Size: {} B\n", self.total_file_size)?;
+        }
+        write!(f, "- Creation time: {}\n", u64_to_utc_datetime(self.ctime))?;
+        write!(
+            f,
+            "- Modification time: {}\n",
+            u64_to_utc_datetime(self.mtime)
+        )?;
+        write!(
+            f,
+            "- Immediate Extent address: {} (0x{:08x})\n",
+            self.extent_addr.get(),
+            self.extent_addr.get()
+        )
     }
 }
 
@@ -500,21 +555,11 @@ impl BruteFS {
         let show = 3;
         out.push_str(&format!("Top {show} smallest:\n"));
         for region in regions.iter().take(show) {
-            out.push_str(&format!(
-                "  - 0x{:08x} -- 0x{:08x} ({:>10} B)\n",
-                region.addr.get(),
-                region.addr.get() + region.capacity as u64,
-                region.capacity
-            ));
+            out.push_str(&region.to_string());
         }
         out.push_str(&format!("Top {show} biggest:\n"));
         for region in regions.iter().rev().take(show) {
-            out.push_str(&format!(
-                "  - 0x{:08x} -- 0x{:08x} ({:>10} B)\n",
-                region.addr.get(),
-                region.addr.get() + region.capacity as u64,
-                region.capacity
-            ));
+            out.push_str(&region.to_string());
         }
 
         let capacity = self.total_capacity()?;
@@ -525,26 +570,8 @@ impl BruteFS {
             .await
             .wrap_err_with(|| eyre::eyre!("Data is either corrupt or encrypted"))?;
 
-        out.push_str(&format!(
-            "Root inode offset {} (0x{:08x})\n",
-            ioffset, ioffset
-        ));
-
-        out.push_str(&format!("- Kind: {:?}\n", inode.kind));
-        out.push_str(&format!(
-            "- Creation time: {}\n",
-            u64_to_utc_datetime(inode.ctime)
-        ));
-        out.push_str(&format!(
-            "- Modification time: {}\n",
-            u64_to_utc_datetime(inode.mtime)
-        ));
-
-        out.push_str(&format!(
-            "- Immediate Extent address: {} (0x{:08x})\n",
-            inode.extent_addr.get(),
-            inode.extent_addr.get()
-        ));
+        out.push_str(&format!("Root inode offset {ioffset} (0x{ioffset:08x})\n"));
+        out.push_str(&inode.to_string());
 
         Ok(out)
     }
@@ -652,7 +679,7 @@ impl BruteFS {
             .ok_or_else(|| eyre::eyre!("File system controller not ready"))
     }
 
-    async fn resolve_path<P: Into<PathBuf>>(&self, path: P) -> eyre::Result<(u64, INode)> {
+    pub async fn resolve_path<P: Into<PathBuf>>(&self, path: P) -> eyre::Result<(u64, INode)> {
         let path: PathBuf = path.into();
         tracing::debug!("Resolving {path:?}");
         let components = path_to_string_list(path);
@@ -1149,6 +1176,7 @@ impl BruteFS {
 
             let old_extent_addr = curr_inode.extent_addr;
             curr_inode.extent_addr = MaybeU64::from(extent_addr);
+            curr_inode.mtime = utc_now_u64();
             self.ctrl
                 .write(curr_addr as usize, &curr_inode.serialize()?)
                 .await?;
@@ -1303,6 +1331,11 @@ impl BruteFS {
         Ok(())
     }
 
+    pub async fn update_mtime(&self, addr: u64, mut inode: INode) -> eyre::Result<()> {
+        inode.mtime = utc_now_u64();
+        self.ctrl.write(addr as usize, &inode.serialize()?).await
+    }
+
     pub async fn read_extent(&self, addr: u64) -> eyre::Result<Extent> {
         let extent_header = self.ctrl.read(addr as usize, 8).await?;
         let curr_extent_data_size = u64::from_le_bytes(extent_header[0..8].try_into()?);
@@ -1312,6 +1345,22 @@ impl BruteFS {
                 .read(addr as usize, 8 + 8 + curr_extent_data_size as usize)
                 .await?,
         )
+    }
+
+    pub async fn read_extent_metadata(&self, addr: u64) -> eyre::Result<(RegionSlot, AddressSlot)> {
+        let extent_header = self.ctrl.read(addr as usize, 16).await?;
+        let curr_extent_data_size = u64::from_le_bytes(extent_header[0..8].try_into()?);
+        let next_extent = MaybeU64::from(u64::from_le_bytes(extent_header[8..16].try_into()?));
+        Ok((
+            RegionSlot {
+                start: MaybeU64::from(addr),
+                end: MaybeU64::from(addr + 8 + 8 + curr_extent_data_size as u64),
+            },
+            AddressSlot {
+                addr: next_extent,
+                capacity: curr_extent_data_size as usize,
+            },
+        ))
     }
 
     pub async fn mark_as_reusable(&self, new_slot_value: AddressSlot) -> eyre::Result<()> {
@@ -1452,9 +1501,8 @@ impl BruteFS {
         Ok(all_extent_start)
     }
 
-    pub async fn read_full_data_from_extent(&self, addr: MaybeU64) -> eyre::Result<Vec<u8>> {
+    pub async fn read_full_data_from_extent(&self, mut addr: MaybeU64) -> eyre::Result<Vec<u8>> {
         let mut data = vec![];
-        let mut addr = addr;
         while let Some(next_addr) = addr.to_optional() {
             tracing::debug!("Resolving extent 0x{next_addr:x}");
             let extent = self.read_extent(next_addr).await?;
@@ -1462,6 +1510,27 @@ impl BruteFS {
             data.extend(extent.data);
         }
         Ok(data)
+    }
+
+    pub async fn find_full_extent_metadata(
+        &self,
+        mut addr: MaybeU64,
+        stop: Option<u32>,
+    ) -> eyre::Result<Vec<RegionSlot>> {
+        let mut blocks = vec![];
+        let max = stop.unwrap_or(u32::MAX);
+        let mut i = 1;
+        while let Some(next_addr) = addr.to_optional() {
+            if i - 1 >= max {
+                break;
+            }
+            tracing::debug!("Resolving {i}-th extent metadata 0x{next_addr:x}");
+            let (block_slot, addr_slot) = self.read_extent_metadata(next_addr).await?;
+            addr = addr_slot.addr;
+            blocks.push(block_slot);
+            i += 1;
+        }
+        Ok(blocks)
     }
 
     pub async fn seek_full_data_from_extent(
