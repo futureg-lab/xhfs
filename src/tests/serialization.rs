@@ -1,8 +1,4 @@
-use crate::{
-    addr::MaybeU64,
-    bfs::{AddressSlot, AddressVector, BruteFsHeader, Directory, Extent, INode, INodeKind},
-    crypto::Crypto,
-};
+use crate::bfs::{addr::MaybeU64, crypto::Crypto, ds::*};
 
 #[test]
 pub fn test_basic_binary_serialization() -> eyre::Result<()> {

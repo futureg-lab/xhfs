@@ -1,4 +1,4 @@
-use crate::{addr::MaybeU64, interface::cli::GlobalOptions};
+use crate::{bfs::addr::MaybeU64, interface::cli::GlobalOptions};
 use clap::{Args, Subcommand};
 use std::path::PathBuf;
 use tokio::fs;

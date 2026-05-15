@@ -2,9 +2,7 @@ use crate::interface::cli::MainCommand;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
-pub mod addr;
 pub mod bfs;
-pub mod crypto;
 pub mod device;
 pub mod interface;
 pub mod utils;

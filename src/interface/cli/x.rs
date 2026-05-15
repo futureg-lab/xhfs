@@ -1,5 +1,5 @@
 use crate::{
-    bfs::{BruteFS, INodeKind, WriteOption},
+    bfs::{BruteFS, WriteOption, ds::INodeKind},
     interface::cli::{GlobalOptions, PathCommand},
     utils::{normalize_path, u64_to_utc_datetime},
 };

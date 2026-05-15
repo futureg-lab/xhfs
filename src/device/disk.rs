@@ -1,4 +1,4 @@
-use crate::{crypto::Crypto, device::logical::LogicalDevice};
+use crate::{bfs::crypto::Crypto, device::logical::LogicalDevice};
 
 #[derive(Clone)]
 pub struct PinnedDevice {
