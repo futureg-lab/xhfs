@@ -64,3 +64,68 @@ pub fn test_basic_binary_serialization() -> eyre::Result<()> {
     }
     Ok(())
 }
+
+#[test]
+pub fn test_bitmap_serialization() -> eyre::Result<()> {
+    {
+        let size = 100;
+        let bitmap = Bitmap::new(size);
+        assert_eq!(bitmap.map.len(), size);
+        for i in 0..size {
+            assert_eq!(bitmap.get(i)?, false);
+        }
+    }
+
+    {
+        let mut bitmap = Bitmap::new(64);
+        bitmap.set(0, true)?;
+        bitmap.set(31, true)?;
+        bitmap.set(63, true)?;
+
+        assert_eq!(bitmap.get(0)?, true);
+        assert_eq!(bitmap.get(31)?, true);
+        assert_eq!(bitmap.get(63)?, true);
+
+        assert_eq!(bitmap.get(1)?, false, "untouched bits remain false");
+        assert_eq!(bitmap.get(32)?, false, "untouched bits remain false");
+
+        bitmap.set(31, false)?;
+        assert_eq!(bitmap.get(31)?, false, "set existing true bit to false");
+    }
+
+    {
+        let mut bitmap = Bitmap::new(10);
+        assert!(bitmap.get(10).is_err(), "out of bounds");
+        assert!(bitmap.get(100).is_err(), "out of bounds");
+        assert!(bitmap.set(10, true).is_err(), "out of bounds");
+        assert!(bitmap.set(100, false).is_err(), "out of bounds");
+    }
+
+    {
+        // odd bit length that doesn't align cleanly with 8-bit bytes
+        let bit_size = 77;
+        let mut bitmap = Bitmap::new(bit_size);
+        bitmap.set(0, true)?;
+        bitmap.set(12, true)?;
+        bitmap.set(76, true)?;
+
+        let expected_size = bitmap.serialized_size();
+        let serialized_data = bitmap.serialize()?;
+        assert_eq!(serialized_data.len(), expected_size);
+
+        let deserialized = Bitmap::deserialize(&serialized_data)?;
+        assert_eq!(bitmap, deserialized, "ser-de");
+
+        assert_eq!(deserialized.map.len(), bit_size);
+        assert_eq!(deserialized.get(0)?, true);
+        assert_eq!(deserialized.get(12)?, true);
+        assert_eq!(deserialized.get(76)?, true);
+        assert_eq!(deserialized.get(75)?, false);
+        assert!(
+            deserialized.get(77).is_err(),
+            "original constraint len survived"
+        );
+    }
+
+    Ok(())
+}

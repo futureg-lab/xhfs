@@ -77,7 +77,6 @@ impl BruteFS {
         ctrl.write(header_size, &root_raw).await?;
 
         let bfs = Self::from_formatted(ctrl, password).await?;
-        // bfs.mkdir("/", false).await?;
         Ok(bfs)
     }
 

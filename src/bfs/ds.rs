@@ -1,5 +1,7 @@
 use crate::bfs::addr::MaybeU64;
 use crate::utils::{normalize_path, u64_to_utc_datetime};
+use bitvec::order::Msb0;
+use bitvec::vec::BitVec;
 use eyre::Context;
 use std::fmt::Display;
 use std::{fmt::Debug, path::PathBuf};
@@ -20,6 +22,11 @@ pub struct INode {
     pub extent_addr: MaybeU64,
     pub mtime: u64,
     pub ctime: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Bitmap {
+    pub map: BitVec<u8, Msb0>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -201,9 +208,10 @@ impl Extent {
     pub fn deserialize(data: &[u8]) -> eyre::Result<Self> {
         let meta_expected_size = 8 + 8;
         let incoming_size = data.len();
-        if incoming_size < meta_expected_size {
-            eyre::bail!("Expected Extent data to be at least 8 + 8 (16) bytes");
-        }
+        eyre::ensure!(
+            incoming_size >= meta_expected_size,
+            "Expected Extent data to be at least 8 + 8 (16) bytes"
+        );
 
         let mut addr_start = 0;
         let size = u64::from_le_bytes(data[addr_start..addr_start + 8].try_into()?);
@@ -213,13 +221,12 @@ impl Extent {
         addr_start += 8;
 
         let data = &data[addr_start..];
-        if size != data.len() as u64 {
-            eyre::bail!(
-                "Expected Extent data region to be of size {}, got {} instead",
-                size,
-                data.len()
-            );
-        }
+        eyre::ensure!(
+            size == data.len() as u64,
+            "Expected Extent data region to be of size {}, got {} instead",
+            size,
+            data.len()
+        );
 
         Ok(Extent {
             next,
@@ -253,11 +260,10 @@ impl INode {
     pub fn deserialize(data: &[u8]) -> eyre::Result<Self> {
         let expected_size = Self::serialized_size();
         let incoming_size = data.len();
-        if incoming_size != expected_size {
-            eyre::bail!(
-                "Expected INode data size to be {expected_size}, got {incoming_size} instead"
-            );
-        }
+        eyre::ensure!(
+            incoming_size == expected_size,
+            "Expected INode data size to be {expected_size}, got {incoming_size} instead"
+        );
 
         let mut addr_start = 0;
         let index = u64::from_le_bytes(data[addr_start..addr_start + 8].try_into()?);
@@ -367,11 +373,10 @@ impl Directory {
 
         let expected_size = 8;
         let incoming_size = data.len();
-        if incoming_size < expected_size {
-            eyre::bail!(
-                "Expected Directory data size to be at least {expected_size}, got {incoming_size} instead"
-            );
-        }
+        eyre::ensure!(
+            incoming_size >= expected_size,
+            "Expected Directory data size to be at least {expected_size}, got {incoming_size} instead"
+        );
 
         let mut addr_start = 0;
         let items = u64::from_le_bytes(data[addr_start..addr_start + 8].try_into()?);
@@ -417,14 +422,11 @@ impl BruteFsHeader {
         let magic = b"brutefs";
         let min_expected_size = 7 + 1 + 12;
         let incoming_size = data.len();
-        if incoming_size < min_expected_size {
-            eyre::bail!(
-                "Expected BruteFsHeader data size to be at least {min_expected_size}, got {incoming_size} instead"
-            );
-        }
-        if &data[0..7] != magic {
-            eyre::bail!("Invalid BruteFsHeader magic bytes");
-        }
+        eyre::ensure!(
+            incoming_size >= min_expected_size,
+            "Expected BruteFsHeader data size to be at least {min_expected_size}, got {incoming_size} instead"
+        );
+        eyre::ensure!(&data[0..7] == magic, "Invalid BruteFsHeader magic bytes");
 
         Ok(Self {
             version: data[7],
@@ -434,5 +436,71 @@ impl BruteFsHeader {
 
     pub fn serialized_size(&self) -> usize {
         7 + 1 + 12
+    }
+}
+
+impl Bitmap {
+    pub fn new(size_in_bits: usize) -> Self {
+        let mut map = BitVec::new();
+        map.resize(size_in_bits, false);
+        Self { map }
+    }
+
+    #[inline]
+    pub fn set(&mut self, n: usize, value: bool) -> eyre::Result<()> {
+        eyre::ensure!(
+            n < self.map.len(),
+            "Index {} out of bounds for bitmap of size {}",
+            n,
+            self.map.len()
+        );
+        self.map.set(n, value);
+        Ok(())
+    }
+
+    #[inline]
+    pub fn get(&self, n: usize) -> eyre::Result<bool> {
+        eyre::ensure!(
+            n < self.map.len(),
+            "Index {} out of bounds for bitmap of size {}",
+            n,
+            self.map.len()
+        );
+        Ok(*self.map.get(n).unwrap())
+    }
+
+    pub fn serialize(&self) -> eyre::Result<Vec<u8>> {
+        let bit_len = self.map.len() as u64;
+        let raw_bytes = self.map.as_raw_slice();
+        let mut data = Vec::with_capacity(8 + raw_bytes.len());
+        data.extend_from_slice(&bit_len.to_be_bytes());
+        data.extend_from_slice(raw_bytes);
+        Ok(data)
+    }
+
+    pub fn deserialize(data: &[u8]) -> eyre::Result<Self> {
+        eyre::ensure!(
+            data.len() >= 8,
+            "Invalid data: buffer is too short to contain the header (min 8 bytes)"
+        );
+
+        let bit_len_bytes: [u8; 8] = data[0..8]
+            .try_into()
+            .wrap_err("Failed to parse bit length header")?;
+        let bit_len = u64::from_be_bytes(bit_len_bytes) as usize;
+
+        let raw_bytes = &data[8..];
+        let mut map: BitVec<u8, Msb0> = BitVec::from_slice(raw_bytes);
+        eyre::ensure!(
+            map.len() >= bit_len,
+            "Invalid data: buffer contains fewer bits than specified in the header"
+        );
+        map.truncate(bit_len);
+
+        Ok(Self { map })
+    }
+
+    pub fn serialized_size(&self) -> usize {
+        8 + self.map.as_raw_slice().len()
     }
 }

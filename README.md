@@ -30,32 +30,32 @@ Consider the following configuration:
 # or use the cli with --password helloworld if the config and bins are made public
 password: helloworld
 devices:
-    - type: file
-      name: bloc1
-      path: ./part1.bin
-    - type: file
-      name: bloc2
-      path: ./part1-replica.bin
-    - type: file
-      name: bloc3
-      path: ./part3.bin
-    # - type: s3
-    #   name: bloc3
-    #   key: ..
-    #  ..
+  - type: file
+    name: bloc1
+    path: ./part1.bin
+  - type: file
+    name: bloc2
+    path: ./part1-replica.bin
+  - type: file
+    name: bloc3
+    path: ./part3.bin
+  # - type: s3
+  #   name: bloc3
+  #   key: ..
+  #  ..
 configuration:
-    logical:
-        - name: dev1
-          include: [bloc1, bloc2]
-          capacity: "2 MiB"
-          max_concurrent: 2
-        - name: dev2
-          include: [bloc3]
-          capacity: "2 MiB"
-          max_concurrent: 1
-    # Final storage layout
-    # [dev1: 0 - 2MB] [dev2: 2MiB - 4MiB]
-    layout: [dev1, dev2]
+  logical:
+    - name: dev1
+      include: [bloc1, bloc2]
+      capacity: "2 MiB"
+      max_concurrent: 2
+    - name: dev2
+      include: [bloc3]
+      capacity: "2 MiB"
+      max_concurrent: 1
+  # Final storage layout
+  # [dev1: 0 - 2MB] [dev2: 2MiB - 4MiB]
+  layout: [dev1, dev2]
 ```
 
 All you have to do left is format the drive if not done yet then play with it.
@@ -65,7 +65,7 @@ All you have to do left is format the drive if not done yet then play with it.
 brutefs format
 
 echo "Hello World" > thething.txt
-brutefs write thething.txt /test.txt
+brutefs upload thething.txt /test.txt
 
 brutefs x ls . -v
 # FILE 2026-05-14 16:49:49        28 B test.txt
