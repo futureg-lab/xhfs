@@ -4,7 +4,7 @@ use crate::bfs::{addr::MaybeU64, crypto::Crypto, ds::*};
 pub fn test_basic_binary_serialization() -> eyre::Result<()> {
     {
         let original = INode {
-            index: 66441234,
+            inumber: 66441234,
             nlink: 42,
             kind: INodeKind::Symlink,
             extent_addr: MaybeU64::from(1234),
@@ -56,6 +56,11 @@ pub fn test_basic_binary_serialization() -> eyre::Result<()> {
     {
         let original = BruteFsHeader {
             version: 42,
+            format: Format {
+                block_size_bytes: 12348794,
+                blocks_per_group: 234567,
+                group_count: 4,
+            },
             chacha20_nonce: Crypto::gen_nonce(),
         };
         let data = original.serialize()?;
@@ -69,7 +74,7 @@ pub fn test_basic_binary_serialization() -> eyre::Result<()> {
 pub fn test_bitmap_serialization() -> eyre::Result<()> {
     {
         let size = 100;
-        let bitmap = Bitmap::new(size);
+        let bitmap = Bitmap::new_from_bits_count(size);
         assert_eq!(bitmap.map.len(), size);
         for i in 0..size {
             assert_eq!(bitmap.get(i)?, false);
@@ -77,7 +82,7 @@ pub fn test_bitmap_serialization() -> eyre::Result<()> {
     }
 
     {
-        let mut bitmap = Bitmap::new(64);
+        let mut bitmap = Bitmap::new_from_bits_count(64);
         bitmap.set(0, true)?;
         bitmap.set(31, true)?;
         bitmap.set(63, true)?;
@@ -94,7 +99,7 @@ pub fn test_bitmap_serialization() -> eyre::Result<()> {
     }
 
     {
-        let mut bitmap = Bitmap::new(10);
+        let mut bitmap = Bitmap::new_from_bits_count(10);
         assert!(bitmap.get(10).is_err(), "out of bounds");
         assert!(bitmap.get(100).is_err(), "out of bounds");
         assert!(bitmap.set(10, true).is_err(), "out of bounds");
@@ -104,7 +109,7 @@ pub fn test_bitmap_serialization() -> eyre::Result<()> {
     {
         // odd bit length that doesn't align cleanly with 8-bit bytes
         let bit_size = 77;
-        let mut bitmap = Bitmap::new(bit_size);
+        let mut bitmap = Bitmap::new_from_bits_count(bit_size);
         bitmap.set(0, true)?;
         bitmap.set(12, true)?;
         bitmap.set(76, true)?;

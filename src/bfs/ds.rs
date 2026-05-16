@@ -16,7 +16,7 @@ pub enum INodeKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct INode {
     pub kind: INodeKind,
-    pub index: u64,
+    pub inumber: u64,
     pub nlink: u64,
     pub total_file_size: u64,
     pub extent_addr: MaybeU64,
@@ -152,11 +152,35 @@ impl Display for RegionSlot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "  - 0x{:08x} -- 0x{:08x} ({:>10} B)\n",
+            "0x{:08x} -- 0x{:08x} ({:>10} B)",
             self.start.get(),
             self.end.get(),
-            self.end.get().saturating_sub(self.start.get())
+            self.to_addr_slot().capacity
         )
+    }
+}
+
+impl RegionSlot {
+    pub fn add_offset(&self, offset: u64) -> Self {
+        Self {
+            start: MaybeU64::from(offset + self.start.get()),
+            end: MaybeU64::from(offset + self.end.get()),
+        }
+    }
+
+    pub fn to_pair(&self) -> (u64, u64) {
+        (self.start.get(), self.end.get())
+    }
+
+    pub fn size(&self) -> u64 {
+        self.end.get().saturating_sub(self.start.get()) + 1
+    }
+
+    pub fn to_addr_slot(&self) -> AddressSlot {
+        AddressSlot {
+            addr: self.start,
+            capacity: self.size() as usize,
+        }
     }
 }
 
@@ -169,7 +193,46 @@ pub struct AddressVector {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BruteFsHeader {
     pub version: u8,
+    pub format: Format,
     pub chacha20_nonce: [u8; 12],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Format {
+    pub block_size_bytes: u64,
+    pub blocks_per_group: u64,
+    pub group_count: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct GeometryLayout {
+    pub rel_header_region: RegionSlot,
+    pub rel_data_bitmap_region: RegionSlot,
+    pub rel_inode_bitmap_region: RegionSlot,
+    pub rel_inode_table_region: RegionSlot,
+    pub rel_data_region: RegionSlot,
+    pub n_inodes_in_group: u64,
+    pub group_stride: u64,
+    pub usable_blocks_per_group: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct BlockInitialValues {
+    pub serialized_header: Vec<u8>,
+    pub inode_bitmap_placeholder: Vec<u8>,
+    pub data_block_bitmap: Vec<u8>,
+    pub inode_table_placeholder: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct GroupLayout {
+    pub g_index: u64,
+    pub g_offset: u64,
+    pub header_region: RegionSlot,
+    pub data_bitmap_region: RegionSlot,
+    pub inode_bitmap_region: RegionSlot,
+    pub inode_table_region: RegionSlot,
+    pub data_region: RegionSlot,
 }
 
 impl INodeKind {
@@ -243,7 +306,7 @@ impl INode {
     pub fn serialize(&self) -> eyre::Result<Vec<u8>> {
         let mut buf = Vec::with_capacity(Self::serialized_size());
 
-        buf.extend_from_slice(&self.index.to_le_bytes());
+        buf.extend_from_slice(&self.inumber.to_le_bytes());
         let kind = self.kind.to_byte();
         buf.push(kind);
 
@@ -266,7 +329,7 @@ impl INode {
         );
 
         let mut addr_start = 0;
-        let index = u64::from_le_bytes(data[addr_start..addr_start + 8].try_into()?);
+        let inumber = u64::from_le_bytes(data[addr_start..addr_start + 8].try_into()?);
         addr_start += 8;
         let kind = INodeKind::from_byte(data[8])?;
         addr_start += 1;
@@ -284,7 +347,7 @@ impl INode {
         let ctime = u64::from_le_bytes(data[addr_start..addr_start + 8].try_into()?);
 
         Ok(INode {
-            index,
+            inumber,
             kind,
             nlink,
             extent_addr,
@@ -411,36 +474,143 @@ impl SymLink {
 
 impl BruteFsHeader {
     pub fn serialize(&self) -> eyre::Result<Vec<u8>> {
-        let mut buf = Vec::with_capacity(self.serialized_size());
+        let mut buf = Vec::with_capacity(Self::serialized_size());
         buf.extend_from_slice(b"brutefs");
         buf.push(self.version);
+        buf.extend_from_slice(&self.format.block_size_bytes.to_le_bytes());
+        buf.extend_from_slice(&self.format.blocks_per_group.to_le_bytes());
+        buf.extend_from_slice(&self.format.group_count.to_le_bytes());
         buf.extend_from_slice(&self.chacha20_nonce);
+
         Ok(buf)
     }
 
     pub fn deserialize(data: &[u8]) -> eyre::Result<Self> {
-        let magic = b"brutefs";
-        let min_expected_size = 7 + 1 + 12;
+        let expected_size = Self::serialized_size();
         let incoming_size = data.len();
         eyre::ensure!(
-            incoming_size >= min_expected_size,
-            "Expected BruteFsHeader data size to be at least {min_expected_size}, got {incoming_size} instead"
+            incoming_size == expected_size,
+            "Expected BruteFsHeader data size to be {expected_size}, got {incoming_size} instead"
         );
-        eyre::ensure!(&data[0..7] == magic, "Invalid BruteFsHeader magic bytes");
+        eyre::ensure!(
+            &data[0..7] == b"brutefs",
+            "Invalid BruteFsHeader magic bytes"
+        );
+
+        let version = data[7];
+        let mut addr_start = 8;
+        let block_size_bytes = u64::from_le_bytes(data[addr_start..addr_start + 8].try_into()?);
+        addr_start += 8;
+        let blocks_per_group = u64::from_le_bytes(data[addr_start..addr_start + 8].try_into()?);
+        addr_start += 8;
+        let group_count = u64::from_le_bytes(data[addr_start..addr_start + 8].try_into()?);
+        addr_start += 8;
+        let chacha20_nonce = data[addr_start..addr_start + 12].try_into()?;
 
         Ok(Self {
-            version: data[7],
-            chacha20_nonce: data[8..8 + 12].try_into()?,
+            version,
+            format: Format {
+                block_size_bytes,
+                blocks_per_group,
+                group_count,
+            },
+            chacha20_nonce,
         })
     }
 
-    pub fn serialized_size(&self) -> usize {
-        7 + 1 + 12
+    pub fn serialized_size() -> usize {
+        7 + 1 + 8 + 8 + 8 + 12
+    }
+
+    pub fn template() -> Self {
+        Self {
+            version: 0,
+            format: Format {
+                block_size_bytes: 0,
+                blocks_per_group: 0,
+                group_count: 0,
+            },
+            chacha20_nonce: Default::default(),
+        }
+    }
+
+    pub fn calculate_relative_geometry(
+        &self,
+    ) -> eyre::Result<(GeometryLayout, BlockInitialValues)> {
+        let serialized_header = self.serialize()?;
+        let rel_header_region = RegionSlot {
+            start: 0u64.into(),
+            end: ((serialized_header.len() - 1) as u64).into(),
+        };
+
+        let total_blocks_in_group = self.format.blocks_per_group as usize;
+        let data_block_bitmap = Bitmap::new_from_bits_count(total_blocks_in_group).serialize()?;
+        let data_bitmap_start = rel_header_region.end.get() + 1;
+        let rel_data_bitmap_region = RegionSlot {
+            start: data_bitmap_start.into(),
+            end: (data_bitmap_start + data_block_bitmap.len() as u64 - 1).into(),
+        };
+
+        let n_inodes_in_group = 8 * self.format.block_size_bytes as usize;
+        let inode_bitmap_placeholder =
+            Bitmap::new_from_bits_count(n_inodes_in_group).serialize()?; // default would be
+        let inode_bitmap_start = rel_data_bitmap_region.end.get() + 1;
+        let rel_inode_bitmap_region = RegionSlot {
+            start: inode_bitmap_start.into(),
+            end: (inode_bitmap_start + inode_bitmap_placeholder.len() as u64 - 1).into(),
+        };
+
+        let inode_table_len_bytes = (n_inodes_in_group * INode::serialized_size()) as u64;
+        let inode_table_start = rel_inode_bitmap_region.end.get() + 1;
+        let inode_table_placeholder = vec![0u8; inode_table_len_bytes as usize];
+
+        let rel_inode_table_region = RegionSlot {
+            start: inode_table_start.into(),
+            end: (inode_table_start + inode_table_len_bytes - 1).into(),
+        };
+
+        let data_region_start = rel_inode_table_region.end.get() + 1;
+        let total_group_bytes = self.format.blocks_per_group * self.format.block_size_bytes;
+        // IMPORTANT:
+        // we need to ensure the data region size is a multiple of the block size
+        // if it's bigger or smaller => reduce to closest multiple
+        // The reason is that the allocator speaks in terms of blocks at allocates in that unit not bytes
+        let raw_bytes_available = total_group_bytes - data_region_start;
+        let data_blocks_per_group = raw_bytes_available / self.format.block_size_bytes;
+        let exact_data_payload_bytes = data_blocks_per_group * self.format.block_size_bytes;
+        let rel_data_region = RegionSlot {
+            start: data_region_start.into(),
+            end: (data_region_start + exact_data_payload_bytes - 1).into(),
+        };
+
+        let group_stride = total_group_bytes;
+
+        let data_bytes_available = rel_data_region.end.get() - rel_data_region.start.get() + 1;
+        let data_blocks_per_group = data_bytes_available / self.format.block_size_bytes;
+
+        let geometry = GeometryLayout {
+            rel_header_region,
+            rel_data_bitmap_region,
+            rel_inode_bitmap_region,
+            rel_inode_table_region,
+            n_inodes_in_group: n_inodes_in_group as u64,
+            rel_data_region,
+            group_stride,
+            usable_blocks_per_group: data_blocks_per_group,
+        };
+        let templates = BlockInitialValues {
+            serialized_header,
+            data_block_bitmap,
+            inode_bitmap_placeholder,
+            inode_table_placeholder,
+        };
+
+        Ok((geometry, templates))
     }
 }
 
 impl Bitmap {
-    pub fn new(size_in_bits: usize) -> Self {
+    pub fn new_from_bits_count(size_in_bits: usize) -> Self {
         let mut map = BitVec::new();
         map.resize(size_in_bits, false);
         Self { map }
@@ -484,13 +654,10 @@ impl Bitmap {
             "Invalid data: buffer is too short to contain the header (min 8 bytes)"
         );
 
-        let bit_len_bytes: [u8; 8] = data[0..8]
-            .try_into()
-            .wrap_err("Failed to parse bit length header")?;
-        let bit_len = u64::from_be_bytes(bit_len_bytes) as usize;
-
+        let bit_len = u64::from_be_bytes(data[0..8].try_into()?) as usize;
         let raw_bytes = &data[8..];
         let mut map: BitVec<u8, Msb0> = BitVec::from_slice(raw_bytes);
+
         eyre::ensure!(
             map.len() >= bit_len,
             "Invalid data: buffer contains fewer bits than specified in the header"
@@ -500,7 +667,141 @@ impl Bitmap {
         Ok(Self { map })
     }
 
+    pub fn find_next_zero_index(&self, start_index: usize) -> Option<usize> {
+        if start_index >= self.map.len() {
+            return None;
+        }
+        let remaining_bits = &self.map[start_index..];
+        remaining_bits
+            .iter_zeros()
+            .next()
+            .map(|relative_idx| start_index + relative_idx)
+    }
+
     pub fn serialized_size(&self) -> usize {
         8 + self.map.as_raw_slice().len()
+    }
+}
+
+impl Format {
+    pub fn infer_from_free_space(total_capacity: u64) -> Self {
+        let block_size_bytes = if total_capacity <= 512 * 1024 {
+            512
+        } else if total_capacity <= 4 * 1024 * 1024 {
+            1024
+        } else {
+            4096
+        };
+
+        let total_blocks = total_capacity / block_size_bytes;
+
+        // 4 groups for 1GB scale
+        let target_group_bytes = 256 * 1024 * 1024;
+        let group_count = (total_capacity + target_group_bytes - 1) / target_group_bytes;
+        let group_count = group_count.max(1);
+
+        let target_blocks_per_group = target_group_bytes / block_size_bytes;
+        let blocks_per_group = target_blocks_per_group.min(total_blocks).max(1);
+
+        Self {
+            block_size_bytes,
+            blocks_per_group,
+            group_count,
+        }
+    }
+
+    pub fn validate(&self, total_bytes: u64) -> eyre::Result<()> {
+        eyre::ensure!(total_bytes > 0, "Target storage size cannot be 0 bytes");
+        eyre::ensure!(self.group_count > 0, "Group count must be > 0");
+        eyre::ensure!(
+            self.block_size_bytes > 0 && self.block_size_bytes.is_power_of_two(),
+            "Block size ({}) must be greater than 0 and a power of two",
+            self.block_size_bytes
+        );
+        eyre::ensure!(self.blocks_per_group > 0, "Blocks per group cannot be 0");
+        eyre::ensure!(
+            total_bytes >= self.block_size_bytes,
+            "Storage size ({} bytes) is too small to hold even a single block of size {} bytes",
+            total_bytes,
+            self.block_size_bytes
+        );
+
+        // a single block bitmap must be able to track every block inside its group
+        // Since 1 byte = 8 bits, a block can track (block_size_bytes * 8) blocks
+        let max_blocks_per_bitmap = self.block_size_bytes * 8;
+        eyre::ensure!(
+            self.blocks_per_group <= max_blocks_per_bitmap,
+            "Blocks per group ({}) exceeds the max capacity of a single block bitmap ({} blocks) for a block size of {} bytes",
+            self.blocks_per_group,
+            max_blocks_per_bitmap,
+            self.block_size_bytes
+        );
+
+        Ok(())
+    }
+}
+
+impl GroupLayout {
+    pub fn derive_from_address(addr: u64, geometry: &GeometryLayout) -> Option<Self> {
+        // prevent division by zero if geometry isn't initialized properly
+        if geometry.group_stride == 0 {
+            return None;
+        }
+
+        let g_index = addr / geometry.group_stride; // !
+        let g_offset = g_index * geometry.group_stride;
+
+        Some(Self {
+            g_index,
+            g_offset,
+            header_region: geometry.rel_header_region.add_offset(g_offset),
+            data_bitmap_region: geometry.rel_data_bitmap_region.add_offset(g_offset),
+            inode_bitmap_region: geometry.rel_inode_bitmap_region.add_offset(g_offset),
+            inode_table_region: geometry.rel_inode_table_region.add_offset(g_offset),
+            data_region: geometry.rel_data_region.add_offset(g_offset),
+        })
+    }
+
+    pub fn derive_from_inode(inumber: u64, geometry: &GeometryLayout) -> Option<Self> {
+        if inumber == 0 {
+            // special none case
+            return None;
+        }
+
+        let g_index = (inumber - 1) / geometry.n_inodes_in_group; // !
+        let g_offset = g_index * geometry.group_stride;
+
+        Some(Self {
+            g_index,
+            g_offset,
+            header_region: geometry.rel_header_region.add_offset(g_offset),
+            data_bitmap_region: geometry.rel_data_bitmap_region.add_offset(g_offset),
+            inode_bitmap_region: geometry.rel_inode_bitmap_region.add_offset(g_offset),
+            inode_table_region: geometry.rel_inode_table_region.add_offset(g_offset),
+            data_region: geometry.rel_data_region.add_offset(g_offset),
+        })
+    }
+}
+
+impl Display for GeometryLayout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "Geometry Layout:")?;
+        writeln!(f, "  Group Stride:        {} B", self.group_stride)?;
+        writeln!(f, "  Inodes per Group:    {}", self.n_inodes_in_group)?;
+        writeln!(f, "  Usable Blocks/Group: {}", self.usable_blocks_per_group)?;
+        writeln!(f, "  Header Region:       {}", self.rel_header_region)?;
+        writeln!(f, "  Data Bitmap Region:  {}", self.rel_data_bitmap_region)?;
+        writeln!(f, "  INode Bitmap Region: {}", self.rel_inode_bitmap_region)?;
+        writeln!(f, "  INode Table Region:  {}", self.rel_inode_table_region)?;
+        write!(f, "  Data Payload Region: {}", self.rel_data_region)
+    }
+}
+
+impl Display for Format {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "Filesystem Format Configuration:")?;
+        writeln!(f, "  Block Size:       {} B", self.block_size_bytes)?;
+        writeln!(f, "  Blocks per Group: {}", self.blocks_per_group)?;
+        write!(f, "  Total Groups:     {}", self.group_count)
     }
 }

@@ -4,7 +4,7 @@ use crate::{
     utils::*,
 };
 use async_recursion::async_recursion;
-use eyre::Context;
+use eyre::{Context, ContextCompat};
 use std::{fmt::Debug, io::SeekFrom, path::PathBuf};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt},
@@ -27,6 +27,8 @@ macro_rules! bfs_bail {
 pub struct BruteFS {
     header_size: usize,
     alloc_guard: Mutex<()>,
+    static_format: Format,
+    geometry: GeometryLayout,
     pub ctrl: Controller,
 }
 
@@ -37,14 +39,30 @@ pub struct WriteOption {
 
 impl BruteFS {
     pub async fn from_formatted(ctrl: Controller, password: Option<String>) -> eyre::Result<Self> {
-        let header_size = Self::header_template().serialize()?.len();
+        let header_size = BruteFsHeader::template().serialize()?.len();
         let mut bfs = Self {
             header_size,
             ctrl,
             alloc_guard: Mutex::new(()),
+            static_format: Format {
+                block_size_bytes: 0,
+                blocks_per_group: 0,
+                group_count: 0,
+            },
+            geometry: Default::default(),
         };
 
         let header = bfs.get_header().await?;
+        let total_bytes = bfs
+            .ctrl
+            .total_capacity()
+            .ok_or_else(|| eyre::eyre!("Failed calculating total capacity"))?;
+
+        bfs.geometry = header.calculate_relative_geometry()?.0;
+        bfs.static_format = header.format;
+        bfs.static_format
+            .validate(total_bytes.saturating_sub(header_size) as u64)?;
+
         if let Some(password) = password {
             bfs.ctrl
                 .setup_crypto(Crypto::new(&password, header.chacha20_nonce));
@@ -55,29 +73,113 @@ impl BruteFS {
     }
 
     pub async fn format_new(mut ctrl: Controller, password: Option<String>) -> eyre::Result<Self> {
-        let header_size = Self::header_template().serialize()?.len();
-        let root = INode {
-            index: 1,
-            nlink: 1,
-            ctime: utc_now_u64(),
-            mtime: utc_now_u64(),
-            total_file_size: 0,
-            extent_addr: MaybeU64::default(),
-            kind: INodeKind::Directory,
-        };
-
-        let root_raw = root.serialize()?;
-
-        let mut header = Self::header_template();
+        let mut header = BruteFsHeader::template();
         header.chacha20_nonce = Crypto::gen_nonce();
         if let Some(password) = &password {
             ctrl.setup_crypto(Crypto::new(password, header.chacha20_nonce));
         }
-        ctrl.raw_write(0, &header.serialize()?).await?;
-        ctrl.write(header_size, &root_raw).await?;
 
-        let bfs = Self::from_formatted(ctrl, password).await?;
-        Ok(bfs)
+        let total_capacity = ctrl
+            .total_capacity()
+            .ok_or_else(|| eyre::eyre!("Failed calculating total capacity"))?
+            as u64;
+        header.format = Format::infer_from_free_space(total_capacity);
+
+        let (g, b) = header.calculate_relative_geometry()?;
+        let mut offset = 0;
+        for _ in 0..header.format.group_count {
+            // header
+            {
+                let start = g.rel_header_region.start.get();
+                let header_addr = offset + start as usize;
+                ctrl.raw_write(header_addr, &b.serialized_header).await?;
+            }
+            // data bitmap
+            {
+                let start = g.rel_data_bitmap_region.start.get();
+                let bitmap_addr = offset + start as usize;
+                ctrl.raw_write(bitmap_addr, &b.data_block_bitmap).await?;
+            }
+            // INode bitmap
+            {
+                let start = g.rel_inode_bitmap_region.start.get();
+                let ibitmap_addr = offset + start as usize;
+                ctrl.raw_write(ibitmap_addr, &b.inode_bitmap_placeholder)
+                    .await?;
+            }
+            // INode table
+            {
+                let start = g.rel_inode_table_region.start.get();
+                let itable_addr = offset + start as usize;
+                ctrl.raw_write(itable_addr, &b.inode_table_placeholder)
+                    .await?;
+            }
+            // zeroing data region is heavy but we can skip
+            offset += g.group_stride as usize;
+        }
+
+        Self::from_formatted(ctrl, password).await
+    }
+
+    pub fn resolve_inode_addr(&self, inumber: u64) -> Option<AddressSlot> {
+        if let Some(group) = GroupLayout::derive_from_inode(inumber, &self.geometry) {
+            let local_inode_index = (inumber - 1) % self.geometry.n_inodes_in_group;
+            let start_inode_table_addr =
+                group.g_offset + self.geometry.rel_inode_table_region.start.get();
+            let inode_size = INode::serialized_size();
+            let inode_addr = start_inode_table_addr + (inode_size as u64 * local_inode_index);
+            return Some(AddressSlot {
+                addr: inode_addr.into(),
+                capacity: inode_size,
+            });
+        }
+        None
+    }
+
+    pub async fn resolve_inode(&self, inumber: u64) -> eyre::Result<Option<INode>> {
+        if let Some((slot, group)) = self
+            .resolve_inode_addr(inumber)
+            .zip(GroupLayout::derive_from_inode(inumber, &self.geometry))
+        {
+            let bitmap_slot = group.inode_bitmap_region.to_addr_slot();
+            let raw_bitmap = self
+                .ctrl
+                .raw_read(bitmap_slot.addr.get() as usize, bitmap_slot.capacity)
+                .await?;
+            let bitmap = Bitmap::deserialize(&raw_bitmap)?;
+
+            let inode_index_in_group = (inumber - 1) % self.geometry.n_inodes_in_group;
+            if !bitmap
+                .get(inode_index_in_group as usize)
+                .wrap_err("Resolving inode")?
+            {
+                return Ok(None);
+            }
+
+            let raw_inode = self
+                .ctrl
+                .raw_read(slot.addr.get() as usize, slot.capacity)
+                .await?;
+
+            return Ok(Some(INode::deserialize(&raw_inode)?));
+        }
+
+        Ok(None)
+    }
+
+    // let start_ibitmap = group_addr + self.geometry.rel_inode_bitmap_region.start.get();
+    // let end_ibitmap = group_addr + self.geometry.rel_inode_bitmap_region.end.get();
+    // self.ctrl
+    //     .read(
+    //         start_ibitmap as usize,
+    //         (end_ibitmap - start_ibitmap + 1) as usize,
+    //     )
+    //     .await?;
+
+    // let group_addr = group_index * self.static_format.blocks_per_group;
+    async fn allocate_inode(&self) -> eyre::Result<()> {
+        // let bitmask = self.ctrl.read(logical_addr, size);
+        todo!()
     }
 
     pub async fn format_headers_report(&self) -> eyre::Result<String> {
@@ -88,17 +190,11 @@ impl BruteFS {
         out.push_str(&format!("brutefs version: {}\n", header.version));
 
         let capacity = self.total_capacity()?;
-        let rem_capacity = self.total_remaining_capacity().await?;
+        // let rem_capacity = self.total_remaining_capacity().await?;
         out.push_str(&format!("Capacity:  {capacity:>10} B\n"));
-        out.push_str(&format!("Remaining: {rem_capacity:>10} B\n"));
-
-        let (ioffset, inode) = self
-            .get_root_inode()
-            .await
-            .wrap_err_with(|| eyre::eyre!("Data is either corrupt or encrypted"))?;
-
-        out.push_str(&format!("Root inode offset {ioffset} (0x{ioffset:08x})\n"));
-        out.push_str(&inode.to_string());
+        out.push_str(&format!("{}\n", self.static_format));
+        out.push_str(&format!("{}\n", self.geometry));
+        // out.push_str(&format!("Remaining: {rem_capacity:>10} B\n"));
 
         Ok(out)
     }
@@ -106,13 +202,6 @@ impl BruteFS {
     pub async fn ensure_headers(&self) -> eyre::Result<()> {
         tracing::debug!("{}", self.format_headers_report().await?);
         Ok(())
-    }
-
-    fn header_template() -> BruteFsHeader {
-        BruteFsHeader {
-            version: 1,
-            chacha20_nonce: Default::default(),
-        }
     }
 
     pub async fn get_header(&self) -> eyre::Result<BruteFsHeader> {
@@ -142,13 +231,15 @@ impl BruteFS {
     }
 
     pub fn total_capacity(&self) -> eyre::Result<usize> {
-        todo!()
+        self.ctrl
+            .total_capacity()
+            .wrap_err("Failed retrieving total capacity")
     }
 
     pub async fn total_remaining_capacity(&self) -> eyre::Result<usize> {
         let mut total = self.total_capacity()?;
         let header = self.get_header().await?;
-        total = total.saturating_sub(header.serialized_size());
+        total = total.saturating_sub(BruteFsHeader::serialized_size());
 
         Ok(total)
     }
@@ -519,7 +610,7 @@ impl BruteFS {
         // println!("File size {filename} => {file_size} B");
 
         let inode = INode {
-            index: 4,
+            inumber: 4,
             nlink: 42,
             ctime: utc_now_u64(),
             mtime: utc_now_u64(),
