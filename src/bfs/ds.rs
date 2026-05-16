@@ -14,6 +14,8 @@ pub enum INodeKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct INode {
     pub kind: INodeKind,
+    pub index: u64,
+    pub nlink: u64,
     pub total_file_size: u64,
     pub extent_addr: MaybeU64,
     pub mtime: u64,
@@ -160,7 +162,6 @@ pub struct AddressVector {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BruteFsHeader {
     pub version: u8,
-    pub extent_freed: AddressVector,
     pub chacha20_nonce: [u8; 12],
 }
 
@@ -235,11 +236,13 @@ impl INode {
     pub fn serialize(&self) -> eyre::Result<Vec<u8>> {
         let mut buf = Vec::with_capacity(Self::serialized_size());
 
+        buf.extend_from_slice(&self.index.to_le_bytes());
         let kind = self.kind.to_byte();
         buf.push(kind);
 
-        buf.extend_from_slice(&self.extent_addr.serialize()?);
+        buf.extend_from_slice(&self.nlink.to_le_bytes());
         buf.extend_from_slice(&self.total_file_size.to_le_bytes());
+        buf.extend_from_slice(&self.extent_addr.serialize()?);
 
         buf.extend_from_slice(&self.mtime.to_le_bytes());
         buf.extend_from_slice(&self.ctime.to_le_bytes());
@@ -256,12 +259,18 @@ impl INode {
             );
         }
 
-        let kind = INodeKind::from_byte(data[0])?;
-
-        let mut addr_start = 1;
-        let extent_addr = MaybeU64::deserialize(data[addr_start..addr_start + 8].try_into()?);
+        let mut addr_start = 0;
+        let index = u64::from_le_bytes(data[addr_start..addr_start + 8].try_into()?);
         addr_start += 8;
+        let kind = INodeKind::from_byte(data[8])?;
+        addr_start += 1;
+
+        let nlink = u64::from_le_bytes(data[addr_start..addr_start + 8].try_into()?);
+        addr_start += 8;
+
         let total_file_size = u64::from_le_bytes(data[addr_start..addr_start + 8].try_into()?);
+        addr_start += 8;
+        let extent_addr = MaybeU64::deserialize(data[addr_start..addr_start + 8].try_into()?);
         addr_start += 8;
 
         let mtime = u64::from_le_bytes(data[addr_start..addr_start + 8].try_into()?);
@@ -269,16 +278,18 @@ impl INode {
         let ctime = u64::from_le_bytes(data[addr_start..addr_start + 8].try_into()?);
 
         Ok(INode {
+            index,
             kind,
+            nlink,
+            extent_addr,
             total_file_size,
             mtime,
             ctime,
-            extent_addr,
         })
     }
 
     pub fn serialized_size() -> usize {
-        1 + 8 + 8 + 8 + 8
+        8 + 1 + 8 + 8 + 8 + 8 + 8
     }
 }
 
@@ -393,121 +404,12 @@ impl SymLink {
     }
 }
 
-impl AddressVector {
-    pub fn allocate(count: usize) -> Self {
-        AddressVector {
-            global_offset: 0,
-            items: vec![AddressSlot::default(); count],
-        }
-    }
-
-    pub fn compactify(&mut self) {
-        let original_count = self.items.len();
-        if original_count < 2 {
-            return;
-        }
-        self.items
-            .sort_by_key(|slot| slot.addr.to_optional().unwrap_or(u64::MAX));
-
-        let mut consolidated = Vec::with_capacity(original_count);
-        let mut items_iter = self.items.drain(..);
-        if let Some(first) = items_iter.next() {
-            consolidated.push(first);
-        }
-
-        for next_slot in items_iter {
-            let last_slot = consolidated.last_mut().unwrap();
-            if let (Some(last_addr), Some(next_addr)) =
-                (last_slot.addr.to_optional(), next_slot.addr.to_optional())
-            {
-                if last_addr + (last_slot.capacity as u64) == next_addr {
-                    last_slot.capacity += next_slot.capacity;
-                    continue;
-                }
-            }
-            consolidated.push(next_slot);
-        }
-
-        // greedy: smallest non-zero/usable capacity first
-        consolidated.sort_by_key(|s| {
-            if s.capacity == 0 {
-                usize::MAX
-            } else {
-                s.capacity
-            }
-        });
-
-        while consolidated.len() < original_count {
-            consolidated.push(AddressSlot::default());
-        }
-        self.items = consolidated;
-    }
-
-    pub fn serialize(&self) -> eyre::Result<Vec<u8>> {
-        let count = self.items.len();
-        let mut buf = Vec::with_capacity(self.serialized_size());
-        buf.extend_from_slice(&count.to_le_bytes());
-        buf.extend_from_slice(&self.global_offset.to_le_bytes());
-        for slot in &self.items {
-            buf.extend_from_slice(&slot.addr.get().to_le_bytes());
-            buf.extend_from_slice(&slot.capacity.to_le_bytes());
-        }
-
-        Ok(buf)
-    }
-
-    pub fn deserialize(data: &[u8]) -> eyre::Result<Self> {
-        if data.len() < 8 {
-            eyre::bail!("Expected AddressVector to be contain at least the the data count");
-        }
-
-        let mut addr_start = 0;
-        let items = u64::from_le_bytes(data[addr_start..addr_start + 8].try_into()?);
-        addr_start += 8;
-
-        let global_offset = u64::from_le_bytes(data[addr_start..addr_start + 8].try_into()?);
-        addr_start += 8;
-
-        let u64_count = (data.len() - addr_start) / 8;
-        if u64_count != 2 * items as usize {
-            eyre::bail!("Expected a count of {items} address entries, got {u64_count} instead")
-        }
-
-        // TODO:
-        // This is a hot path! find a better way if possible
-        let slice = &data[addr_start..];
-        if slice.len() % 16 != 0 {
-            eyre::bail!("Invalid slice length (not multiple of 16)");
-        }
-
-        let mut items = Vec::with_capacity(slice.len() / 16);
-        for chunk in slice.chunks_exact(16) {
-            let addr_bytes: [u8; 8] = chunk[0..8].try_into().expect("valid size");
-            let size_bytes: [u8; 8] = chunk[8..16].try_into().expect("valid size");
-            let addr = MaybeU64::deserialize(addr_bytes);
-            let capacity = u64::from_le_bytes(size_bytes) as usize;
-
-            items.push(AddressSlot { addr, capacity });
-        }
-
-        Ok(Self {
-            global_offset,
-            items,
-        })
-    }
-
-    pub fn serialized_size(&self) -> usize {
-        1 * 8 + self.items.len() * (8 + 8)
-    }
-}
-
 impl BruteFsHeader {
     pub fn serialize(&self) -> eyre::Result<Vec<u8>> {
         let mut buf = Vec::with_capacity(self.serialized_size());
         buf.extend_from_slice(b"brutefs");
         buf.push(self.version);
         buf.extend_from_slice(&self.chacha20_nonce);
-        buf.extend_from_slice(&self.extent_freed.serialize()?);
         Ok(buf)
     }
 
@@ -527,11 +429,10 @@ impl BruteFsHeader {
         Ok(Self {
             version: data[7],
             chacha20_nonce: data[8..8 + 12].try_into()?,
-            extent_freed: AddressVector::deserialize(&data[8 + 12..])?,
         })
     }
 
     pub fn serialized_size(&self) -> usize {
-        7 + 1 + self.extent_freed.serialized_size() + 12
+        7 + 1 + 12
     }
 }
