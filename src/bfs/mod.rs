@@ -188,11 +188,6 @@ impl BruteFS {
             );
         }
 
-        bitmap.set(inode_index_in_group as usize, true)?;
-        self.ctrl
-            .raw_write(bitmap_slot.addr.into(), &bitmap.serialize()?)
-            .await?;
-
         let slot = self.resolve_inode_addr(inode.inumber).ok_or_else(|| {
             eyre::eyre!(
                 "Could not map table space layout coordinates for inumber {}",
@@ -203,6 +198,11 @@ impl BruteFS {
         // encrypt! otherwise people can reverse engineer dir entries
         self.ctrl
             .write(slot.addr.into(), &inode.serialize()?)
+            .await?;
+        // commit
+        bitmap.set(inode_index_in_group as usize, true)?;
+        self.ctrl
+            .raw_write(bitmap_slot.addr.into(), &bitmap.serialize()?)
             .await?;
 
         Ok(())
