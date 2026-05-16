@@ -83,8 +83,8 @@ impl InspectSubcommands {
         match self {
             InspectSubcommands::Inode(i) => {
                 let bfs = i.global.get_bfs().await?;
-                let (addr, inode) = bfs.resolve_path(&i.path).await?;
-                println!("Offset {addr} (0x{addr:08x})\n");
+                let inode = bfs.resolve_path(&i.path).await?;
+                println!("INode #{}\n", inode.inumber);
                 println!("{inode}");
             }
             InspectSubcommands::Extent(e) => {

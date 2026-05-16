@@ -524,7 +524,7 @@ impl BruteFsHeader {
 
     pub fn template() -> Self {
         Self {
-            version: 0,
+            version: 1,
             format: Format {
                 block_size_bytes: 0,
                 blocks_per_group: 0,
@@ -742,15 +742,13 @@ impl Format {
 }
 
 impl GroupLayout {
-    pub fn derive_from_address(addr: u64, geometry: &GeometryLayout) -> Option<Self> {
+    pub fn derive_from_group_index(g_index: u64, geometry: &GeometryLayout) -> Option<Self> {
         // prevent division by zero if geometry isn't initialized properly
         if geometry.group_stride == 0 {
             return None;
         }
 
-        let g_index = addr / geometry.group_stride; // !
         let g_offset = g_index * geometry.group_stride;
-
         Some(Self {
             g_index,
             g_offset,
@@ -762,30 +760,25 @@ impl GroupLayout {
         })
     }
 
-    pub fn derive_from_inode(inumber: u64, geometry: &GeometryLayout) -> Option<Self> {
-        if inumber == 0 {
-            // special none case
+    pub fn derive_from_address(addr: u64, geometry: &GeometryLayout) -> Option<Self> {
+        // prevent division by zero if geometry isn't initialized properly
+        if geometry.group_stride == 0 {
             return None;
         }
+        Self::derive_from_group_index(addr / geometry.group_stride, geometry)
+    }
 
-        let g_index = (inumber - 1) / geometry.n_inodes_in_group; // !
-        let g_offset = g_index * geometry.group_stride;
-
-        Some(Self {
-            g_index,
-            g_offset,
-            header_region: geometry.rel_header_region.add_offset(g_offset),
-            data_bitmap_region: geometry.rel_data_bitmap_region.add_offset(g_offset),
-            inode_bitmap_region: geometry.rel_inode_bitmap_region.add_offset(g_offset),
-            inode_table_region: geometry.rel_inode_table_region.add_offset(g_offset),
-            data_region: geometry.rel_data_region.add_offset(g_offset),
-        })
+    pub fn derive_from_inode(inumber: u64, geometry: &GeometryLayout) -> Option<Self> {
+        if inumber == 0 || geometry.n_inodes_in_group == 0 {
+            return None;
+        }
+        Self::derive_from_group_index((inumber - 1) / geometry.n_inodes_in_group, geometry)
     }
 }
 
 impl Display for GeometryLayout {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "Geometry Layout:")?;
+        writeln!(f, "Geometry Layout (relative):")?;
         writeln!(f, "  Group Stride:        {} B", self.group_stride)?;
         writeln!(f, "  Inodes per Group:    {}", self.n_inodes_in_group)?;
         writeln!(f, "  Usable Blocks/Group: {}", self.usable_blocks_per_group)?;
@@ -799,7 +792,7 @@ impl Display for GeometryLayout {
 
 impl Display for Format {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "Filesystem Format Configuration:")?;
+        writeln!(f, "Format Configuration:")?;
         writeln!(f, "  Block Size:       {} B", self.block_size_bytes)?;
         writeln!(f, "  Blocks per Group: {}", self.blocks_per_group)?;
         write!(f, "  Total Groups:     {}", self.group_count)

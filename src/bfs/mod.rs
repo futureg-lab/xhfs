@@ -136,7 +136,7 @@ impl BruteFS {
         None
     }
 
-    pub async fn resolve_inode(&self, inumber: u64) -> eyre::Result<Option<INode>> {
+    async fn resolve_inode(&self, inumber: u64) -> eyre::Result<Option<INode>> {
         if let Some((slot, group)) = self
             .resolve_inode_addr(inumber)
             .zip(GroupLayout::derive_from_inode(inumber, &self.geometry))
@@ -144,57 +144,82 @@ impl BruteFS {
             let bitmap_slot = group.inode_bitmap_region.to_addr_slot();
             let raw_bitmap = self
                 .ctrl
-                .raw_read(bitmap_slot.addr.get() as usize, bitmap_slot.capacity)
+                .raw_read(bitmap_slot.addr.into(), bitmap_slot.capacity)
                 .await?;
             let bitmap = Bitmap::deserialize(&raw_bitmap)?;
 
             let inode_index_in_group = (inumber - 1) % self.geometry.n_inodes_in_group;
             if !bitmap
                 .get(inode_index_in_group as usize)
-                .wrap_err("Resolving inode")?
+                .wrap_err("Resolving INode")?
             {
                 return Ok(None);
             }
 
-            let raw_inode = self
-                .ctrl
-                .raw_read(slot.addr.get() as usize, slot.capacity)
-                .await?;
+            let raw_inode = self.ctrl.raw_read(slot.addr.into(), slot.capacity).await?;
 
-            return Ok(Some(INode::deserialize(&raw_inode)?));
+            return Some(INode::deserialize(&raw_inode)).transpose();
         }
 
         Ok(None)
     }
 
-    // let start_ibitmap = group_addr + self.geometry.rel_inode_bitmap_region.start.get();
-    // let end_ibitmap = group_addr + self.geometry.rel_inode_bitmap_region.end.get();
-    // self.ctrl
-    //     .read(
-    //         start_ibitmap as usize,
-    //         (end_ibitmap - start_ibitmap + 1) as usize,
-    //     )
-    //     .await?;
+    async fn register_node(&self, inode: &INode, overwrite: bool) -> eyre::Result<()> {
+        let _guard = self.alloc_guard.lock().await;
+        let group = GroupLayout::derive_from_inode(inode.inumber, &self.geometry)
+            .wrap_err("Unable to derive group when registering INode")?;
 
-    // let group_addr = group_index * self.static_format.blocks_per_group;
-    async fn allocate_inode(&self) -> eyre::Result<()> {
-        // let bitmask = self.ctrl.read(logical_addr, size);
-        todo!()
+        let bitmap_slot = group.inode_bitmap_region.to_addr_slot();
+        let raw_bitmap = self
+            .ctrl
+            .raw_read(bitmap_slot.addr.into(), bitmap_slot.capacity)
+            .await?;
+        let mut bitmap = Bitmap::deserialize(&raw_bitmap)?;
+
+        let inode_index_in_group = (inode.inumber - 1) % self.geometry.n_inodes_in_group;
+        let is_already_allocated = bitmap
+            .get(inode_index_in_group as usize)
+            .wrap_err("Scanning bitmap state")?;
+        if !overwrite && is_already_allocated {
+            eyre::bail!(
+                "INode number {} exists already in group {}",
+                inode.inumber,
+                group.g_index
+            );
+        }
+
+        bitmap.set(inode_index_in_group as usize, true)?;
+        self.ctrl
+            .raw_write(bitmap_slot.addr.into(), &bitmap.serialize()?)
+            .await?;
+
+        let slot = self.resolve_inode_addr(inode.inumber).ok_or_else(|| {
+            eyre::eyre!(
+                "Could not map table space layout coordinates for inumber {}",
+                inode.inumber
+            )
+        })?;
+
+        // encrypt! otherwise people can reverse engineer dir entries
+        self.ctrl
+            .write(slot.addr.into(), &inode.serialize()?)
+            .await?;
+
+        Ok(())
     }
 
     pub async fn format_headers_report(&self) -> eyre::Result<String> {
         let mut out = String::new();
 
         let header = self.get_header().await?;
-
         out.push_str(&format!("brutefs version: {}\n", header.version));
 
         let capacity = self.total_capacity()?;
-        // let rem_capacity = self.total_remaining_capacity().await?;
+        let rem_capacity = self.total_remaining_capacity().await?;
         out.push_str(&format!("Capacity:  {capacity:>10} B\n"));
+        out.push_str(&format!("Remaining: {rem_capacity:>10} B\n"));
         out.push_str(&format!("{}\n", self.static_format));
         out.push_str(&format!("{}\n", self.geometry));
-        // out.push_str(&format!("Remaining: {rem_capacity:>10} B\n"));
 
         Ok(out)
     }
@@ -213,21 +238,10 @@ impl BruteFS {
         self.ctrl.raw_write(0, &header.serialize()?).await
     }
 
-    pub async fn get_root_inode(&self) -> eyre::Result<(u64, INode)> {
-        let root_inode_addr = self.header_size;
-        Ok((
-            root_inode_addr as u64,
-            INode::deserialize(
-                &self
-                    .ctrl
-                    .read(root_inode_addr, INode::serialized_size())
-                    .await?,
-            )?,
-        ))
-    }
-
-    pub async fn allocate(&self, wanted_size: usize) -> Result<u64, BruteFsError> {
-        todo!()
+    pub async fn get_root_inode(&self) -> eyre::Result<INode> {
+        self.resolve_inode(1)
+            .await?
+            .ok_or_else(|| eyre::eyre!("Could not find root inode"))
     }
 
     pub fn total_capacity(&self) -> eyre::Result<usize> {
@@ -237,22 +251,39 @@ impl BruteFS {
     }
 
     pub async fn total_remaining_capacity(&self) -> eyre::Result<usize> {
-        let mut total = self.total_capacity()?;
-        let header = self.get_header().await?;
-        total = total.saturating_sub(BruteFsHeader::serialized_size());
+        let mut total = 0;
+        for g_index in 0..self.static_format.group_count {
+            let group =
+                GroupLayout::derive_from_group_index(g_index, &self.geometry).ok_or_else(|| {
+                    eyre::eyre!("Failed calculating group layout for index {g_index}")
+                })?;
+
+            let slot = group.data_bitmap_region.to_addr_slot();
+            let raw_bitmap = self.ctrl.raw_read(slot.addr.into(), slot.capacity).await?;
+            let bitmap = Bitmap::deserialize(&raw_bitmap)?;
+
+            // TODO: SIMD, or use some bitwise vodoo, again correctness first
+            let mut free_blocks = 0;
+            for i in 0..self.geometry.usable_blocks_per_group as usize {
+                if !bitmap
+                    .get(i)
+                    .wrap_err("Parsing block map allocation state")?
+                {
+                    free_blocks += 1;
+                }
+            }
+
+            total += free_blocks * self.static_format.block_size_bytes as usize;
+        }
 
         Ok(total)
     }
 
-    pub async fn resolve_path<P: Into<PathBuf>>(&self, path: P) -> eyre::Result<(u64, INode)> {
+    pub async fn resolve_path<P: Into<PathBuf>>(&self, path: P) -> eyre::Result<INode> {
         let path: PathBuf = path.into();
         tracing::debug!("Resolving {path:?}");
         let components = path_to_string_list(path);
-
-        let (mut inode_addr, mut inode) = self.get_root_inode().await?;
-        if components.is_empty() {
-            return Ok((inode_addr, inode));
-        }
+        let mut inode = self.get_root_inode().await?;
 
         for (i, component) in components.iter().enumerate() {
             match inode.kind {
@@ -260,47 +291,46 @@ impl BruteFS {
                     tracing::debug!(" > Enter dir {component}");
                     let payload = self.read_full_data_from_extent(inode.extent_addr).await?;
                     let directory = Directory::deserialize(&payload)?;
-                    let mut found = None;
-                    for (name, child_addr) in directory.entries {
-                        if name.eq(component) {
-                            found = Some(child_addr);
-                            break;
-                        }
-                    }
 
-                    let child_addr = found.ok_or_else(|| {
-                        eyre::eyre!("Path '{}' does not exist", join_absolute(&components[..=i]))
+                    let child_inumber = directory
+                        .entries
+                        .iter()
+                        .find(|(name, _)| name.eq(component))
+                        .map(|(_, inumber)| *inumber)
+                        .ok_or_else(|| {
+                            eyre::eyre!(
+                                "Path '{}' does not exist",
+                                join_absolute(&components[..=i])
+                            )
+                        })?;
+
+                    // IMMEDIATELY resolve the child target so it can be checked on the next pass
+                    // or loop exit
+                    inode = self.resolve_inode(child_inumber).await?.wrap_err_with(|| {
+                        eyre::eyre!("Could not find INode child entry {child_inumber}")
                     })?;
-                    inode_addr = child_addr;
-                    inode = INode::deserialize(
-                        &self
-                            .ctrl
-                            .read(child_addr as usize, INode::serialized_size())
-                            .await?,
-                    )?;
                 }
                 INodeKind::File => {
                     eyre::bail!(
-                        "Encountered file while traversing path '{}'",
-                        join_absolute(&components[..=i])
+                        "Encountered file '{}' while expecting a directory container to reach components downstream",
+                        join_absolute(&components[..i])
                     );
                 }
                 INodeKind::Symlink => {
+                    // IDEA: impl symlink resolution traversal loop substitution here
+                    // resolving a link should resolve into its containing path?
                     eyre::bail!(
-                        "Encountered a symbolic link while traversing path '{}'",
-                        join_absolute(&components[..=i])
+                        "Symbolic links are not yet supported during traversal at '{}'",
+                        join_absolute(&components[..i])
                     );
                 }
             }
         }
 
-        Ok((inode_addr, inode))
+        Ok(inode)
     }
 
-    async fn resolve_parent<P: Into<PathBuf>>(
-        &self,
-        path: P,
-    ) -> eyre::Result<(u64, INode, String)> {
+    async fn resolve_parent<P: Into<PathBuf>>(&self, path: P) -> eyre::Result<(INode, String)> {
         let path: PathBuf = path.into();
         tracing::debug!("Resolving parent of {path:?}");
         let parent = path.parent().ok_or_else(|| eyre::eyre!("Missing parent"))?;
@@ -309,14 +339,14 @@ impl BruteFS {
             .ok_or_else(|| eyre::eyre!("Missing filename"))?
             .to_string_lossy()
             .to_string();
-        let (addr, inode) = self.resolve_path(parent).await?;
-        Ok((addr, inode, filename))
+        let inode = self.resolve_path(parent).await?;
+        Ok((inode, filename))
     }
 
     #[async_recursion(?Send)]
     pub async fn ls<P: Into<PathBuf>>(&self, path: P) -> eyre::Result<Vec<String>> {
         let path: PathBuf = path.into();
-        let (_, inode) = self.resolve_path(&path).await?;
+        let inode = self.resolve_path(&path).await?;
         match inode.kind {
             INodeKind::Directory => {
                 let payload = self.read_full_data_from_extent(inode.extent_addr).await?;
@@ -355,175 +385,177 @@ impl BruteFS {
         opt: WriteOption,
     ) -> Result<(), BruteFsError> {
         let data = self.fread(src).await?;
-        let (_dst_parent_addr, _dst_parent_inode, _) = self.resolve_parent(dest.clone()).await?;
+        let (_dst_parent_inode, _) = self.resolve_parent(dest.clone()).await?;
         self.fwrite(dest, data, opt).await
     }
 
+    #[allow(unused)]
     pub async fn fmove<P: Into<PathBuf>>(&self, src: P, dest: P) -> eyre::Result<()> {
-        let (src_parent_addr, mut src_parent_inode, src_name) = self.resolve_parent(src).await?;
-        let (dst_parent_addr, mut dst_parent_inode, dst_name) = self.resolve_parent(dest).await?;
+        // let (mut src_parent_inode, src_name) = self.resolve_parent(src).await?;
+        // let (mut dst_parent_inode, dst_name) = self.resolve_parent(dest).await?;
 
-        let src_payload = self
-            .read_full_data_from_extent(src_parent_inode.extent_addr)
-            .await?;
-        let dst_payload = self
-            .read_full_data_from_extent(dst_parent_inode.extent_addr)
-            .await?;
+        // let src_payload = self
+        //     .read_full_data_from_extent(src_parent_inode.extent_addr)
+        //     .await?;
+        // let dst_payload = self
+        //     .read_full_data_from_extent(dst_parent_inode.extent_addr)
+        //     .await?;
 
-        // Same parent:
-        // we need to be careful updating dir entries as there is only one (psrc = pdst)
-        if src_parent_addr == dst_parent_addr {
-            tracing::debug!("fmove found same parent for src and dest");
-            let mut dir = Directory::deserialize(&src_payload)?;
-            if dir.entries.iter().any(|(name, _)| name == &dst_name) {
-                eyre::bail!("Destination already exists: {dst_name}");
-            }
-            let mut found_inode_addr = None;
-            dir.entries.retain(|(name, inode_addr)| {
-                if name == &src_name {
-                    found_inode_addr = Some(*inode_addr);
-                    false
-                } else {
-                    true
-                }
-            });
-            let inode_addr =
-                found_inode_addr.ok_or_else(|| eyre::eyre!("Source entry not found"))?;
-            dir.entries.push((dst_name, inode_addr));
+        // // Same parent:
+        // // we need to be careful updating dir entries as there is only one (psrc = pdst)
+        // if src_parent_addr == dst_parent_addr {
+        //     tracing::debug!("fmove found same parent for src and dest");
+        //     let mut dir = Directory::deserialize(&src_payload)?;
+        //     if dir.entries.iter().any(|(name, _)| name == &dst_name) {
+        //         eyre::bail!("Destination already exists: {dst_name}");
+        //     }
+        //     let mut found_inode_addr = None;
+        //     dir.entries.retain(|(name, inode_addr)| {
+        //         if name == &src_name {
+        //             found_inode_addr = Some(*inode_addr);
+        //             false
+        //         } else {
+        //             true
+        //         }
+        //     });
+        //     let inode_addr =
+        //         found_inode_addr.ok_or_else(|| eyre::eyre!("Source entry not found"))?;
+        //     dir.entries.push((dst_name, inode_addr));
 
-            let old_extent = src_parent_inode.extent_addr;
-            let new_ext = Extent {
-                next: MaybeU64::default(),
-                data: dir.serialize()?,
-            };
-            let addr = self.allocate(new_ext.serialized_size()).await?;
-            self.ctrl
-                .write(addr as usize, &new_ext.serialize()?)
-                .await?;
-            src_parent_inode.extent_addr = MaybeU64::from(addr);
-            self.ctrl
-                .write(src_parent_addr as usize, &src_parent_inode.serialize()?)
-                .await?;
+        //     let old_extent = src_parent_inode.extent_addr;
+        //     let new_ext = Extent {
+        //         next: MaybeU64::default(),
+        //         data: dir.serialize()?,
+        //     };
+        //     let addr = self.allocate(new_ext.serialized_size()).await?;
+        //     self.ctrl
+        //         .write(addr as usize, &new_ext.serialize()?)
+        //         .await?;
+        //     src_parent_inode.extent_addr = MaybeU64::from(addr);
+        //     self.ctrl
+        //         .write(src_parent_addr as usize, &src_parent_inode.serialize()?)
+        //         .await?;
 
-            self.free_full_extent(old_extent).await?;
-            return Ok(());
-        }
+        //     self.free_full_extent(old_extent).await?;
+        //     return Ok(());
+        // }
 
-        let mut src_dir = Directory::deserialize(&src_payload)?;
-        let mut dst_dir = Directory::deserialize(&dst_payload)?;
-        if dst_dir.entries.iter().any(|(name, _)| name == &dst_name) {
-            eyre::bail!("Destination already exists: {dst_name}");
-        }
-        let mut found_inode_addr = None;
-        src_dir.entries.retain(|(name, inode_addr)| {
-            if name == &src_name {
-                found_inode_addr = Some(*inode_addr);
-                false
-            } else {
-                true
-            }
-        });
+        // let mut src_dir = Directory::deserialize(&src_payload)?;
+        // let mut dst_dir = Directory::deserialize(&dst_payload)?;
+        // if dst_dir.entries.iter().any(|(name, _)| name == &dst_name) {
+        //     eyre::bail!("Destination already exists: {dst_name}");
+        // }
+        // let mut found_inode_addr = None;
+        // src_dir.entries.retain(|(name, inode_addr)| {
+        //     if name == &src_name {
+        //         found_inode_addr = Some(*inode_addr);
+        //         false
+        //     } else {
+        //         true
+        //     }
+        // });
 
-        let inode_addr = found_inode_addr.ok_or_else(|| eyre::eyre!("Source entry not found"))?;
-        dst_dir.entries.push((dst_name, inode_addr));
-        let old_src = src_parent_inode.extent_addr;
-        let old_dst = dst_parent_inode.extent_addr;
-        let new_src = Extent {
-            next: MaybeU64::default(),
-            data: src_dir.serialize()?,
-        };
-        let new_dst = Extent {
-            next: MaybeU64::default(),
-            data: dst_dir.serialize()?,
-        };
+        // let inode_addr = found_inode_addr.ok_or_else(|| eyre::eyre!("Source entry not found"))?;
+        // dst_dir.entries.push((dst_name, inode_addr));
+        // let old_src = src_parent_inode.extent_addr;
+        // let old_dst = dst_parent_inode.extent_addr;
+        // let new_src = Extent {
+        //     next: MaybeU64::default(),
+        //     data: src_dir.serialize()?,
+        // };
+        // let new_dst = Extent {
+        //     next: MaybeU64::default(),
+        //     data: dst_dir.serialize()?,
+        // };
 
-        let src_addr = self.allocate(new_src.serialized_size()).await?;
-        self.ctrl
-            .write(src_addr as usize, &new_src.serialize()?)
-            .await?;
-        src_parent_inode.extent_addr = MaybeU64::from(src_addr);
+        // let src_addr = self.allocate(new_src.serialized_size()).await?;
+        // self.ctrl
+        //     .write(src_addr as usize, &new_src.serialize()?)
+        //     .await?;
+        // src_parent_inode.extent_addr = MaybeU64::from(src_addr);
 
-        let dst_addr = self.allocate(new_dst.serialized_size()).await?;
-        self.ctrl
-            .write(dst_addr as usize, &new_dst.serialize()?)
-            .await?;
-        dst_parent_inode.extent_addr = MaybeU64::from(dst_addr);
+        // let dst_addr = self.allocate(new_dst.serialized_size()).await?;
+        // self.ctrl
+        //     .write(dst_addr as usize, &new_dst.serialize()?)
+        //     .await?;
+        // dst_parent_inode.extent_addr = MaybeU64::from(dst_addr);
 
-        self.ctrl
-            .write(src_parent_addr as usize, &src_parent_inode.serialize()?)
-            .await?;
-        self.ctrl
-            .write(dst_parent_addr as usize, &dst_parent_inode.serialize()?)
-            .await?;
+        // self.ctrl
+        //     .write(src_parent_addr as usize, &src_parent_inode.serialize()?)
+        //     .await?;
+        // self.ctrl
+        //     .write(dst_parent_addr as usize, &dst_parent_inode.serialize()?)
+        //     .await?;
 
-        self.free_all([old_src, old_dst]).await?;
+        // self.free_all([old_src, old_dst]).await?;
         Ok(())
     }
 
+    #[allow(unused)]
     pub async fn unlink<P: Into<PathBuf>>(&self, path: P) -> eyre::Result<()> {
-        let path: PathBuf = path.into();
-        let (parent_addr, mut parent_inode, filename) = self.resolve_parent(&path).await?;
-        let payload = self
-            .read_full_data_from_extent(parent_inode.extent_addr)
-            .await?;
+        // let path: PathBuf = path.into();
+        // let (mut parent_inode, filename) = self.resolve_parent(&path).await?;
+        // let payload = self
+        //     .read_full_data_from_extent(parent_inode.extent_addr)
+        //     .await?;
 
-        let mut directory = Directory::deserialize(&payload)?;
-        let entry_index = directory
-            .entries
-            .iter()
-            .position(|(name, _)| name == &filename)
-            .ok_or_else(|| eyre::eyre!("Path does not exist"))?;
+        // let mut directory = Directory::deserialize(&payload)?;
+        // let entry_index = directory
+        //     .entries
+        //     .iter()
+        //     .position(|(name, _)| name == &filename)
+        //     .ok_or_else(|| eyre::eyre!("Path does not exist"))?;
 
-        let (_, inode_addr) = directory.entries.remove(entry_index);
-        let inode = INode::deserialize(
-            &self
-                .ctrl
-                .read(inode_addr as usize, INode::serialized_size())
-                .await?,
-        )?;
+        // let (_, inode_addr) = directory.entries.remove(entry_index);
+        // let inode = INode::deserialize(
+        //     &self
+        //         .ctrl
+        //         .read(inode_addr as usize, INode::serialized_size())
+        //         .await?,
+        // )?;
 
-        let mut maybe_garbages = vec![];
-        match inode.kind {
-            INodeKind::File | INodeKind::Symlink => {
-                self.free_full_extent(inode.extent_addr).await?;
-            }
-            INodeKind::Directory => {
-                let dir_payload = self.read_full_data_from_extent(inode.extent_addr).await?;
-                let dir = Directory::deserialize(&dir_payload)?;
-                if !dir.entries.is_empty() {
-                    eyre::bail!("Directory is not empty");
-                }
+        // let mut maybe_garbages = vec![];
+        // match inode.kind {
+        //     INodeKind::File | INodeKind::Symlink => {
+        //         self.free_full_extent(inode.extent_addr).await?;
+        //     }
+        //     INodeKind::Directory => {
+        //         let dir_payload = self.read_full_data_from_extent(inode.extent_addr).await?;
+        //         let dir = Directory::deserialize(&dir_payload)?;
+        //         if !dir.entries.is_empty() {
+        //             eyre::bail!("Directory is not empty");
+        //         }
 
-                maybe_garbages.push(inode.extent_addr);
-            }
-        }
+        //         maybe_garbages.push(inode.extent_addr);
+        //     }
+        // }
 
-        tracing::debug!("Rewrite parent directory entries");
-        maybe_garbages.push(parent_inode.extent_addr);
+        // tracing::debug!("Rewrite parent directory entries");
+        // maybe_garbages.push(parent_inode.extent_addr);
 
-        let new_dir_extent = Extent {
-            next: MaybeU64::default(),
-            data: directory.serialize()?,
-        };
-        let new_dir_extent_addr = self.allocate(new_dir_extent.serialized_size()).await?;
-        self.ctrl
-            .write(new_dir_extent_addr as usize, &new_dir_extent.serialize()?)
-            .await?;
+        // let new_dir_extent = Extent {
+        //     next: MaybeU64::default(),
+        //     data: directory.serialize()?,
+        // };
+        // let new_dir_extent_addr = self.allocate(new_dir_extent.serialized_size()).await?;
+        // self.ctrl
+        //     .write(new_dir_extent_addr as usize, &new_dir_extent.serialize()?)
+        //     .await?;
 
-        parent_inode.extent_addr = MaybeU64::from(new_dir_extent_addr);
-        parent_inode.mtime = utc_now_u64();
+        // parent_inode.extent_addr = MaybeU64::from(new_dir_extent_addr);
+        // parent_inode.mtime = utc_now_u64();
 
-        self.ctrl
-            .write(parent_addr as usize, &parent_inode.serialize()?)
-            .await?;
+        // self.ctrl
+        //     .write(parent_addr as usize, &parent_inode.serialize()?)
+        //     .await?;
 
-        self.mark_as_reusable(AddressSlot {
-            addr: MaybeU64::from(inode_addr),
-            capacity: INode::serialized_size(),
-        })
-        .await?;
+        // self.mark_as_reusable(AddressSlot {
+        //     addr: MaybeU64::from(inode_addr),
+        //     capacity: INode::serialized_size(),
+        // })
+        // .await?;
 
-        self.free_all(maybe_garbages).await?;
+        // self.free_all(maybe_garbages).await?;
         Ok(())
     }
 
@@ -544,20 +576,18 @@ impl BruteFS {
         }
 
         let path: PathBuf = path.into();
-        let (parent_addr, mut parent_inode, filename) = self.resolve_parent(&path).await?;
+        let (mut parent_inode, filename) = self.resolve_parent(&path).await?;
         let payload = self
             .read_full_data_from_extent(parent_inode.extent_addr)
             .await?;
 
         let mut directory = Directory::deserialize(&payload)?;
-        for (name, inode_addr) in &directory.entries {
+        for (name, inumber) in &directory.entries {
             if name == &filename {
-                let mut inode = INode::deserialize(
-                    &self
-                        .ctrl
-                        .read(*inode_addr as usize, INode::serialized_size())
-                        .await?,
-                )?;
+                let mut inode = self
+                    .resolve_inode(*inumber)
+                    .await?
+                    .ok_or_else(|| eyre::eyre!("Resolving INode for direntry '{name}'"))?;
                 match inode.kind {
                     INodeKind::File | INodeKind::Symlink => {
                         if !opt.overwrite {
@@ -578,9 +608,7 @@ impl BruteFS {
                             .await?;
                         inode.extent_addr = MaybeU64::from(extent_addr);
                         inode.mtime = utc_now_u64();
-                        self.ctrl
-                            .write(*inode_addr as usize, &inode.serialize()?)
-                            .await?;
+                        self.update_inode(inode).await?;
 
                         self.free_full_extent(old_extent_addr).await?;
 
@@ -640,9 +668,7 @@ impl BruteFS {
         parent_inode.extent_addr = MaybeU64::from(new_dir_extent_addr);
         parent_inode.mtime = utc_now_u64();
 
-        self.ctrl
-            .write(parent_addr as usize, &parent_inode.serialize()?)
-            .await?;
+        self.update_inode(parent_inode).await?;
 
         self.free_full_extent(old_parent_extent).await?;
 
@@ -727,6 +753,7 @@ impl BruteFS {
         Ok(())
     }
 
+    #[allow(unused)]
     pub async fn mkdir<P: Into<PathBuf>>(&self, path: P, recursive: bool) -> eyre::Result<bool> {
         let components = path_to_string_list(path);
         todo!()
@@ -735,7 +762,7 @@ impl BruteFS {
     #[async_recursion(?Send)]
     pub async fn fread<P: Into<PathBuf>>(&self, path: P) -> Result<Vec<u8>, BruteFsError> {
         let path: PathBuf = path.into();
-        let (_, inode) = self.resolve_path(&path).await?;
+        let inode = self.resolve_path(&path).await?;
         match inode.kind {
             INodeKind::Directory => Err(BruteFsError::from_report(eyre::eyre!(
                 "Cannot fread directory"
@@ -769,7 +796,7 @@ impl BruteFS {
         end: u64,
     ) -> eyre::Result<Vec<u8>> {
         let path: PathBuf = path.into();
-        let (_, inode) = self.resolve_path(&path).await?;
+        let inode = self.resolve_path(&path).await?;
         match inode.kind {
             INodeKind::File => {
                 self.seek_full_data_from_extent(inode.extent_addr, start, end)
@@ -806,7 +833,7 @@ impl BruteFS {
         data: Vec<u8>,
     ) -> Result<(), BruteFsError> {
         let path: PathBuf = path.into();
-        let (iaddr, mut inode) = self.resolve_path(&path).await?;
+        let mut inode = self.resolve_path(&path).await?;
         match inode.kind {
             INodeKind::File => {
                 inode.total_file_size += data.len() as u64;
@@ -816,7 +843,7 @@ impl BruteFS {
                 };
                 self.append_or_allocate_extent(inode.extent_addr, new_extent)
                     .await?;
-                self.update_inode(iaddr, inode).await?;
+                self.update_inode(inode).await?;
             }
             INodeKind::Symlink => {
                 tracing::debug!("Trying tofappend file from symlink");
@@ -841,9 +868,9 @@ impl BruteFS {
         Ok(())
     }
 
-    pub async fn update_inode(&self, addr: u64, mut inode: INode) -> eyre::Result<()> {
+    pub async fn update_inode(&self, mut inode: INode) -> eyre::Result<()> {
         inode.mtime = utc_now_u64();
-        self.ctrl.write(addr as usize, &inode.serialize()?).await
+        self.register_node(&inode, true).await
     }
 
     pub async fn read_extent(&self, addr: u64) -> Result<Extent, BruteFsError> {
@@ -896,7 +923,7 @@ impl BruteFS {
         let components = path_to_string_list(path.clone());
 
         if components.is_empty() {
-            let (_, inode) = self.get_root_inode().await?;
+            let inode = self.get_root_inode().await?;
             return Ok(Some(EntryStat {
                 name: "/".to_string(),
                 size: None,
@@ -905,7 +932,7 @@ impl BruteFS {
                 ctime: inode.ctime,
             }));
         }
-        let (_, inode) = match self.resolve_path(path).await {
+        let inode = match self.resolve_path(path).await {
             Ok(v) => v,
             Err(_) => return Ok(None),
         };
@@ -921,6 +948,11 @@ impl BruteFS {
             mtime: inode.mtime,
             ctime: inode.ctime,
         }))
+    }
+
+    #[allow(unused)]
+    pub async fn allocate(&self, wanted_size: usize) -> Result<u64, BruteFsError> {
+        todo!()
     }
 
     pub async fn free_full_extent(&self, start_extent_addr: MaybeU64) -> eyre::Result<()> {

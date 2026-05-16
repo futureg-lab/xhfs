@@ -29,6 +29,12 @@ impl From<usize> for MaybeU64 {
     }
 }
 
+impl Into<usize> for MaybeU64 {
+    fn into(self) -> usize {
+        self.get() as usize
+    }
+}
+
 impl MaybeU64 {
     pub fn get(&self) -> u64 {
         match self.inner {
