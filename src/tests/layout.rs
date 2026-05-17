@@ -1,3 +1,5 @@
+use bitvec::{bitvec, order::Msb0};
+
 use crate::bfs::ds::*;
 
 fn create_test_header(block_size: u64, blocks_per_group: u64, groups: u64) -> BruteFsHeader {
@@ -293,6 +295,16 @@ fn test_derive_inode_group_zero_boundaries() {
 }
 
 #[test]
+fn test_derive_inode_deep_index_generic() {
+    let geom = setup_mock_geometry();
+    let target_group = 42;
+    let target_inode = (target_group * geom.n_inodes_in_group) + 372;
+    let layout = GroupLayout::derive_from_inode(target_inode, &geom).unwrap();
+    assert_eq!(layout.g_index, target_group);
+    assert_eq!(layout.g_offset, target_group * geom.group_stride);
+}
+
+#[test]
 fn test_derive_inode_group_one_inflection_point() {
     let geom = setup_mock_geometry();
     let first_inode_g1 = geom.n_inodes_in_group + 1;
@@ -308,13 +320,101 @@ fn test_derive_inode_group_one_inflection_point() {
 }
 
 #[test]
-fn test_derive_inode_deep_index_translation() {
-    let geom = setup_mock_geometry();
-    let target_group = 10;
-    // First entry index of group 10 is (10 * size) + 1
-    let target_inode = (target_group * geom.n_inodes_in_group) + 500;
+fn test_runs_of_zeros_empty_and_full() {
+    // 0s
+    let mut bitmap = Bitmap::new_from_bits_count(16);
+    {
+        let free_runs = bitmap.runs_of(false, None);
+        assert_eq!(
+            free_runs,
+            [BitRunSlot { start: 0, size: 16 }],
+            "find one massive 16 block free run"
+        );
 
-    let layout = GroupLayout::derive_from_inode(target_inode, &geom).unwrap();
-    assert_eq!(layout.g_index, target_group);
-    assert_eq!(layout.g_offset, target_group * geom.group_stride);
+        let allocated_runs = bitmap.runs_of(true, None);
+        assert!(allocated_runs.is_empty(), "find zero allocated runs");
+    }
+    // 1s
+    {
+        bitmap.map.fill(true);
+        let free_runs_full = bitmap.runs_of(false, None);
+        assert!(
+            free_runs_full.is_empty(),
+            "find zero free runs when disk is full"
+        );
+        let allocated_runs_full = bitmap.runs_of(true, None);
+        assert_eq!(
+            allocated_runs_full,
+            [BitRunSlot { start: 0, size: 16 }],
+            "Should find one massive 16-block continuous file"
+        );
+    }
+}
+
+#[test]
+fn test_runs_of_fragmented_boundaries() -> eyre::Result<()> {
+    let mut bitmap = Bitmap::new_from_bits_count(10);
+    bitmap.set(4, true)?;
+    bitmap.set(5, true)?;
+    bitmap.set(6, true)?;
+
+    let free_runs = bitmap.runs_of(false, None);
+    assert_eq!(
+        free_runs,
+        [
+            BitRunSlot { start: 0, size: 4 },
+            BitRunSlot { start: 7, size: 3 }
+        ],
+        "isolate the two distinct gaps of free blocks"
+    );
+
+    let allocated_runs = bitmap.runs_of(true, None);
+    assert_eq!(
+        allocated_runs,
+        [BitRunSlot { start: 4, size: 3 }],
+        "find the exact single contiguous file fragment inside the group"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_runs_spanning_across_bytes() -> eyre::Result<()> {
+    let mut bitmap = Bitmap {
+        map: bitvec![u8, Msb0; 0; 16],
+    };
+    for i in 0..4 {
+        bitmap.set(i, true)?;
+    }
+    for i in 12..16 {
+        bitmap.set(i, true)?;
+    }
+
+    let free_runs = bitmap.runs_of(false, None);
+    assert_eq!(
+        free_runs,
+        [BitRunSlot { start: 4, size: 8 }],
+        "merge zero chunks across raw slice byte boundaries"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_runs_of_with_stop_index() {
+    let bitmap = Bitmap::new_from_bits_count(24);
+
+    let full_run = bitmap.runs_of(false, None);
+    assert_eq!(
+        full_run,
+        [BitRunSlot { start: 0, size: 24 }],
+        "scan the full capacity when no stop_index is set"
+    );
+
+    let truncated_run = bitmap.runs_of(false, Some(10));
+    assert_eq!(
+        truncated_run,
+        [BitRunSlot { start: 0, size: 10 }],
+        "cut off exactly at bit index 10, completely ignoring trailing bits"
+    );
 }

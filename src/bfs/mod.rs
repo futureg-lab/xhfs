@@ -262,16 +262,10 @@ impl BruteFS {
             let raw_bitmap = self.ctrl.raw_read(slot.addr.into(), slot.capacity).await?;
             let bitmap = Bitmap::deserialize(&raw_bitmap)?;
 
-            // TODO: SIMD, or use some bitwise vodoo, again correctness first
-            let mut free_blocks = 0;
-            for i in 0..self.geometry.usable_blocks_per_group as usize {
-                if !bitmap
-                    .get(i)
-                    .wrap_err("Parsing block map allocation state")?
-                {
-                    free_blocks += 1;
-                }
-            }
+            let free_blocks = bitmap
+                .runs_of(false, Some(self.geometry.usable_blocks_per_group as usize))
+                .iter()
+                .fold(0, |a, x| a + x.size);
 
             total += free_blocks * self.static_format.block_size_bytes as usize;
         }
@@ -952,6 +946,35 @@ impl BruteFS {
 
     #[allow(unused)]
     pub async fn allocate(&self, wanted_size: usize) -> Result<u64, BruteFsError> {
+        tracing::debug!("Trying to allocate {wanted_size} B");
+        let _guard = self.alloc_guard.lock().await;
+
+        //  BruteFsError::Insufficient {
+        //     wanted: usize,
+        //     max_slot_size: usize,
+        //     min_slot_size: usize,
+        // }
+        let mut max_slot_size = u32::MIN;
+        let mut max_slot_size = u32::MAX;
+        for g_index in 0..self.static_format.group_count {
+            let group =
+                GroupLayout::derive_from_group_index(g_index, &self.geometry).ok_or_else(|| {
+                    eyre::eyre!("Failed calculating group layout for index {g_index}")
+                })?;
+
+            let slot = group.data_bitmap_region.to_addr_slot();
+            let raw_bitmap = self.ctrl.raw_read(slot.addr.into(), slot.capacity).await?;
+            let bitmap = Bitmap::deserialize(&raw_bitmap)?;
+
+            // for i in 0..self.geometry.usable_blocks_per_group as usize {
+            //     if !bitmap
+            //         .get(i)
+            //         .wrap_err("Parsing block map allocation state")?
+            //     {
+            //         free_blocks += 1;
+            //     }
+            // }
+        }
         todo!()
     }
 

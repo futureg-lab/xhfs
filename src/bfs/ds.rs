@@ -30,6 +30,12 @@ pub struct Bitmap {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BitRunSlot {
+    pub start: usize,
+    pub size: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EntryStat {
     pub name: String,
     pub kind: INodeKind,
@@ -72,7 +78,7 @@ pub enum BruteFsError {
     Insufficient {
         wanted: usize,
         max_slot_size: usize,
-        left_contiguous: usize,
+        min_slot_size: usize,
     },
     Error {
         err: String,
@@ -85,11 +91,11 @@ impl Display for BruteFsError {
             BruteFsError::Insufficient {
                 wanted,
                 max_slot_size,
-                left_contiguous,
+                min_slot_size,
             } => {
                 write!(
                     f,
-                    "Insufficient space, operation requires {wanted} B, max fragment available {max_slot_size} B, max contiguous bloc {left_contiguous}"
+                    "Insufficient space, operation requires {wanted} B, fragment available max {max_slot_size} B, min {min_slot_size}"
                 )
             }
             BruteFsError::Error { err } => write!(f, "{err}"),
@@ -639,11 +645,117 @@ impl Bitmap {
         Ok(*self.map.get(n).unwrap())
     }
 
+    pub fn runs_of(&self, target_bit: bool, stop_index: Option<usize>) -> Vec<BitRunSlot> {
+        let mut runs = vec![];
+        let logical_len = stop_index.unwrap_or(self.map.len()).min(self.map.len());
+        if logical_len == 0 {
+            return runs;
+        }
+
+        let actual = self.map[..logical_len].to_bitvec();
+        let raw = actual.as_raw_slice();
+        let full_bytes = logical_len / 8;
+        let rem_bits = logical_len % 8;
+        let mut current_run_start = None;
+        let mut current_bit_index = 0;
+        for (byte_index, &raw_word) in raw.iter().enumerate() {
+            let mut word = raw_word;
+            // mask away padding bits in the final partial byte
+            if byte_index == full_bytes && rem_bits != 0 {
+                let mask = 0xFF << (8 - rem_bits);
+                word &= mask;
+            }
+            if !target_bit {
+                word = !word;
+                // remask after inversion so padding bits stay zero
+                if byte_index == full_bytes && rem_bits != 0 {
+                    let mask = 0xFF << (8 - rem_bits);
+                    word &= mask;
+                }
+            }
+            let valid_bits = if byte_index < full_bytes {
+                8
+            } else if rem_bits == 0 {
+                8
+            } else {
+                rem_bits
+            };
+
+            if word == 0 {
+                // match
+                if let Some(start) = current_run_start.take() {
+                    runs.push(BitRunSlot {
+                        start,
+                        size: current_bit_index - start,
+                    });
+                }
+                current_bit_index += valid_bits;
+                continue;
+            }
+
+            // full match
+            let full_mask = if valid_bits == 8 {
+                u8::MAX
+            } else {
+                0xFF << (8 - valid_bits)
+            };
+
+            if word == full_mask {
+                if current_run_start.is_none() {
+                    current_run_start = Some(current_bit_index);
+                }
+
+                current_bit_index += valid_bits;
+                continue;
+            }
+
+            // mixed => scan transitions
+            let mut processed = 0;
+            while processed < valid_bits {
+                let zeros = word.leading_zeros() as usize;
+                if zeros > 0 {
+                    if let Some(start) = current_run_start.take() {
+                        runs.push(BitRunSlot {
+                            start,
+                            size: current_bit_index - start,
+                        });
+                    }
+                    let shift = zeros.min(valid_bits - processed);
+                    word <<= shift;
+                    current_bit_index += shift;
+                    processed += shift;
+                }
+                if processed >= valid_bits {
+                    break;
+                }
+                let ones = word.leading_ones() as usize;
+                if ones > 0 {
+                    if current_run_start.is_none() {
+                        current_run_start = Some(current_bit_index);
+                    }
+                    let shift = ones.min(valid_bits - processed);
+                    word <<= shift;
+                    current_bit_index += shift;
+                    processed += shift;
+                }
+            }
+        }
+
+        if let Some(start) = current_run_start.take() {
+            runs.push(BitRunSlot {
+                start,
+                size: current_bit_index - start,
+            });
+        }
+
+        runs
+    }
+
     pub fn serialize(&self) -> eyre::Result<Vec<u8>> {
         let bit_len = self.map.len() as u64;
         let raw_bytes = self.map.as_raw_slice();
         let mut data = Vec::with_capacity(8 + raw_bytes.len());
-        data.extend_from_slice(&bit_len.to_be_bytes());
+        data.extend_from_slice(&bit_len.to_le_bytes());
         data.extend_from_slice(raw_bytes);
         Ok(data)
     }
@@ -651,16 +763,19 @@ impl Bitmap {
     pub fn deserialize(data: &[u8]) -> eyre::Result<Self> {
         eyre::ensure!(
             data.len() >= 8,
-            "Invalid data: buffer is too short to contain the header (min 8 bytes)"
+            "Bitmap buffer is too short to contain the header (min 8 bytes), got {}",
+            data.len()
         );
 
-        let bit_len = u64::from_be_bytes(data[0..8].try_into()?) as usize;
+        let bit_len = u64::from_le_bytes(data[0..8].try_into()?) as usize;
         let raw_bytes = &data[8..];
         let mut map: BitVec<u8, Msb0> = BitVec::from_slice(raw_bytes);
 
         eyre::ensure!(
             map.len() >= bit_len,
-            "Invalid data: buffer contains fewer bits than specified in the header"
+            "Bitmap expected {} bits, got {} instead",
+            map.len(),
+            bit_len
         );
         map.truncate(bit_len);
 
