@@ -1,4 +1,4 @@
-use crate::{bfs::addr::MaybeU64, interface::cli::GlobalOptions};
+use crate::{interface::cli::GlobalOptions, xhfs::addr::MaybeU64};
 use clap::{Args, Subcommand};
 use std::path::PathBuf;
 use tokio::fs;
@@ -99,6 +99,9 @@ impl InspectSubcommands {
             InspectSubcommands::Dump(d) => {
                 let bfs = d.global.get_bfs().await?;
                 let size = d.end_address.saturating_sub(d.start_address);
+                if d.dest_path.exists() && !d.overwrite {
+                    eyre::bail!("File {} already exists", d.dest_path.display());
+                }
                 let blob = if d.decrypt {
                     bfs.ctrl
                         .read(d.start_address as usize, size as usize)
@@ -108,9 +111,6 @@ impl InspectSubcommands {
                         .raw_read(d.start_address as usize, size as usize)
                         .await?
                 };
-                if d.dest_path.exists() && !d.overwrite {
-                    eyre::bail!("File {} already exists", d.dest_path.display());
-                }
                 fs::write(&d.dest_path, blob).await?;
             }
             InspectSubcommands::View(v) => {

@@ -1,9 +1,8 @@
+use crate::xhfs::ds::*;
 use bitvec::{bitvec, order::Msb0};
 
-use crate::bfs::ds::*;
-
-fn create_test_header(block_size: u64, blocks_per_group: u64, groups: u64) -> BruteFsHeader {
-    BruteFsHeader {
+fn create_test_header(block_size: u64, blocks_per_group: u64, groups: u64) -> XHFSHeader {
+    XHFSHeader {
         version: 1,
         chacha20_nonce: Default::default(),
         format: Format {

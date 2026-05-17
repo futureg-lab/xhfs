@@ -1,9 +1,9 @@
 use crate::{
-    bfs::{BruteFS, WriteOption},
     interface::{
         cli::{inspect::InspectCommands, x::FsCommands},
         config::Config,
     },
+    xhfs::{WriteOption, XHFS},
 };
 use clap::{Args, Parser, Subcommand};
 use std::{io::Write, path::PathBuf};
@@ -19,7 +19,7 @@ mod x;
 #[command(
     author = "michael-0acf4",
     version,
-    about = "brutefs distributed File System"
+    about = "XHFS distributed File System"
 )]
 pub struct MainCommand {
     #[command(subcommand)]
@@ -28,17 +28,17 @@ pub struct MainCommand {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// Upload local file into brutefs
+    /// Upload local file into XHFS
     Upload(UploadCommand),
-    /// Download file from brutefs into local filesystem
+    /// Download file from XHFS into local filesystem
     Download(DownloadCommand),
     /// Read the file immediately and print to stdout
     Read(PathCommand),
-    /// Format a new brutefs
+    /// Format a new XHFS
     Format(GlobalOptions),
-    /// Show brutefs/device information
+    /// Show XHFS/device information
     Infos(GlobalOptions),
-    /// brutefs operations
+    /// XHFS operations
     X(FsCommands),
     /// Inspect current filesystem
     Inspect(InspectCommands),
@@ -46,9 +46,9 @@ pub enum Commands {
 
 #[derive(Args, Debug, Clone)]
 pub struct GlobalOptions {
-    /// Path to config yaml
-    #[arg(long, default_value = "./brutefs.yaml")]
-    pub config: PathBuf,
+    /// Path to config yaml (default xhfs.yaml, or env XHFS_CONFIG)
+    #[arg(long)]
+    pub config: Option<PathBuf>,
     #[arg(long)]
     pub password: Option<String>,
     /// Enable debug logs
@@ -62,7 +62,7 @@ pub struct GlobalOptions {
 
 #[derive(Args, Debug)]
 pub struct PathCommand {
-    /// Target path inside brutefs
+    /// Target path inside XHFS
     pub path: PathBuf,
     #[arg(long, short)]
     pub recursive: bool,
@@ -74,12 +74,14 @@ pub struct PathCommand {
 pub struct UploadCommand {
     /// Local source file
     pub src_path: PathBuf,
-    /// Destination path inside brutefs
+    /// Destination path inside XHFS
     pub dest_path: Option<PathBuf>,
     #[arg(short, long, default_value = "false")]
     pub overwrite: bool,
-    #[arg(short, long, default_value = "1024")]
+    /// Maximum chunk of data to write at a time
+    #[arg(short, long, default_value = "1048576")]
     pub block_size: usize,
+    /// If set, will try to oneshot data write as a single block
     #[arg(long, default_value = "false")]
     pub single_block: bool,
     #[command(flatten)]
@@ -88,7 +90,7 @@ pub struct UploadCommand {
 
 #[derive(Args, Debug)]
 pub struct DownloadCommand {
-    /// Source path inside brutefs
+    /// Source path inside XHFS
     pub src_path: PathBuf,
     /// Local destination path
     pub dest_path: Option<PathBuf>,
@@ -146,7 +148,6 @@ impl MainCommand {
             }
             Commands::Download(d) => {
                 let bfs = d.global.get_bfs().await?;
-                let data = bfs.fread(&d.src_path).await?;
                 let dest_path = match &d.dest_path {
                     Some(path) => path.clone(),
                     None => d.src_path.file_name().expect("Valid filename").into(),
@@ -154,6 +155,7 @@ impl MainCommand {
                 if dest_path.exists() && !d.overwrite {
                     eyre::bail!("File {} already exists", dest_path.display());
                 }
+                let data = bfs.fread(&d.src_path).await?;
                 fs::write(dest_path, data).await?;
             }
             Commands::Read(r) => {
@@ -176,13 +178,23 @@ impl MainCommand {
 }
 
 impl GlobalOptions {
-    pub async fn format_and_get_bfs(&self) -> eyre::Result<BruteFS> {
-        let config = Config::load(self.config.clone())?;
+    fn resolve_config_path(&self) -> PathBuf {
+        match &self.config {
+            Some(config) => config.clone(),
+            None => match std::env::var("XHFS_CONFIG") {
+                Ok(val) => PathBuf::from(val),
+                Err(_) => PathBuf::from("xhfs.yaml"),
+            },
+        }
+    }
+
+    pub async fn format_and_get_bfs(&self) -> eyre::Result<XHFS> {
+        let config = Config::load(self.resolve_config_path())?;
         config.materialize(true, self.password.clone()).await
     }
 
-    pub async fn get_bfs(&self) -> eyre::Result<BruteFS> {
-        let config = Config::load(self.config.clone())?;
+    pub async fn get_bfs(&self) -> eyre::Result<XHFS> {
+        let config = Config::load(self.resolve_config_path())?;
         config.materialize(false, self.password.clone()).await
     }
 }

@@ -1,7 +1,10 @@
 use crate::{
-    bfs::*,
-    device::{Device, disk::Controller, fs_device::FsDevice, kv_device::*, logical::LogicalDevice},
+    device::{
+        Device, disk::Controller, fs_device::FsDevice, http_device::HttpKV, kv_device::*,
+        logical::LogicalDevice,
+    },
     utils::normalize_path,
+    xhfs::*,
 };
 use bytesize::ByteSize;
 use eyre::Context;
@@ -14,6 +17,7 @@ use std::{
     sync::Arc,
 };
 use tokio::sync::RwLock;
+use url::Url;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Config {
@@ -29,6 +33,13 @@ pub enum DeviceConfig {
     KVMemory {
         name: String,
         slot_capacity_bytes: u64,
+    },
+    #[serde(rename = "kvhttp")]
+    KVHttp {
+        name: String,
+        slot_capacity_bytes: u64,
+        url: Url,
+        headers: Option<HashMap<String, String>>,
     },
     #[serde(rename = "file")]
     File { name: String, path: String },
@@ -63,6 +74,7 @@ impl DeviceConfig {
         match self {
             DeviceConfig::KVMemory { name, .. } => name,
             DeviceConfig::File { name, .. } => name,
+            DeviceConfig::KVHttp { name, .. } => name,
         }
         .to_owned()
     }
@@ -76,6 +88,10 @@ impl DeviceConfig {
             }
             DeviceConfig::KVMemory { .. } => {
                 rand::random::<u64>().hash(&mut hasher);
+            }
+            DeviceConfig::KVHttp { name, url, .. } => {
+                name.hash(&mut hasher);
+                url.hash(&mut hasher);
             }
         };
         hasher.finish()
@@ -191,7 +207,7 @@ configuration:
         &self,
         format_new: bool,
         password_override: Option<String>,
-    ) -> eyre::Result<BruteFS> {
+    ) -> eyre::Result<XHFS> {
         let mut logdev_instances = HashMap::new();
 
         for logdev in &self.configuration.logical {
@@ -209,7 +225,21 @@ configuration:
                         slot_capacity_bytes,
                         ..
                     } => Arc::new(KVDevice {
-                        store: Arc::new(RwLock::new(MemoryKV(HashMap::new()))),
+                        store: Arc::new(MemoryKV(RwLock::new(HashMap::new()))),
+                        total_slots: (capacity / *slot_capacity_bytes) as usize,
+                        slot_capacity: *slot_capacity_bytes as usize,
+                    }) as Arc<dyn Device>,
+                    DeviceConfig::KVHttp {
+                        slot_capacity_bytes,
+                        url,
+                        headers,
+                        name,
+                    } => Arc::new(KVDevice {
+                        store: Arc::new(HttpKV {
+                            url: url.clone(),
+                            key_prefix: name.clone(),
+                            headers: headers.clone().unwrap_or_default(),
+                        }),
                         total_slots: (capacity / *slot_capacity_bytes) as usize,
                         slot_capacity: *slot_capacity_bytes as usize,
                     }) as Arc<dyn Device>,
@@ -249,9 +279,9 @@ configuration:
             self.password.clone()
         };
         if format_new {
-            BruteFS::format_new(ctrl, password).await
+            XHFS::format_new(ctrl, password).await
         } else {
-            BruteFS::from_formatted(ctrl, password).await
+            XHFS::from_formatted(ctrl, password).await
         }
     }
 }

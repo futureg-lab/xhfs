@@ -1,26 +1,26 @@
 use crate::{
-    bfs::{BruteFS, WriteOption, ds::*},
     device::{Device, disk::Controller, kv_device::*, logical::LogicalDevice},
+    xhfs::{WriteOption, XHFS, ds::*},
 };
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
 
-async fn create_simple_memory_brute_fs(capacity: usize) -> eyre::Result<BruteFS> {
+async fn create_simple_memory_brute_fs(capacity: usize) -> eyre::Result<XHFS> {
     if capacity % 8 != 0 {
         eyre::bail!("Test fs expects % 8");
     }
     let dev1 = KVDevice {
-        store: Arc::new(RwLock::new(MemoryKV(HashMap::new()))),
+        store: Arc::new(MemoryKV(RwLock::new(HashMap::new()))),
         total_slots: capacity / 8,
         slot_capacity: 8,
     };
     let dev1 = LogicalDevice::new(2, [Arc::from(dev1) as Arc<dyn Device>])?;
     let ctrl = Controller::from([dev1]).await?;
-    BruteFS::format_new(ctrl, Some("helloworld".to_string())).await
+    XHFS::format_new(ctrl, Some("helloworld".to_string())).await
 }
 
 #[tokio::test]
-async fn test_brutefs_core_ops() -> eyre::Result<()> {
+async fn test_xhfs_core_ops() -> eyre::Result<()> {
     let bfs = create_simple_memory_brute_fs(128 * 1000 * 1000).await?;
 
     assert!(bfs.mkdir("/", false).await? == false, "root is not new");
@@ -133,7 +133,7 @@ async fn test_brutefs_core_ops() -> eyre::Result<()> {
 }
 
 #[tokio::test]
-async fn test_brutefs_ref_manips_and_stats() -> eyre::Result<()> {
+async fn test_xhfs_ref_manips_and_stats() -> eyre::Result<()> {
     let bfs = create_simple_memory_brute_fs(128 * 1000 * 1000).await?;
 
     bfs.mkdir("/many/entries/a", true).await?;

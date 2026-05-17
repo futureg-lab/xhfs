@@ -69,9 +69,8 @@ macro_rules! test_read_write_complex {
 
 #[tokio::test]
 async fn test_kv_device() -> eyre::Result<()> {
-    let store = MemoryKV(HashMap::new());
     test_read_write_simple!(KVDevice {
-        store: Arc::new(RwLock::new(store)),
+        store: Arc::new(MemoryKV(RwLock::new(HashMap::new()))),
         total_slots: 10,
         slot_capacity: 4,
     })
@@ -85,9 +84,8 @@ async fn test_kv_device() -> eyre::Result<()> {
     // slot4: [0C 0D 0E]
     // slot5: [0F 10 11]
     // slot6: [12 13 14]
-    let store = MemoryKV(HashMap::new());
     test_read_write_complex!(KVDevice {
-        store: Arc::new(RwLock::new(store)),
+        store: Arc::new(MemoryKV(RwLock::new(HashMap::new()))),
         total_slots: 7,
         slot_capacity: 3,
     })
@@ -125,12 +123,12 @@ async fn test_logical_device() -> eyre::Result<()> {
     let dev1 = FsDevice::new(test_files[0].clone(), 20).await?;
     let dev2 = FsDevice::new(test_files[1].clone(), 20).await?;
     let dev3 = KVDevice {
-        store: Arc::new(RwLock::new(MemoryKV(HashMap::new()))),
+        store: Arc::new(MemoryKV(RwLock::new(HashMap::new()))),
         total_slots: 6,
         slot_capacity: 7,
     };
     let dev4 = KVDevice {
-        store: Arc::new(RwLock::new(MemoryKV(HashMap::new()))),
+        store: Arc::new(MemoryKV(RwLock::new(HashMap::new()))),
         total_slots: 4,
         slot_capacity: 5,
     };
