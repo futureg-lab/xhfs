@@ -175,7 +175,8 @@ xhfs inspect inode /Pictures/cat.jpg
 # INode #4
 # - Number of Links: 1
 # - Kind: File
-# - Size: 1050318 B- Creation time: 2026-05-17 21:26:29 UTC
+# - Size: 1050318 B
+# - Creation time: 2026-05-17 21:26:29 UTC
 # - Modification time: 2026-05-17 21:26:29 UTC
 # - Immediate Extent address: 404025 (0x00062a39)
 
