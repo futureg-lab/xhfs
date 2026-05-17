@@ -1,5 +1,5 @@
-use crate::bfs::addr::MaybeU64;
 use crate::utils::{normalize_path, u64_to_utc_datetime};
+use crate::xhfs::addr::MaybeU64;
 use bitvec::order::Msb0;
 use bitvec::vec::BitVec;
 use eyre::Context;
@@ -77,7 +77,7 @@ pub struct RegionSlot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BruteFsError {
+pub enum XHFSError {
     Insufficient {
         wanted: usize,
         max_slot_size: usize,
@@ -89,10 +89,10 @@ pub enum BruteFsError {
     },
 }
 
-impl Display for BruteFsError {
+impl Display for XHFSError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            BruteFsError::Insufficient {
+            XHFSError::Insufficient {
                 wanted,
                 max_slot_size,
                 min_slot_size,
@@ -104,38 +104,38 @@ impl Display for BruteFsError {
                     free_slot_sizes.len()
                 )
             }
-            BruteFsError::Error { err } => write!(f, "{err}"),
+            XHFSError::Error { err } => write!(f, "{err}"),
         }
     }
 }
 
-impl BruteFsError {
-    pub fn from_error(error: impl std::error::Error) -> BruteFsError {
-        BruteFsError::Error {
+impl XHFSError {
+    pub fn from_error(error: impl std::error::Error) -> XHFSError {
+        XHFSError::Error {
             err: error.to_string(),
         }
     }
 
-    pub fn from_report(error: eyre::Report) -> BruteFsError {
-        BruteFsError::Error {
+    pub fn from_report(error: eyre::Report) -> XHFSError {
+        XHFSError::Error {
             err: error.to_string(),
         }
     }
 }
 
-impl std::error::Error for BruteFsError {}
+impl std::error::Error for XHFSError {}
 
-impl From<eyre::Report> for BruteFsError {
+impl From<eyre::Report> for XHFSError {
     fn from(value: eyre::Report) -> Self {
-        BruteFsError::Error {
+        XHFSError::Error {
             err: value.to_string(),
         }
     }
 }
 
-impl From<Box<dyn std::error::Error + Send + Sync>> for BruteFsError {
+impl From<Box<dyn std::error::Error + Send + Sync>> for XHFSError {
     fn from(value: Box<dyn std::error::Error + Send + Sync>) -> Self {
-        BruteFsError::Error {
+        XHFSError::Error {
             err: value.to_string(),
         }
     }
@@ -203,7 +203,7 @@ pub struct AddressVector {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BruteFsHeader {
+pub struct XHFSHeader {
     pub version: u8,
     pub format: Format,
     pub chacha20_nonce: [u8; 12],
@@ -494,10 +494,10 @@ impl SymLink {
     }
 }
 
-impl BruteFsHeader {
+impl XHFSHeader {
     pub fn serialize(&self) -> eyre::Result<Vec<u8>> {
         let mut buf = Vec::with_capacity(Self::serialized_size());
-        buf.extend_from_slice(b"brutefs");
+        buf.extend_from_slice(b"XHFS");
         buf.push(self.version);
         buf.extend_from_slice(&self.format.block_size_bytes.to_le_bytes());
         buf.extend_from_slice(&self.format.blocks_per_group.to_le_bytes());
@@ -512,15 +512,12 @@ impl BruteFsHeader {
         let incoming_size = data.len();
         eyre::ensure!(
             incoming_size == expected_size,
-            "Expected BruteFsHeader data size to be {expected_size}, got {incoming_size} instead"
+            "Expected XHFSHeader data size to be {expected_size}, got {incoming_size} instead"
         );
-        eyre::ensure!(
-            &data[0..7] == b"brutefs",
-            "Invalid BruteFsHeader magic bytes"
-        );
+        eyre::ensure!(&data[0..4] == b"XHFS", "Invalid XHFSHeader magic bytes");
 
-        let version = data[7];
-        let mut addr_start = 8;
+        let version = data[4];
+        let mut addr_start = 5;
         let block_size_bytes = u64::from_le_bytes(data[addr_start..addr_start + 8].try_into()?);
         addr_start += 8;
         let blocks_per_group = u64::from_le_bytes(data[addr_start..addr_start + 8].try_into()?);
@@ -541,7 +538,7 @@ impl BruteFsHeader {
     }
 
     pub fn serialized_size() -> usize {
-        7 + 1 + 8 + 8 + 8 + 12
+        4 + 1 + 8 + 8 + 8 + 12
     }
 
     pub fn template() -> Self {

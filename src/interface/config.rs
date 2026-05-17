@@ -1,7 +1,7 @@
 use crate::{
-    bfs::*,
     device::{Device, disk::Controller, fs_device::FsDevice, kv_device::*, logical::LogicalDevice},
     utils::normalize_path,
+    xhfs::*,
 };
 use bytesize::ByteSize;
 use eyre::Context;
@@ -191,7 +191,7 @@ configuration:
         &self,
         format_new: bool,
         password_override: Option<String>,
-    ) -> eyre::Result<BruteFS> {
+    ) -> eyre::Result<XHFS> {
         let mut logdev_instances = HashMap::new();
 
         for logdev in &self.configuration.logical {
@@ -249,9 +249,9 @@ configuration:
             self.password.clone()
         };
         if format_new {
-            BruteFS::format_new(ctrl, password).await
+            XHFS::format_new(ctrl, password).await
         } else {
-            BruteFS::from_formatted(ctrl, password).await
+            XHFS::from_formatted(ctrl, password).await
         }
     }
 }

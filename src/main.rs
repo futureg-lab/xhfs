@@ -2,10 +2,10 @@ use crate::interface::cli::MainCommand;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
-pub mod bfs;
 pub mod device;
 pub mod interface;
 pub mod utils;
+pub mod xhfs;
 
 #[cfg(test)]
 mod tests;

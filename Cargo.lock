@@ -154,32 +154,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "brutefs"
-version = "0.1.0"
-dependencies = [
- "async-recursion",
- "async-stream",
- "async-trait",
- "bitvec",
- "bytesize",
- "chacha20",
- "chrono",
- "clap",
- "eyre",
- "futures",
- "rand",
- "serde",
- "serde_json",
- "serde_yaml",
- "sha2",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-error",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "bumpalo"
 version = "3.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1384,6 +1358,32 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "05f360fc0b24296329c78fda852a1e9ae82de9cf7b27dae4b7f62f118f77b9ed"
 dependencies = [
  "tap",
+]
+
+[[package]]
+name = "xhfs"
+version = "0.1.0"
+dependencies = [
+ "async-recursion",
+ "async-stream",
+ "async-trait",
+ "bitvec",
+ "bytesize",
+ "chacha20",
+ "chrono",
+ "clap",
+ "eyre",
+ "futures",
+ "rand",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-error",
+ "tracing-subscriber",
 ]
 
 [[package]]

@@ -1,7 +1,7 @@
 use crate::{
-    bfs::{BruteFS, WriteOption, ds::INodeKind},
     interface::cli::{GlobalOptions, PathCommand},
     utils::{normalize_path, u64_to_utc_datetime},
+    xhfs::{WriteOption, XHFS, ds::INodeKind},
 };
 use async_recursion::async_recursion;
 use clap::{Args, Subcommand};
@@ -34,9 +34,9 @@ pub struct FsCommands {
 
 #[derive(Args, Debug)]
 pub struct LinkCommand {
-    /// Source path inside brutefs
+    /// Source path inside XHFS
     pub src_path: PathBuf,
-    /// Link destination path inside brutefs
+    /// Link destination path inside XHFS
     pub dest_path: PathBuf,
     #[arg(short, long, default_value = "false")]
     pub overwrite: bool,
@@ -156,7 +156,7 @@ impl LsCommand {
     }
 
     #[async_recursion(?Send)]
-    async fn print_tree(&self, bfs: &BruteFS, path: &Path, prefix: &str) -> eyre::Result<()> {
+    async fn print_tree(&self, bfs: &XHFS, path: &Path, prefix: &str) -> eyre::Result<()> {
         let entries = bfs.ls(path).await?;
         let count = entries.len();
         for (i, entry) in entries.into_iter().enumerate() {

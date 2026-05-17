@@ -1,7 +1,7 @@
-# brutefs
+# XHFS (Extented Headless File System)
 
-A tiny, full-fledged file system that enables you to store files anywhere, on
-anything, across an arbitrary combination of arbitrary devices.
+XHFS is a small, full-fledged file system that enables you to store files
+anywhere, on anything, across an arbitrary combination of arbitrary devices.
 
 # Concept
 
@@ -10,7 +10,7 @@ storage device, whether or not it was built for such an operation: be it a file
 on disk, a remote Key-Value store (Redis, Cloudflare KV), or hell, even a
 database.
 
-brutefs makes no assumptions about what the underlying "device" actually is; in
+XHFS makes no assumptions about what the underlying "device" actually is; in
 fact, it remains entirely agnostic as long as you provide a way to read/write to
 arbitrary locations.
 
@@ -20,10 +20,10 @@ you may argue makes it slower for seek operations but still good enough.
 
 # Example
 
-Consider the following configuration:
+Consider the following [configuration](./examples/split_files.yaml):
 
 ```yaml
-# brutefs.yaml
+# xhfs.yaml
 # encrypt the drive
 # or use the cli with --password helloworld if the config and bins are made public
 password: helloworld
@@ -60,26 +60,26 @@ All you have to do left is format the drive if not done yet then play with it.
 
 ```bash
 # setup the File System if not formatted yet
-brutefs format
+xhfs format
 
 echo "Hello World" > thething.txt
-brutefs upload thething.txt /test.txt
+xhfs upload thething.txt /test.txt
 
-brutefs x ls . -v
+xhfs x ls . -v
 # FILE 2026-05-14 16:49:49        28 B test.txt
 
-brutefs x read test.txt | echo
+xhfs x read test.txt | echo
 # Hello World
 
 # You can also import stored files like this..
-brutefs download test.txt my_physical_copy.txt
+xhfs download test.txt my_physical_copy.txt
 ```
 
 # Features
 
 - [ ] File System
   - [x] Encryption (ChaCha20 stream cipher)
-  - [x] brutefs core: fopen, fwrite, fseek, mkdir, fmove, fcopy, unlink
+  - [x] xhfs core: fopen, fwrite, fseek, mkdir, fmove, fcopy, unlink
   - [x] native symlink support: create_link
   - [ ] native hardlink support: wip
   - [x] extra: fappend

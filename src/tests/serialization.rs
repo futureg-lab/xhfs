@@ -1,4 +1,4 @@
-use crate::bfs::{addr::MaybeU64, crypto::Crypto, ds::*};
+use crate::xhfs::{addr::MaybeU64, crypto::Crypto, ds::*};
 
 #[test]
 pub fn test_basic_binary_serialization() -> eyre::Result<()> {
@@ -54,7 +54,7 @@ pub fn test_basic_binary_serialization() -> eyre::Result<()> {
     }
 
     {
-        let original = BruteFsHeader {
+        let original = XHFSHeader {
             version: 42,
             format: Format {
                 block_size_bytes: 12348794,
@@ -64,8 +64,8 @@ pub fn test_basic_binary_serialization() -> eyre::Result<()> {
             chacha20_nonce: Crypto::gen_nonce(),
         };
         let data = original.serialize()?;
-        let reconstr = BruteFsHeader::deserialize(&data)?;
-        assert_eq!(original, reconstr, "BruteFsHeader serde");
+        let reconstr = XHFSHeader::deserialize(&data)?;
+        assert_eq!(original, reconstr, "XHFSHeader serde");
     }
     Ok(())
 }
