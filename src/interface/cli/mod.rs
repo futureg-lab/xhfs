@@ -46,9 +46,9 @@ pub enum Commands {
 
 #[derive(Args, Debug, Clone)]
 pub struct GlobalOptions {
-    /// Path to config yaml
-    #[arg(long, default_value = "./xhfs.yaml")]
-    pub config: PathBuf,
+    /// Path to config yaml (default xhfs.yaml, or env XHFS_CONFIG)
+    #[arg(long)]
+    pub config: Option<PathBuf>,
     #[arg(long)]
     pub password: Option<String>,
     /// Enable debug logs
@@ -78,8 +78,10 @@ pub struct UploadCommand {
     pub dest_path: Option<PathBuf>,
     #[arg(short, long, default_value = "false")]
     pub overwrite: bool,
-    #[arg(short, long, default_value = "1024")]
+    /// Maximum chunk of data to write at a time
+    #[arg(short, long, default_value = "1048576")]
     pub block_size: usize,
+    /// If set, will try to oneshot data write as a single block
     #[arg(long, default_value = "false")]
     pub single_block: bool,
     #[command(flatten)]
@@ -146,7 +148,6 @@ impl MainCommand {
             }
             Commands::Download(d) => {
                 let bfs = d.global.get_bfs().await?;
-                let data = bfs.fread(&d.src_path).await?;
                 let dest_path = match &d.dest_path {
                     Some(path) => path.clone(),
                     None => d.src_path.file_name().expect("Valid filename").into(),
@@ -154,6 +155,7 @@ impl MainCommand {
                 if dest_path.exists() && !d.overwrite {
                     eyre::bail!("File {} already exists", dest_path.display());
                 }
+                let data = bfs.fread(&d.src_path).await?;
                 fs::write(dest_path, data).await?;
             }
             Commands::Read(r) => {
@@ -176,13 +178,23 @@ impl MainCommand {
 }
 
 impl GlobalOptions {
+    fn resolve_config_path(&self) -> PathBuf {
+        match &self.config {
+            Some(config) => config.clone(),
+            None => match std::env::var("XHFS_CONFIG") {
+                Ok(val) => PathBuf::from(val),
+                Err(_) => PathBuf::from("xhfs.yaml"),
+            },
+        }
+    }
+
     pub async fn format_and_get_bfs(&self) -> eyre::Result<XHFS> {
-        let config = Config::load(self.config.clone())?;
+        let config = Config::load(self.resolve_config_path())?;
         config.materialize(true, self.password.clone()).await
     }
 
     pub async fn get_bfs(&self) -> eyre::Result<XHFS> {
-        let config = Config::load(self.config.clone())?;
+        let config = Config::load(self.resolve_config_path())?;
         config.materialize(false, self.password.clone()).await
     }
 }

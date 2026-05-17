@@ -17,6 +17,7 @@ use std::{
     sync::Arc,
 };
 use tokio::sync::RwLock;
+use url::Url;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Config {
@@ -37,7 +38,7 @@ pub enum DeviceConfig {
     KVHttp {
         name: String,
         slot_capacity_bytes: u64,
-        url: String,
+        url: Url,
         headers: Option<HashMap<String, String>>,
     },
     #[serde(rename = "file")]

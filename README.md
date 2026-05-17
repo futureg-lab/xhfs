@@ -18,9 +18,26 @@ While its core design is inspired by ext4, the primary architectural split is
 that its inode extents are organized as a linked list instead of a H Tree, which
 you may argue makes it slower for seek operations but still good enough.
 
+# Use-cases
+
+- Basic: You can setup blob file replicas accross drives on top of your local
+  filesystem.
+
+- As a storage layer on top of an existing one:
+  - Split your XHFS storage into multiple files, and store that on a localled
+    synchronized folder using nullfs, Google Drive, Mega, Onedrive, Syncthing or
+    anything similar: you get encrypted storage layer that can be shared
+    publicly + automatic backups.
+
+- Distributed: Out of the box, XHFS makes no assumption on the underlying device
+  as long as we can read/write arbitrary data.
+
+- As Yet Another Filesystem: The wiring is already there, you can hack your way
+  into formating a physical block device, or write a driver for it.
+
 # Example
 
-Consider the following [configuration](./examples/split_files.yaml):
+Consider the following configuration:
 
 ```yaml
 # xhfs.yaml
@@ -37,10 +54,13 @@ devices:
   - type: file
     name: bloc3
     path: ./part3.bin
-  # - type: s3
-  #   name: bloc3
-  #   key: ..
-  #  ..
+  # Memory blocs can even be as exotic as a Key-Value store
+  # - type: kvhttp
+  #   name: bloc4
+  #   # see examples/kv_cloudflare.js, examples/kv_handler.ts
+  #   url: http://exmaple.com
+  #   # keys are about 100KB each
+  #   slot_capacity_bytes: 100000
 configuration:
   logical:
     - name: dev1
@@ -75,6 +95,21 @@ xhfs x read test.txt | echo
 xhfs download test.txt my_physical_copy.txt
 ```
 
+# Installation
+
+```bash
+cargo install xhfs
+```
+
+## Environment variables
+
+- `XHFS_CONFIG`: Can be overridden by `--config <CONFIG>`. If none is set, will
+  default to `xhfs.yaml`.
+- `XHFS_PASSWORD`: Can be overridden by password in config file if set or
+  `--password <STRING>`. The xhfs client will not use encryption if all are
+  unset (you will still need a password for an existing encrypted volume
+  though).
+
 # Features
 
 - [ ] File System
@@ -89,8 +124,79 @@ xhfs download test.txt my_physical_copy.txt
 - [ ] No device assumption
   - [x] File device
   - [x] In memory device
-  - [ ] custom KV http endpoint + Cloudflare example
+  - [x] custom KV http endpoint
+  - [x] Cloudflare KV example
   - [ ] s3 device
 - [ ] Explorer
   - [x] CLI
+  - [x] Inspection utilities
   - [ ] WebDAV server
+
+# Inspection tools
+
+The command line has a few sets of utilities you can use to inspect the
+formatted filesystem.
+
+## General state
+
+```bash
+xhfs infos
+```
+
+The infos command will show you the general layout of what constitutes your
+storage, this includes the remaining usable space and metadata layout.
+
+```
+XHFS version: 1
+Capacity:     4194304 B
+Remaining:    3790848 B
+Format Configuration:
+  Block Size:       1024 B
+  Blocks per Group: 4096
+  Total Groups:     1
+Geometry Layout (relative):
+  Group Stride:        4194304 B
+  Inodes per Group:    8192
+  Usable Blocks/Group: 3702
+  Header Region:       0x00000000 -- 0x00000028 (        41 B)
+  Data Bitmap Region:  0x00000029 -- 0x00000230 (       520 B)
+  INode Bitmap Region: 0x00000231 -- 0x00000638 (      1032 B)
+  INode Table Region:  0x00000639 -- 0x00062638 (    401408 B)
+  Data Payload Region: 0x00062639 -- 0x003ffe38 (   3790848 B)
+```
+
+## INode metadata
+
+```bash
+# Display metadata of an INode and its extent address
+xhfs inspect inode /Pictures/cat.jpg
+# INode #4
+# - Number of Links: 1
+# - Kind: File
+# - Size: 1050318 B- Creation time: 2026-05-17 21:26:29 UTC
+# - Modification time: 2026-05-17 21:26:29 UTC
+# - Immediate Extent address: 404025 (0x00062a39)
+
+# then the Extent chain up to a count
+xhfs inspect extent 0x00062a39 -m 3 
+# #1 :: 0x00062a39 -- 0x00062e39 (      1025 B)
+# #2 :: 0x00164239 -- 0x00264639 (   1049601 B)
+# #3 :: 0x00264639 -- 0x00264e39 (      2049 B)
+```
+
+## Block view and dump
+
+If you want to read from the filesystem directly, you can dump or view its
+content either raw or decrypted. This can be useful if you want to make custom a
+tool that reconstruct removed file extents, dump the entire filesystem content
+locally or inspect the state of the data.
+
+```bash
+# which you can view in hex (don't forget to decrypt for the data and INode regions)
+xhfs inspect view 0x00062a39 0x00062a50 -c 16 --decrypt
+# 00000000: 00 00 00 00 00 00 00 00 39 42 16 00 00 00 00 00 | ........9B......
+# 00000010: 01 00 00 00 00 00 00                            | .......
+
+# or even dump
+xhfs inspect dump 0x00062a39 0x00062a50 stuff.bin --decrypt
+```

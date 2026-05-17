@@ -1,7 +1,20 @@
 [package]
 edition = "2024"
 name = "xhfs"
-version = "0.1.0"
+version = "0.2.0"
+license = "MPL-2.0"
+description = "Bruteforce your way into storing files anywhere across an arbitrary combination of arbitrary devices."
+authors = ["michael-0acf4 <root@afmichael.dev>"]
+repository = "https://github.com/futureg-lab/xhfs"
+readme = "README.md"
+keywords = ["fs", "storage", "io"]
+categories = ["command-line-utilities", "filesystem", "storage", "engine"]
+include = [
+    "src/**/*.rs",
+    "Cargo.toml",
+    "LICENSE*",
+    "README.md"
+]
 
 [dependencies]
 async-recursion = "1.1.1"
@@ -25,4 +38,4 @@ tokio-util = {version = "0.7.18", features = ["io"]}
 tracing = {version = "0.1.44", features = ["std"]}
 tracing-error = "0.2.1"
 tracing-subscriber = {version = "0.3.23", features = ["fmt", "std", "env-filter"]}
-url = "2.5.8"
+url = { version = "2.5.8", features = ["serde"] }
