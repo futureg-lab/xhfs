@@ -10,7 +10,7 @@ async fn create_simple_memory_brute_fs(capacity: usize) -> eyre::Result<XHFS> {
         eyre::bail!("Test fs expects % 8");
     }
     let dev1 = KVDevice {
-        store: Arc::new(RwLock::new(MemoryKV(HashMap::new()))),
+        store: Arc::new(MemoryKV(RwLock::new(HashMap::new()))),
         total_slots: capacity / 8,
         slot_capacity: 8,
     };

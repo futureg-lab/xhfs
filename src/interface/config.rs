@@ -1,5 +1,8 @@
 use crate::{
-    device::{Device, disk::Controller, fs_device::FsDevice, kv_device::*, logical::LogicalDevice},
+    device::{
+        Device, disk::Controller, fs_device::FsDevice, http_device::HttpKV, kv_device::*,
+        logical::LogicalDevice,
+    },
     utils::normalize_path,
     xhfs::*,
 };
@@ -29,6 +32,13 @@ pub enum DeviceConfig {
     KVMemory {
         name: String,
         slot_capacity_bytes: u64,
+    },
+    #[serde(rename = "kvhttp")]
+    KVHttp {
+        name: String,
+        slot_capacity_bytes: u64,
+        url: String,
+        headers: Option<HashMap<String, String>>,
     },
     #[serde(rename = "file")]
     File { name: String, path: String },
@@ -63,6 +73,7 @@ impl DeviceConfig {
         match self {
             DeviceConfig::KVMemory { name, .. } => name,
             DeviceConfig::File { name, .. } => name,
+            DeviceConfig::KVHttp { name, .. } => name,
         }
         .to_owned()
     }
@@ -76,6 +87,10 @@ impl DeviceConfig {
             }
             DeviceConfig::KVMemory { .. } => {
                 rand::random::<u64>().hash(&mut hasher);
+            }
+            DeviceConfig::KVHttp { name, url, .. } => {
+                name.hash(&mut hasher);
+                url.hash(&mut hasher);
             }
         };
         hasher.finish()
@@ -209,7 +224,21 @@ configuration:
                         slot_capacity_bytes,
                         ..
                     } => Arc::new(KVDevice {
-                        store: Arc::new(RwLock::new(MemoryKV(HashMap::new()))),
+                        store: Arc::new(MemoryKV(RwLock::new(HashMap::new()))),
+                        total_slots: (capacity / *slot_capacity_bytes) as usize,
+                        slot_capacity: *slot_capacity_bytes as usize,
+                    }) as Arc<dyn Device>,
+                    DeviceConfig::KVHttp {
+                        slot_capacity_bytes,
+                        url,
+                        headers,
+                        name,
+                    } => Arc::new(KVDevice {
+                        store: Arc::new(HttpKV {
+                            url: url.clone(),
+                            key_prefix: name.clone(),
+                            headers: headers.clone().unwrap_or_default(),
+                        }),
                         total_slots: (capacity / *slot_capacity_bytes) as usize,
                         slot_capacity: *slot_capacity_bytes as usize,
                     }) as Arc<dyn Device>,

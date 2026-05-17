@@ -47,7 +47,7 @@ pub enum Commands {
 #[derive(Args, Debug, Clone)]
 pub struct GlobalOptions {
     /// Path to config yaml
-    #[arg(long, default_value = "./XHFS.yaml")]
+    #[arg(long, default_value = "./xhfs.yaml")]
     pub config: PathBuf,
     #[arg(long)]
     pub password: Option<String>,

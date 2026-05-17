@@ -5,18 +5,19 @@ use tokio::sync::RwLock;
 
 use crate::device::{Device, KeyValue};
 
-#[derive(Clone)]
-pub struct MemoryKV(pub HashMap<u64, Vec<u8>>);
+pub struct MemoryKV(pub RwLock<HashMap<u64, Vec<u8>>>);
 
 #[async_trait]
 impl KeyValue for MemoryKV {
-    async fn set(&mut self, k: u64, v: Vec<u8>) -> eyre::Result<()> {
-        self.0.insert(k, v);
+    async fn set(&self, k: u64, v: Vec<u8>) -> eyre::Result<()> {
+        let mut kv = self.0.write().await;
+        kv.insert(k, v);
         Ok(())
     }
 
     async fn get(&self, k: &u64) -> eyre::Result<Option<Vec<u8>>> {
-        Ok(self.0.get(k).cloned())
+        let kv = self.0.write().await;
+        Ok(kv.get(k).cloned())
     }
 }
 
@@ -24,7 +25,7 @@ impl KeyValue for MemoryKV {
 pub struct KVDevice {
     pub total_slots: usize,
     pub slot_capacity: usize,
-    pub store: Arc<RwLock<dyn KeyValue + Send + Sync>>,
+    pub store: Arc<dyn KeyValue + Send + Sync>,
 }
 
 #[async_trait]
@@ -40,7 +41,6 @@ impl Device for KVDevice {
     async fn write(&self, addr: usize, data: &[u8]) -> eyre::Result<()> {
         let mut remaining = data;
         let mut current_addr = addr;
-        let mut store = self.store.write().await;
 
         while !remaining.is_empty() {
             let slot = current_addr / self.slot_capacity;
@@ -51,7 +51,8 @@ impl Device for KVDevice {
 
             let writable = (self.slot_capacity - offset).min(remaining.len());
             let key = slot as u64;
-            let mut slot_buf = store
+            let mut slot_buf = self
+                .store
                 .get(&key)
                 .await?
                 .unwrap_or(vec![0u8; self.slot_capacity]);
@@ -60,7 +61,7 @@ impl Device for KVDevice {
                 slot_buf.resize(self.slot_capacity, 0);
             }
             slot_buf[offset..offset + writable].copy_from_slice(&remaining[..writable]);
-            store.set(key, slot_buf).await?;
+            self.store.set(key, slot_buf).await?;
 
             remaining = &remaining[writable..];
             current_addr += writable;
@@ -74,7 +75,6 @@ impl Device for KVDevice {
         let mut current_addr = addr;
 
         let mut buf = Vec::with_capacity(size);
-        let store = self.store.read().await;
 
         while remaining > 0 {
             let slot = current_addr / self.slot_capacity;
@@ -87,7 +87,8 @@ impl Device for KVDevice {
             let readable = (self.slot_capacity - offset).min(remaining);
             let key = slot as u64;
 
-            let slot_buf = store
+            let slot_buf = self
+                .store
                 .get(&key)
                 .await?
                 .unwrap_or(vec![0u8; self.slot_capacity]);
