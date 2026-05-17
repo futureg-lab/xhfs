@@ -271,6 +271,8 @@ impl INodeKind {
 }
 
 impl Extent {
+    pub const HEADER_NEXT_OFFSET: u64 = 8;
+
     pub fn serialize(&self) -> eyre::Result<Vec<u8>> {
         let mut buf = Vec::with_capacity(self.serialized_size());
         buf.extend_from_slice(&(self.data.len() as u64).to_le_bytes());
@@ -281,21 +283,8 @@ impl Extent {
     }
 
     pub fn deserialize(data: &[u8]) -> eyre::Result<Self> {
-        let meta_expected_size = 8 + 8;
-        let incoming_size = data.len();
-        eyre::ensure!(
-            incoming_size >= meta_expected_size,
-            "Expected Extent data to be at least 8 + 8 (16) bytes"
-        );
-
-        let mut addr_start = 0;
-        let size = u64::from_le_bytes(data[addr_start..addr_start + 8].try_into()?);
-        addr_start += 8;
-
-        let next = MaybeU64::deserialize(data[addr_start..addr_start + 8].try_into()?);
-        addr_start += 8;
-
-        let data = &data[addr_start..];
+        let (size, next) = Self::deserialize_header_only(data)?;
+        let data = &data[8 + 8..];
         eyre::ensure!(
             size == data.len() as u64,
             "Expected Extent data region to be of size {}, got {} instead",
@@ -307,6 +296,22 @@ impl Extent {
             next,
             data: data.to_vec(),
         })
+    }
+
+    pub fn deserialize_header_only(data: &[u8]) -> eyre::Result<(u64, MaybeU64)> {
+        let meta_expected_size = 8 + 8;
+        let incoming_size = data.len();
+        eyre::ensure!(
+            incoming_size >= meta_expected_size,
+            "Expected Extent data to be at least 8 + 8 (16) bytes"
+        );
+
+        let mut addr_start = 0;
+        let size = u64::from_le_bytes(data[addr_start..addr_start + 8].try_into()?);
+        addr_start += 8;
+        let next = MaybeU64::deserialize(data[addr_start..addr_start + 8].try_into()?);
+
+        Ok((size, next))
     }
 
     pub fn emulate_serialized_size(data_len: usize) -> usize {
