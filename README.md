@@ -16,9 +16,7 @@ arbitrary locations.
 
 While its core design is inspired by ext4, the primary architectural split is
 that its inode extents are organized as a linked list instead of a H Tree, which
-you may argue makes it slower for seek operations but still good enough for
-checking correctness. The mechanism it uses to reclaim and reuse freed memory to
-mitigate fragmentation is also quite different.
+you may argue makes it slower for seek operations but still good enough.
 
 # Example
 
@@ -30,32 +28,32 @@ Consider the following configuration:
 # or use the cli with --password helloworld if the config and bins are made public
 password: helloworld
 devices:
-    - type: file
-      name: bloc1
-      path: ./part1.bin
-    - type: file
-      name: bloc2
-      path: ./part1-replica.bin
-    - type: file
-      name: bloc3
-      path: ./part3.bin
-    # - type: s3
-    #   name: bloc3
-    #   key: ..
-    #  ..
+  - type: file
+    name: bloc1
+    path: ./part1.bin
+  - type: file
+    name: bloc2
+    path: ./part1-replica.bin
+  - type: file
+    name: bloc3
+    path: ./part3.bin
+  # - type: s3
+  #   name: bloc3
+  #   key: ..
+  #  ..
 configuration:
-    logical:
-        - name: dev1
-          include: [bloc1, bloc2]
-          capacity: "2 MiB"
-          max_concurrent: 2
-        - name: dev2
-          include: [bloc3]
-          capacity: "2 MiB"
-          max_concurrent: 1
-    # Final storage layout
-    # [dev1: 0 - 2MB] [dev2: 2MiB - 4MiB]
-    layout: [dev1, dev2]
+  logical:
+    - name: dev1
+      include: [bloc1, bloc2]
+      capacity: "2 MiB"
+      max_concurrent: 2
+    - name: dev2
+      include: [bloc3]
+      capacity: "2 MiB"
+      max_concurrent: 1
+  # Final storage layout
+  # [dev1: 0 - 2MB] [dev2: 2MiB - 4MiB]
+  layout: [dev1, dev2]
 ```
 
 All you have to do left is format the drive if not done yet then play with it.
@@ -65,7 +63,7 @@ All you have to do left is format the drive if not done yet then play with it.
 brutefs format
 
 echo "Hello World" > thething.txt
-brutefs write thething.txt /test.txt
+brutefs upload thething.txt /test.txt
 
 brutefs x ls . -v
 # FILE 2026-05-14 16:49:49        28 B test.txt
@@ -79,10 +77,11 @@ brutefs download test.txt my_physical_copy.txt
 
 # Features
 
-- [x] File System
+- [ ] File System
   - [x] Encryption (ChaCha20 stream cipher)
   - [x] brutefs core: fopen, fwrite, fseek, mkdir, fmove, fcopy, unlink
   - [x] native symlink support: create_link
+  - [ ] native hardlink support: wip
   - [x] extra: fappend
 - [x] RAID-like configuration
   - [x] logical grouping

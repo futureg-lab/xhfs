@@ -4,6 +4,8 @@ use crate::bfs::{addr::MaybeU64, crypto::Crypto, ds::*};
 pub fn test_basic_binary_serialization() -> eyre::Result<()> {
     {
         let original = INode {
+            inumber: 66441234,
+            nlink: 42,
             kind: INodeKind::Symlink,
             extent_addr: MaybeU64::from(1234),
             total_file_size: 42,
@@ -52,23 +54,83 @@ pub fn test_basic_binary_serialization() -> eyre::Result<()> {
     }
 
     {
-        let mut original = BruteFsHeader {
+        let original = BruteFsHeader {
             version: 42,
-            extent_freed: AddressVector::allocate(11),
+            format: Format {
+                block_size_bytes: 12348794,
+                blocks_per_group: 234567,
+                group_count: 4,
+            },
             chacha20_nonce: Crypto::gen_nonce(),
         };
-        original.extent_freed.items[5] = AddressSlot {
-            addr: MaybeU64::from(1234),
-            capacity: 444,
-        };
-        original.extent_freed.items[10] = AddressSlot {
-            addr: MaybeU64::from(234567),
-            capacity: 4567112234,
-        };
-
         let data = original.serialize()?;
         let reconstr = BruteFsHeader::deserialize(&data)?;
         assert_eq!(original, reconstr, "BruteFsHeader serde");
     }
+    Ok(())
+}
+
+#[test]
+pub fn test_bitmap_serialization() -> eyre::Result<()> {
+    {
+        let size = 100;
+        let bitmap = Bitmap::new_from_bits_count(size);
+        assert_eq!(bitmap.map.len(), size);
+        for i in 0..size {
+            assert_eq!(bitmap.get(i)?, false);
+        }
+    }
+
+    {
+        let mut bitmap = Bitmap::new_from_bits_count(64);
+        bitmap.set(0, true)?;
+        bitmap.set(31, true)?;
+        bitmap.set(63, true)?;
+
+        assert_eq!(bitmap.get(0)?, true);
+        assert_eq!(bitmap.get(31)?, true);
+        assert_eq!(bitmap.get(63)?, true);
+
+        assert_eq!(bitmap.get(1)?, false, "untouched bits remain false");
+        assert_eq!(bitmap.get(32)?, false, "untouched bits remain false");
+
+        bitmap.set(31, false)?;
+        assert_eq!(bitmap.get(31)?, false, "set existing true bit to false");
+    }
+
+    {
+        let mut bitmap = Bitmap::new_from_bits_count(10);
+        assert!(bitmap.get(10).is_err(), "out of bounds");
+        assert!(bitmap.get(100).is_err(), "out of bounds");
+        assert!(bitmap.set(10, true).is_err(), "out of bounds");
+        assert!(bitmap.set(100, false).is_err(), "out of bounds");
+    }
+
+    {
+        // odd bit length that doesn't align cleanly with 8-bit bytes
+        let bit_size = 77;
+        let mut bitmap = Bitmap::new_from_bits_count(bit_size);
+        bitmap.set(0, true)?;
+        bitmap.set(12, true)?;
+        bitmap.set(76, true)?;
+
+        let expected_size = bitmap.serialized_size();
+        let serialized_data = bitmap.serialize()?;
+        assert_eq!(serialized_data.len(), expected_size);
+
+        let deserialized = Bitmap::deserialize(&serialized_data)?;
+        assert_eq!(bitmap, deserialized, "ser-de");
+
+        assert_eq!(deserialized.map.len(), bit_size);
+        assert_eq!(deserialized.get(0)?, true);
+        assert_eq!(deserialized.get(12)?, true);
+        assert_eq!(deserialized.get(76)?, true);
+        assert_eq!(deserialized.get(75)?, false);
+        assert!(
+            deserialized.get(77).is_err(),
+            "original constraint len survived"
+        );
+    }
+
     Ok(())
 }

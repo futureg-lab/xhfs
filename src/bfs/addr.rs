@@ -17,6 +17,24 @@ impl Default for MaybeU64 {
     }
 }
 
+impl From<u64> for MaybeU64 {
+    fn from(value: u64) -> Self {
+        Self::from(value)
+    }
+}
+
+impl From<usize> for MaybeU64 {
+    fn from(value: usize) -> Self {
+        Self::from(value as u64)
+    }
+}
+
+impl Into<usize> for MaybeU64 {
+    fn into(self) -> usize {
+        self.get() as usize
+    }
+}
+
 impl MaybeU64 {
     pub fn get(&self) -> u64 {
         match self.inner {

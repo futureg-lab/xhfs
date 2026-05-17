@@ -1,5 +1,7 @@
 use crate::bfs::addr::MaybeU64;
 use crate::utils::{normalize_path, u64_to_utc_datetime};
+use bitvec::order::Msb0;
+use bitvec::vec::BitVec;
 use eyre::Context;
 use std::fmt::Display;
 use std::{fmt::Debug, path::PathBuf};
@@ -9,15 +11,31 @@ pub enum INodeKind {
     File,
     Directory,
     Symlink,
+    // TODO: hardlinks are easy doable!
+    // payload is inumber instead of path + increase nlink
+    // Hardlink,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct INode {
     pub kind: INodeKind,
+    pub inumber: u64,
+    pub nlink: u64,
     pub total_file_size: u64,
     pub extent_addr: MaybeU64,
     pub mtime: u64,
     pub ctime: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Bitmap {
+    pub map: BitVec<u8, Msb0>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BitRunSlot {
+    pub start: usize,
+    pub size: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,7 +81,8 @@ pub enum BruteFsError {
     Insufficient {
         wanted: usize,
         max_slot_size: usize,
-        left_contiguous: usize,
+        min_slot_size: usize,
+        free_slot_sizes: Vec<usize>,
     },
     Error {
         err: String,
@@ -76,11 +95,13 @@ impl Display for BruteFsError {
             BruteFsError::Insufficient {
                 wanted,
                 max_slot_size,
-                left_contiguous,
+                min_slot_size,
+                free_slot_sizes,
             } => {
                 write!(
                     f,
-                    "Insufficient space, operation requires {wanted} B, max fragment available {max_slot_size} B, max contiguous bloc {left_contiguous}"
+                    "Insufficient space, operation requires {wanted} B, found {} fragments: available max {max_slot_size} B, min {min_slot_size}",
+                    free_slot_sizes.len()
                 )
             }
             BruteFsError::Error { err } => write!(f, "{err}"),
@@ -143,11 +164,35 @@ impl Display for RegionSlot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "  - 0x{:08x} -- 0x{:08x} ({:>10} B)\n",
+            "0x{:08x} -- 0x{:08x} ({:>10} B)",
             self.start.get(),
             self.end.get(),
-            self.end.get().saturating_sub(self.start.get())
+            self.to_addr_slot().capacity
         )
+    }
+}
+
+impl RegionSlot {
+    pub fn add_offset(&self, offset: u64) -> Self {
+        Self {
+            start: MaybeU64::from(offset + self.start.get()),
+            end: MaybeU64::from(offset + self.end.get()),
+        }
+    }
+
+    pub fn to_pair(&self) -> (u64, u64) {
+        (self.start.get(), self.end.get())
+    }
+
+    pub fn size(&self) -> u64 {
+        self.end.get().saturating_sub(self.start.get()) + 1
+    }
+
+    pub fn to_addr_slot(&self) -> AddressSlot {
+        AddressSlot {
+            addr: self.start,
+            capacity: self.size() as usize,
+        }
     }
 }
 
@@ -160,8 +205,46 @@ pub struct AddressVector {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BruteFsHeader {
     pub version: u8,
-    pub extent_freed: AddressVector,
+    pub format: Format,
     pub chacha20_nonce: [u8; 12],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Format {
+    pub block_size_bytes: u64,
+    pub blocks_per_group: u64,
+    pub group_count: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct GeometryLayout {
+    pub rel_header_region: RegionSlot,
+    pub rel_data_bitmap_region: RegionSlot,
+    pub rel_inode_bitmap_region: RegionSlot,
+    pub rel_inode_table_region: RegionSlot,
+    pub rel_data_region: RegionSlot,
+    pub n_inodes_in_group: u64,
+    pub group_stride: u64,
+    pub usable_blocks_per_group: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct BlockInitialValues {
+    pub serialized_header: Vec<u8>,
+    pub inode_bitmap_placeholder: Vec<u8>,
+    pub data_block_bitmap: Vec<u8>,
+    pub inode_table_placeholder: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct GroupLayout {
+    pub g_index: u64,
+    pub g_offset: u64,
+    pub header_region: RegionSlot,
+    pub data_bitmap_region: RegionSlot,
+    pub inode_bitmap_region: RegionSlot,
+    pub inode_table_region: RegionSlot,
+    pub data_region: RegionSlot,
 }
 
 impl INodeKind {
@@ -188,6 +271,8 @@ impl INodeKind {
 }
 
 impl Extent {
+    pub const HEADER_NEXT_OFFSET: u64 = 8;
+
     pub fn serialize(&self) -> eyre::Result<Vec<u8>> {
         let mut buf = Vec::with_capacity(self.serialized_size());
         buf.extend_from_slice(&(self.data.len() as u64).to_le_bytes());
@@ -198,27 +283,14 @@ impl Extent {
     }
 
     pub fn deserialize(data: &[u8]) -> eyre::Result<Self> {
-        let meta_expected_size = 8 + 8;
-        let incoming_size = data.len();
-        if incoming_size < meta_expected_size {
-            eyre::bail!("Expected Extent data to be at least 8 + 8 (16) bytes");
-        }
-
-        let mut addr_start = 0;
-        let size = u64::from_le_bytes(data[addr_start..addr_start + 8].try_into()?);
-        addr_start += 8;
-
-        let next = MaybeU64::deserialize(data[addr_start..addr_start + 8].try_into()?);
-        addr_start += 8;
-
-        let data = &data[addr_start..];
-        if size != data.len() as u64 {
-            eyre::bail!(
-                "Expected Extent data region to be of size {}, got {} instead",
-                size,
-                data.len()
-            );
-        }
+        let (size, next) = Self::deserialize_header_only(data)?;
+        let data = &data[8 + 8..];
+        eyre::ensure!(
+            size == data.len() as u64,
+            "Expected Extent data region to be of size {}, got {} instead",
+            size,
+            data.len()
+        );
 
         Ok(Extent {
             next,
@@ -226,8 +298,28 @@ impl Extent {
         })
     }
 
+    pub fn deserialize_header_only(data: &[u8]) -> eyre::Result<(u64, MaybeU64)> {
+        let meta_expected_size = 8 + 8;
+        let incoming_size = data.len();
+        eyre::ensure!(
+            incoming_size >= meta_expected_size,
+            "Expected Extent data to be at least 8 + 8 (16) bytes"
+        );
+
+        let mut addr_start = 0;
+        let size = u64::from_le_bytes(data[addr_start..addr_start + 8].try_into()?);
+        addr_start += 8;
+        let next = MaybeU64::deserialize(data[addr_start..addr_start + 8].try_into()?);
+
+        Ok((size, next))
+    }
+
+    pub fn emulate_serialized_size(data_len: usize) -> usize {
+        8 + 8 + data_len
+    }
+
     pub fn serialized_size(&self) -> usize {
-        8 + 8 + self.data.len()
+        Self::emulate_serialized_size(self.data.len())
     }
 }
 
@@ -235,11 +327,13 @@ impl INode {
     pub fn serialize(&self) -> eyre::Result<Vec<u8>> {
         let mut buf = Vec::with_capacity(Self::serialized_size());
 
+        buf.extend_from_slice(&self.inumber.to_le_bytes());
         let kind = self.kind.to_byte();
         buf.push(kind);
 
-        buf.extend_from_slice(&self.extent_addr.serialize()?);
+        buf.extend_from_slice(&self.nlink.to_le_bytes());
         buf.extend_from_slice(&self.total_file_size.to_le_bytes());
+        buf.extend_from_slice(&self.extent_addr.serialize()?);
 
         buf.extend_from_slice(&self.mtime.to_le_bytes());
         buf.extend_from_slice(&self.ctime.to_le_bytes());
@@ -250,18 +344,23 @@ impl INode {
     pub fn deserialize(data: &[u8]) -> eyre::Result<Self> {
         let expected_size = Self::serialized_size();
         let incoming_size = data.len();
-        if incoming_size != expected_size {
-            eyre::bail!(
-                "Expected INode data size to be {expected_size}, got {incoming_size} instead"
-            );
-        }
+        eyre::ensure!(
+            incoming_size == expected_size,
+            "Expected INode data size to be {expected_size}, got {incoming_size} instead"
+        );
 
-        let kind = INodeKind::from_byte(data[0])?;
-
-        let mut addr_start = 1;
-        let extent_addr = MaybeU64::deserialize(data[addr_start..addr_start + 8].try_into()?);
+        let mut addr_start = 0;
+        let inumber = u64::from_le_bytes(data[addr_start..addr_start + 8].try_into()?);
         addr_start += 8;
+        let kind = INodeKind::from_byte(data[8])?;
+        addr_start += 1;
+
+        let nlink = u64::from_le_bytes(data[addr_start..addr_start + 8].try_into()?);
+        addr_start += 8;
+
         let total_file_size = u64::from_le_bytes(data[addr_start..addr_start + 8].try_into()?);
+        addr_start += 8;
+        let extent_addr = MaybeU64::deserialize(data[addr_start..addr_start + 8].try_into()?);
         addr_start += 8;
 
         let mtime = u64::from_le_bytes(data[addr_start..addr_start + 8].try_into()?);
@@ -269,29 +368,32 @@ impl INode {
         let ctime = u64::from_le_bytes(data[addr_start..addr_start + 8].try_into()?);
 
         Ok(INode {
+            inumber,
             kind,
+            nlink,
+            extent_addr,
             total_file_size,
             mtime,
             ctime,
-            extent_addr,
         })
     }
 
     pub fn serialized_size() -> usize {
-        1 + 8 + 8 + 8 + 8
+        8 + 1 + 8 + 8 + 8 + 8 + 8
     }
 }
 
 impl Display for INode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "- Kind: {:?}\n", self.kind)?;
+        writeln!(f, "- Number of Links: {:?}", self.nlink)?;
+        writeln!(f, "- Kind: {:?}", self.kind)?;
         if !matches!(self.kind, INodeKind::Directory) {
-            write!(f, "- Size: {} B\n", self.total_file_size)?;
+            write!(f, "- Size: {} B", self.total_file_size)?;
         }
-        write!(f, "- Creation time: {}\n", u64_to_utc_datetime(self.ctime))?;
-        write!(
+        writeln!(f, "- Creation time: {}", u64_to_utc_datetime(self.ctime))?;
+        writeln!(
             f,
-            "- Modification time: {}\n",
+            "- Modification time: {}",
             u64_to_utc_datetime(self.mtime)
         )?;
         write!(
@@ -356,11 +458,10 @@ impl Directory {
 
         let expected_size = 8;
         let incoming_size = data.len();
-        if incoming_size < expected_size {
-            eyre::bail!(
-                "Expected Directory data size to be at least {expected_size}, got {incoming_size} instead"
-            );
-        }
+        eyre::ensure!(
+            incoming_size >= expected_size,
+            "Expected Directory data size to be at least {expected_size}, got {incoming_size} instead"
+        );
 
         let mut addr_start = 0;
         let items = u64::from_le_bytes(data[addr_start..addr_start + 8].try_into()?);
@@ -393,145 +494,452 @@ impl SymLink {
     }
 }
 
-impl AddressVector {
-    pub fn allocate(count: usize) -> Self {
-        AddressVector {
-            global_offset: 0,
-            items: vec![AddressSlot::default(); count],
-        }
-    }
-
-    pub fn compactify(&mut self) {
-        let original_count = self.items.len();
-        if original_count < 2 {
-            return;
-        }
-        self.items
-            .sort_by_key(|slot| slot.addr.to_optional().unwrap_or(u64::MAX));
-
-        let mut consolidated = Vec::with_capacity(original_count);
-        let mut items_iter = self.items.drain(..);
-        if let Some(first) = items_iter.next() {
-            consolidated.push(first);
-        }
-
-        for next_slot in items_iter {
-            let last_slot = consolidated.last_mut().unwrap();
-            if let (Some(last_addr), Some(next_addr)) =
-                (last_slot.addr.to_optional(), next_slot.addr.to_optional())
-            {
-                if last_addr + (last_slot.capacity as u64) == next_addr {
-                    last_slot.capacity += next_slot.capacity;
-                    continue;
-                }
-            }
-            consolidated.push(next_slot);
-        }
-
-        // greedy: smallest non-zero/usable capacity first
-        consolidated.sort_by_key(|s| {
-            if s.capacity == 0 {
-                usize::MAX
-            } else {
-                s.capacity
-            }
-        });
-
-        while consolidated.len() < original_count {
-            consolidated.push(AddressSlot::default());
-        }
-        self.items = consolidated;
-    }
-
+impl BruteFsHeader {
     pub fn serialize(&self) -> eyre::Result<Vec<u8>> {
-        let count = self.items.len();
-        let mut buf = Vec::with_capacity(self.serialized_size());
-        buf.extend_from_slice(&count.to_le_bytes());
-        buf.extend_from_slice(&self.global_offset.to_le_bytes());
-        for slot in &self.items {
-            buf.extend_from_slice(&slot.addr.get().to_le_bytes());
-            buf.extend_from_slice(&slot.capacity.to_le_bytes());
-        }
+        let mut buf = Vec::with_capacity(Self::serialized_size());
+        buf.extend_from_slice(b"brutefs");
+        buf.push(self.version);
+        buf.extend_from_slice(&self.format.block_size_bytes.to_le_bytes());
+        buf.extend_from_slice(&self.format.blocks_per_group.to_le_bytes());
+        buf.extend_from_slice(&self.format.group_count.to_le_bytes());
+        buf.extend_from_slice(&self.chacha20_nonce);
 
         Ok(buf)
     }
 
     pub fn deserialize(data: &[u8]) -> eyre::Result<Self> {
-        if data.len() < 8 {
-            eyre::bail!("Expected AddressVector to be contain at least the the data count");
-        }
+        let expected_size = Self::serialized_size();
+        let incoming_size = data.len();
+        eyre::ensure!(
+            incoming_size == expected_size,
+            "Expected BruteFsHeader data size to be {expected_size}, got {incoming_size} instead"
+        );
+        eyre::ensure!(
+            &data[0..7] == b"brutefs",
+            "Invalid BruteFsHeader magic bytes"
+        );
 
-        let mut addr_start = 0;
-        let items = u64::from_le_bytes(data[addr_start..addr_start + 8].try_into()?);
+        let version = data[7];
+        let mut addr_start = 8;
+        let block_size_bytes = u64::from_le_bytes(data[addr_start..addr_start + 8].try_into()?);
         addr_start += 8;
-
-        let global_offset = u64::from_le_bytes(data[addr_start..addr_start + 8].try_into()?);
+        let blocks_per_group = u64::from_le_bytes(data[addr_start..addr_start + 8].try_into()?);
         addr_start += 8;
-
-        let u64_count = (data.len() - addr_start) / 8;
-        if u64_count != 2 * items as usize {
-            eyre::bail!("Expected a count of {items} address entries, got {u64_count} instead")
-        }
-
-        // TODO:
-        // This is a hot path! find a better way if possible
-        let slice = &data[addr_start..];
-        if slice.len() % 16 != 0 {
-            eyre::bail!("Invalid slice length (not multiple of 16)");
-        }
-
-        let mut items = Vec::with_capacity(slice.len() / 16);
-        for chunk in slice.chunks_exact(16) {
-            let addr_bytes: [u8; 8] = chunk[0..8].try_into().expect("valid size");
-            let size_bytes: [u8; 8] = chunk[8..16].try_into().expect("valid size");
-            let addr = MaybeU64::deserialize(addr_bytes);
-            let capacity = u64::from_le_bytes(size_bytes) as usize;
-
-            items.push(AddressSlot { addr, capacity });
-        }
+        let group_count = u64::from_le_bytes(data[addr_start..addr_start + 8].try_into()?);
+        addr_start += 8;
+        let chacha20_nonce = data[addr_start..addr_start + 12].try_into()?;
 
         Ok(Self {
-            global_offset,
-            items,
+            version,
+            format: Format {
+                block_size_bytes,
+                blocks_per_group,
+                group_count,
+            },
+            chacha20_nonce,
         })
     }
 
-    pub fn serialized_size(&self) -> usize {
-        1 * 8 + self.items.len() * (8 + 8)
+    pub fn serialized_size() -> usize {
+        7 + 1 + 8 + 8 + 8 + 12
+    }
+
+    pub fn template() -> Self {
+        Self {
+            version: 1,
+            format: Format {
+                block_size_bytes: 0,
+                blocks_per_group: 0,
+                group_count: 0,
+            },
+            chacha20_nonce: Default::default(),
+        }
+    }
+
+    pub fn calculate_relative_geometry(
+        &self,
+    ) -> eyre::Result<(GeometryLayout, BlockInitialValues)> {
+        let serialized_header = self.serialize()?;
+        let rel_header_region = RegionSlot {
+            start: 0u64.into(),
+            end: ((serialized_header.len() - 1) as u64).into(),
+        };
+
+        let total_blocks_in_group = self.format.blocks_per_group as usize;
+        let data_block_bitmap = Bitmap::new_from_bits_count(total_blocks_in_group).serialize()?;
+        let data_bitmap_start = rel_header_region.end.get() + 1;
+        let rel_data_bitmap_region = RegionSlot {
+            start: data_bitmap_start.into(),
+            end: (data_bitmap_start + data_block_bitmap.len() as u64 - 1).into(),
+        };
+
+        let n_inodes_in_group = 8 * self.format.block_size_bytes as usize;
+        let inode_bitmap_placeholder =
+            Bitmap::new_from_bits_count(n_inodes_in_group).serialize()?; // default would be
+        let inode_bitmap_start = rel_data_bitmap_region.end.get() + 1;
+        let rel_inode_bitmap_region = RegionSlot {
+            start: inode_bitmap_start.into(),
+            end: (inode_bitmap_start + inode_bitmap_placeholder.len() as u64 - 1).into(),
+        };
+
+        let inode_table_len_bytes = (n_inodes_in_group * INode::serialized_size()) as u64;
+        let inode_table_start = rel_inode_bitmap_region.end.get() + 1;
+        let inode_table_placeholder = vec![0u8; inode_table_len_bytes as usize];
+
+        let rel_inode_table_region = RegionSlot {
+            start: inode_table_start.into(),
+            end: (inode_table_start + inode_table_len_bytes - 1).into(),
+        };
+
+        let data_region_start = rel_inode_table_region.end.get() + 1;
+        let total_group_bytes = self.format.blocks_per_group * self.format.block_size_bytes;
+        // IMPORTANT:
+        // we need to ensure the data region size is a multiple of the block size
+        // if it's bigger or smaller => reduce to closest multiple
+        // The reason is that the allocator speaks in terms of blocks at allocates in that unit not bytes
+        let raw_bytes_available = total_group_bytes - data_region_start;
+        let data_blocks_per_group = raw_bytes_available / self.format.block_size_bytes;
+        let exact_data_payload_bytes = data_blocks_per_group * self.format.block_size_bytes;
+        let rel_data_region = RegionSlot {
+            start: data_region_start.into(),
+            end: (data_region_start + exact_data_payload_bytes - 1).into(),
+        };
+
+        let group_stride = total_group_bytes;
+
+        let data_bytes_available = rel_data_region.end.get() - rel_data_region.start.get() + 1;
+        let data_blocks_per_group = data_bytes_available / self.format.block_size_bytes;
+
+        let geometry = GeometryLayout {
+            rel_header_region,
+            rel_data_bitmap_region,
+            rel_inode_bitmap_region,
+            rel_inode_table_region,
+            n_inodes_in_group: n_inodes_in_group as u64,
+            rel_data_region,
+            group_stride,
+            usable_blocks_per_group: data_blocks_per_group,
+        };
+        let templates = BlockInitialValues {
+            serialized_header,
+            data_block_bitmap,
+            inode_bitmap_placeholder,
+            inode_table_placeholder,
+        };
+
+        Ok((geometry, templates))
     }
 }
 
-impl BruteFsHeader {
+impl Bitmap {
+    pub fn new_from_bits_count(size_in_bits: usize) -> Self {
+        let mut map = BitVec::new();
+        map.resize(size_in_bits, false);
+        Self { map }
+    }
+
+    #[inline]
+    pub fn set(&mut self, n: usize, value: bool) -> eyre::Result<()> {
+        eyre::ensure!(
+            n < self.map.len(),
+            "Index {} out of bounds for bitmap of size {}",
+            n,
+            self.map.len()
+        );
+        self.map.set(n, value);
+        Ok(())
+    }
+
+    #[inline]
+    pub fn get(&self, n: usize) -> eyre::Result<bool> {
+        eyre::ensure!(
+            n < self.map.len(),
+            "Index {} out of bounds for bitmap of size {}",
+            n,
+            self.map.len()
+        );
+        Ok(*self.map.get(n).unwrap())
+    }
+
+    pub fn runs_of(&self, target_bit: bool, stop_index: Option<usize>) -> Vec<BitRunSlot> {
+        let mut runs = vec![];
+        let logical_len = stop_index.unwrap_or(self.map.len()).min(self.map.len());
+        if logical_len == 0 {
+            return runs;
+        }
+
+        let actual = self.map[..logical_len].to_bitvec();
+        let raw = actual.as_raw_slice();
+        let full_bytes = logical_len / 8;
+        let rem_bits = logical_len % 8;
+        let mut current_run_start = None;
+        let mut current_bit_index = 0;
+        for (byte_index, &raw_word) in raw.iter().enumerate() {
+            let mut word = raw_word;
+            // mask away padding bits in the final partial byte
+            if byte_index == full_bytes && rem_bits != 0 {
+                let mask = 0xFF << (8 - rem_bits);
+                word &= mask;
+            }
+            if !target_bit {
+                word = !word;
+                // remask after inversion so padding bits stay zero
+                if byte_index == full_bytes && rem_bits != 0 {
+                    let mask = 0xFF << (8 - rem_bits);
+                    word &= mask;
+                }
+            }
+            let valid_bits = if byte_index < full_bytes {
+                8
+            } else if rem_bits == 0 {
+                8
+            } else {
+                rem_bits
+            };
+
+            if word == 0 {
+                // match
+                if let Some(start) = current_run_start.take() {
+                    runs.push(BitRunSlot {
+                        start,
+                        size: current_bit_index - start,
+                    });
+                }
+                current_bit_index += valid_bits;
+                continue;
+            }
+
+            // full match
+            let full_mask = if valid_bits == 8 {
+                u8::MAX
+            } else {
+                0xFF << (8 - valid_bits)
+            };
+
+            if word == full_mask {
+                if current_run_start.is_none() {
+                    current_run_start = Some(current_bit_index);
+                }
+
+                current_bit_index += valid_bits;
+                continue;
+            }
+
+            // mixed => scan transitions
+            let mut processed = 0;
+            while processed < valid_bits {
+                let zeros = word.leading_zeros() as usize;
+                if zeros > 0 {
+                    if let Some(start) = current_run_start.take() {
+                        runs.push(BitRunSlot {
+                            start,
+                            size: current_bit_index - start,
+                        });
+                    }
+                    let shift = zeros.min(valid_bits - processed);
+                    word <<= shift;
+                    current_bit_index += shift;
+                    processed += shift;
+                }
+                if processed >= valid_bits {
+                    break;
+                }
+                let ones = word.leading_ones() as usize;
+                if ones > 0 {
+                    if current_run_start.is_none() {
+                        current_run_start = Some(current_bit_index);
+                    }
+                    let shift = ones.min(valid_bits - processed);
+                    word <<= shift;
+                    current_bit_index += shift;
+                    processed += shift;
+                }
+            }
+        }
+
+        if let Some(start) = current_run_start.take() {
+            runs.push(BitRunSlot {
+                start,
+                size: current_bit_index - start,
+            });
+        }
+
+        runs
+    }
+
+    pub fn set_range(&mut self, start: usize, length: usize, value: bool) -> eyre::Result<()> {
+        let end = start + length;
+        if end > self.map.len() {
+            return Err(eyre::eyre!(
+                "Out of bounds: range {}..{} exceeds bitmap capacity {}",
+                start,
+                end,
+                self.map.len()
+            ));
+        }
+        self.map[start..end].fill(value);
+        Ok(())
+    }
+
     pub fn serialize(&self) -> eyre::Result<Vec<u8>> {
-        let mut buf = Vec::with_capacity(self.serialized_size());
-        buf.extend_from_slice(b"brutefs");
-        buf.push(self.version);
-        buf.extend_from_slice(&self.chacha20_nonce);
-        buf.extend_from_slice(&self.extent_freed.serialize()?);
-        Ok(buf)
+        let bit_len = self.map.len() as u64;
+        let raw_bytes = self.map.as_raw_slice();
+        let mut data = Vec::with_capacity(8 + raw_bytes.len());
+        data.extend_from_slice(&bit_len.to_le_bytes());
+        data.extend_from_slice(raw_bytes);
+        Ok(data)
     }
 
     pub fn deserialize(data: &[u8]) -> eyre::Result<Self> {
-        let magic = b"brutefs";
-        let min_expected_size = 7 + 1 + 12;
-        let incoming_size = data.len();
-        if incoming_size < min_expected_size {
-            eyre::bail!(
-                "Expected BruteFsHeader data size to be at least {min_expected_size}, got {incoming_size} instead"
-            );
-        }
-        if &data[0..7] != magic {
-            eyre::bail!("Invalid BruteFsHeader magic bytes");
-        }
+        eyre::ensure!(
+            data.len() >= 8,
+            "Bitmap buffer is too short to contain the header (min 8 bytes), got {}",
+            data.len()
+        );
 
-        Ok(Self {
-            version: data[7],
-            chacha20_nonce: data[8..8 + 12].try_into()?,
-            extent_freed: AddressVector::deserialize(&data[8 + 12..])?,
-        })
+        let bit_len = u64::from_le_bytes(data[0..8].try_into()?) as usize;
+        let raw_bytes = &data[8..];
+        let mut map: BitVec<u8, Msb0> = BitVec::from_slice(raw_bytes);
+
+        eyre::ensure!(
+            map.len() >= bit_len,
+            "Bitmap expected {} bits, got {} instead",
+            map.len(),
+            bit_len
+        );
+        map.truncate(bit_len);
+
+        Ok(Self { map })
+    }
+
+    pub fn find_next_zero_index(&self, start_index: usize) -> Option<usize> {
+        if start_index >= self.map.len() {
+            return None;
+        }
+        let remaining_bits = &self.map[start_index..];
+        remaining_bits
+            .iter_zeros()
+            .next()
+            .map(|relative_idx| start_index + relative_idx)
     }
 
     pub fn serialized_size(&self) -> usize {
-        7 + 1 + self.extent_freed.serialized_size() + 12
+        8 + self.map.as_raw_slice().len()
+    }
+}
+
+impl Format {
+    pub fn infer_from_free_space(total_capacity: u64) -> Self {
+        let block_size_bytes = if total_capacity <= 512 * 1024 {
+            512
+        } else if total_capacity <= 4 * 1024 * 1024 {
+            1024
+        } else {
+            4096
+        };
+
+        let total_blocks = total_capacity / block_size_bytes;
+
+        // 4 groups for 1GB scale
+        let target_group_bytes = 256 * 1024 * 1024;
+        let group_count = (total_capacity + target_group_bytes - 1) / target_group_bytes;
+        let group_count = group_count.max(1);
+
+        let target_blocks_per_group = target_group_bytes / block_size_bytes;
+        let blocks_per_group = target_blocks_per_group.min(total_blocks).max(1);
+
+        Self {
+            block_size_bytes,
+            blocks_per_group,
+            group_count,
+        }
+    }
+
+    pub fn validate(&self, total_bytes: u64) -> eyre::Result<()> {
+        eyre::ensure!(total_bytes > 0, "Target storage size cannot be 0 bytes");
+        eyre::ensure!(self.group_count > 0, "Group count must be > 0");
+        eyre::ensure!(
+            self.block_size_bytes > 0 && self.block_size_bytes.is_power_of_two(),
+            "Block size ({}) must be greater than 0 and a power of two",
+            self.block_size_bytes
+        );
+        eyre::ensure!(self.blocks_per_group > 0, "Blocks per group cannot be 0");
+        eyre::ensure!(
+            total_bytes >= self.block_size_bytes,
+            "Storage size ({} bytes) is too small to hold even a single block of size {} bytes",
+            total_bytes,
+            self.block_size_bytes
+        );
+
+        // a single block bitmap must be able to track every block inside its group
+        // Since 1 byte = 8 bits, a block can track (block_size_bytes * 8) blocks
+        let max_blocks_per_bitmap = self.block_size_bytes * 8;
+        eyre::ensure!(
+            self.blocks_per_group <= max_blocks_per_bitmap,
+            "Blocks per group ({}) exceeds the max capacity of a single block bitmap ({} blocks) for a block size of {} bytes",
+            self.blocks_per_group,
+            max_blocks_per_bitmap,
+            self.block_size_bytes
+        );
+
+        Ok(())
+    }
+}
+
+impl GroupLayout {
+    pub fn derive_from_group_index(g_index: u64, geometry: &GeometryLayout) -> Option<Self> {
+        // prevent division by zero if geometry isn't initialized properly
+        if geometry.group_stride == 0 {
+            return None;
+        }
+
+        let g_offset = g_index * geometry.group_stride;
+        Some(Self {
+            g_index,
+            g_offset,
+            header_region: geometry.rel_header_region.add_offset(g_offset),
+            data_bitmap_region: geometry.rel_data_bitmap_region.add_offset(g_offset),
+            inode_bitmap_region: geometry.rel_inode_bitmap_region.add_offset(g_offset),
+            inode_table_region: geometry.rel_inode_table_region.add_offset(g_offset),
+            data_region: geometry.rel_data_region.add_offset(g_offset),
+        })
+    }
+
+    pub fn derive_from_address(addr: u64, geometry: &GeometryLayout) -> Option<Self> {
+        // prevent division by zero if geometry isn't initialized properly
+        if geometry.group_stride == 0 {
+            return None;
+        }
+        Self::derive_from_group_index(addr / geometry.group_stride, geometry)
+    }
+
+    pub fn derive_from_inode(inumber: u64, geometry: &GeometryLayout) -> Option<Self> {
+        if inumber == 0 || geometry.n_inodes_in_group == 0 {
+            return None;
+        }
+        Self::derive_from_group_index((inumber - 1) / geometry.n_inodes_in_group, geometry)
+    }
+}
+
+impl Display for GeometryLayout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "Geometry Layout (relative):")?;
+        writeln!(f, "  Group Stride:        {} B", self.group_stride)?;
+        writeln!(f, "  Inodes per Group:    {}", self.n_inodes_in_group)?;
+        writeln!(f, "  Usable Blocks/Group: {}", self.usable_blocks_per_group)?;
+        writeln!(f, "  Header Region:       {}", self.rel_header_region)?;
+        writeln!(f, "  Data Bitmap Region:  {}", self.rel_data_bitmap_region)?;
+        writeln!(f, "  INode Bitmap Region: {}", self.rel_inode_bitmap_region)?;
+        writeln!(f, "  INode Table Region:  {}", self.rel_inode_table_region)?;
+        write!(f, "  Data Payload Region: {}", self.rel_data_region)
+    }
+}
+
+impl Display for Format {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "Format Configuration:")?;
+        writeln!(f, "  Block Size:       {} B", self.block_size_bytes)?;
+        writeln!(f, "  Blocks per Group: {}", self.blocks_per_group)?;
+        write!(f, "  Total Groups:     {}", self.group_count)
     }
 }

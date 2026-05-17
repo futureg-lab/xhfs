@@ -1,12 +1,6 @@
 use crate::{
-    bfs::BruteFS,
-    device::{
-        Device,
-        disk::Controller,
-        fs_device::FsDevice,
-        kv_device::{KVDevice, MemoryKV},
-        logical::LogicalDevice,
-    },
+    bfs::*,
+    device::{Device, disk::Controller, fs_device::FsDevice, kv_device::*, logical::LogicalDevice},
     utils::normalize_path,
 };
 use bytesize::ByteSize;
