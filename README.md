@@ -95,6 +95,10 @@ xhfs download test.txt my_physical_copy.txt
 
 # Installation
 
+Either download the binary from the
+[release](https://github.com/futureg-lab/xhfs/releases/tag/v0.2.2) page or
+install using cargo:
+
 ```bash
 cargo install xhfs
 ```
