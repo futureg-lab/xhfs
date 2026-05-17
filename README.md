@@ -16,9 +16,7 @@ arbitrary locations.
 
 While its core design is inspired by ext4, the primary architectural split is
 that its inode extents are organized as a linked list instead of a H Tree, which
-you may argue makes it slower for seek operations but still good enough for
-checking correctness. The mechanism it uses to reclaim and reuse freed memory to
-mitigate fragmentation is also quite different.
+you may argue makes it slower for seek operations but still good enough.
 
 # Example
 
@@ -79,10 +77,11 @@ brutefs download test.txt my_physical_copy.txt
 
 # Features
 
-- [x] File System
+- [ ] File System
   - [x] Encryption (ChaCha20 stream cipher)
   - [x] brutefs core: fopen, fwrite, fseek, mkdir, fmove, fcopy, unlink
   - [x] native symlink support: create_link
+  - [ ] native hardlink support: wip
   - [x] extra: fappend
 - [x] RAID-like configuration
   - [x] logical grouping
