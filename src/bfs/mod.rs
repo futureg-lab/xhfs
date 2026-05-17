@@ -118,16 +118,32 @@ impl BruteFS {
             offset += g.group_stride as usize;
         }
 
-        Self::from_formatted(ctrl, password).await
+        let bfs = Self::from_formatted(ctrl, password).await?;
+
+        bfs.register_node(
+            &INode {
+                kind: INodeKind::Directory,
+                inumber: 1,
+                nlink: 1,
+                total_file_size: 0,
+                extent_addr: MaybeU64::default(),
+                mtime: utc_now_u64(),
+                ctime: utc_now_u64(),
+            },
+            false,
+        )
+        .await?;
+
+        Ok(bfs)
     }
 
     pub fn resolve_inode_addr(&self, inumber: u64) -> Option<AddressSlot> {
         if let Some(group) = GroupLayout::derive_from_inode(inumber, &self.geometry) {
             let local_inode_index = (inumber - 1) % self.geometry.n_inodes_in_group;
-            let start_inode_table_addr =
-                group.g_offset + self.geometry.rel_inode_table_region.start.get();
+            let start_inode_table_addr = group.inode_table_region.start.get();
             let inode_size = INode::serialized_size();
             let inode_addr = start_inode_table_addr + (inode_size as u64 * local_inode_index);
+
             return Some(AddressSlot {
                 addr: inode_addr.into(),
                 capacity: inode_size,
@@ -137,6 +153,7 @@ impl BruteFS {
     }
 
     async fn resolve_inode(&self, inumber: u64) -> eyre::Result<Option<INode>> {
+        tracing::debug!("Resolving INode");
         if let Some((slot, group)) = self
             .resolve_inode_addr(inumber)
             .zip(GroupLayout::derive_from_inode(inumber, &self.geometry))
@@ -146,9 +163,12 @@ impl BruteFS {
                 .ctrl
                 .raw_read(bitmap_slot.addr.into(), bitmap_slot.capacity)
                 .await?;
+            tracing::debug!("Resolving INode within bitmap {bitmap_slot}");
+
             let bitmap = Bitmap::deserialize(&raw_bitmap)?;
 
             let inode_index_in_group = (inumber - 1) % self.geometry.n_inodes_in_group;
+            tracing::debug!("INode index within group is {inode_index_in_group}");
             if !bitmap
                 .get(inode_index_in_group as usize)
                 .wrap_err("Resolving INode")?
@@ -156,12 +176,88 @@ impl BruteFS {
                 return Ok(None);
             }
 
-            let raw_inode = self.ctrl.raw_read(slot.addr.into(), slot.capacity).await?;
+            // decrypt!
+            let raw_inode = self.ctrl.read(slot.addr.into(), slot.capacity).await?;
 
             return Some(INode::deserialize(&raw_inode)).transpose();
         }
 
         Ok(None)
+    }
+
+    pub async fn allocate_inode_near(
+        &self,
+        hint_inumber: u64,
+        kind: INodeKind,
+    ) -> eyre::Result<INode> {
+        let _guard = self.alloc_guard.lock().await;
+        let starting_group = GroupLayout::derive_from_inode(hint_inumber, &self.geometry)
+            .ok_or_else(|| {
+                eyre::eyre!("Unable to derive group layer from hint inumber {hint_inumber}")
+            })?;
+
+        let mut chosen_inumber = None;
+        let mut chosen_group = None;
+        let mut chosen_bitmap = None;
+
+        for i in 0..self.static_format.group_count {
+            let current_g_index = (starting_group.g_index + i) % self.static_format.group_count;
+            let group = GroupLayout::derive_from_group_index(current_g_index, &self.geometry)
+                .ok_or_else(|| {
+                    eyre::eyre!("Failed calculating group layout for index {current_g_index}")
+                })?;
+
+            let bitmap_slot = group.inode_bitmap_region.to_addr_slot();
+            let raw_bitmap = self
+                .ctrl
+                .raw_read(bitmap_slot.addr.into(), bitmap_slot.capacity)
+                .await?;
+            let bitmap = Bitmap::deserialize(&raw_bitmap)?;
+
+            let free_slots = bitmap.runs_of(false, Some(self.geometry.n_inodes_in_group as usize));
+            if let Some(slot) = free_slots.first() {
+                let absolute_inumber =
+                    (current_g_index * self.geometry.n_inodes_in_group) + (slot.start as u64) + 1;
+                chosen_inumber = Some(absolute_inumber);
+                chosen_group = Some(group);
+                chosen_bitmap = Some(bitmap);
+                break;
+            }
+        }
+
+        let (inumber, group, mut bitmap) = match (chosen_inumber, chosen_group, chosen_bitmap) {
+            (Some(num), Some(grp), Some(map)) => (num, grp, map),
+            _ => eyre::bail!("Insufficient bitmap size, required 1 byte"),
+        };
+
+        let inode = INode {
+            inumber,
+            kind,
+            nlink: 1,
+            total_file_size: 0,
+            extent_addr: MaybeU64::from(0),
+            mtime: utc_now_u64(),
+            ctime: utc_now_u64(),
+        };
+
+        let inode_slot = self.resolve_inode_addr(inumber).ok_or_else(|| {
+            eyre::eyre!(
+                "Could not map table space layout coordinates for newly chosen inumber {inumber}"
+            )
+        })?;
+
+        self.ctrl
+            .write(inode_slot.addr.into(), &inode.serialize()?)
+            .await?;
+        let inode_index_in_group = (inumber - 1) % self.geometry.n_inodes_in_group;
+        bitmap.set(inode_index_in_group as usize, true)?;
+
+        let bitmap_slot = group.inode_bitmap_region.to_addr_slot();
+        self.ctrl
+            .raw_write(bitmap_slot.addr.into(), &bitmap.serialize()?)
+            .await?;
+
+        Ok(inode)
     }
 
     async fn register_node(&self, inode: &INode, overwrite: bool) -> eyre::Result<()> {
@@ -747,10 +843,63 @@ impl BruteFS {
         Ok(())
     }
 
-    #[allow(unused)]
     pub async fn mkdir<P: Into<PathBuf>>(&self, path: P, recursive: bool) -> eyre::Result<bool> {
         let components = path_to_string_list(path);
-        todo!()
+        let mut created_new = false;
+        let mut curr_inode = self.get_root_inode().await?;
+        let at_root = components.len() <= 1;
+        for component in components.into_iter() {
+            match curr_inode.kind {
+                INodeKind::Directory => {}
+                _ => eyre::bail!("Non-directory in mkdir path"),
+            }
+            let payload = self
+                .read_full_data_from_extent(curr_inode.extent_addr)
+                .await?;
+
+            let mut directory = Directory::deserialize(&payload)?;
+            let mut found = None;
+            for (name, inumber) in &directory.entries {
+                if name == &component {
+                    found = Some(*inumber);
+                    break;
+                }
+            }
+
+            if let Some(inumber) = found {
+                curr_inode = self
+                    .resolve_inode(inumber)
+                    .await?
+                    .wrap_err_with(|| eyre::eyre!("Resolving INode {inumber}"))?;
+                continue;
+            }
+            if !recursive && !at_root {
+                eyre::bail!("Directory '{component}' does not exist");
+            }
+
+            tracing::debug!("Creating new dir inode at {component}");
+            let new_inode = self
+                .allocate_inode_near(curr_inode.inumber, INodeKind::Directory)
+                .await?;
+
+            created_new = true;
+            directory
+                .entries
+                .push((component.clone(), new_inode.inumber));
+            let dir_data = directory.serialize()?;
+
+            let old_extent_addr = curr_inode.extent_addr;
+            curr_inode.extent_addr = self.allocate_and_write_extent(dir_data).await?;
+            curr_inode.mtime = utc_now_u64();
+
+            // commit
+            self.register_node(&curr_inode, true).await?;
+            self.free_full_extent(old_extent_addr).await?;
+
+            curr_inode = new_inode;
+        }
+
+        Ok(created_new)
     }
 
     #[async_recursion(?Send)]
@@ -899,15 +1048,6 @@ impl BruteFS {
         ))
     }
 
-    pub async fn mark_as_reusable(&self, new_slot_value: AddressSlot) -> eyre::Result<()> {
-        tracing::debug!(
-            "Marking slot 0x{:x} of size {} as reusable",
-            new_slot_value.addr.get(),
-            new_slot_value.capacity
-        );
-        todo!()
-    }
-
     pub async fn exists<P: Into<PathBuf>>(&self, path: P) -> eyre::Result<bool> {
         Ok(self.stats(path).await?.is_some())
     }
@@ -944,43 +1084,255 @@ impl BruteFS {
         }))
     }
 
-    #[allow(unused)]
     pub async fn allocate(&self, wanted_size: usize) -> Result<u64, BruteFsError> {
-        tracing::debug!("Trying to allocate {wanted_size} B");
-        let _guard = self.alloc_guard.lock().await;
+        tracing::debug!("Trying to allocate {wanted_size} blocks");
 
-        //  BruteFsError::Insufficient {
-        //     wanted: usize,
-        //     max_slot_size: usize,
-        //     min_slot_size: usize,
-        // }
-        let mut max_slot_size = u32::MIN;
-        let mut max_slot_size = u32::MAX;
+        let _guard = self.alloc_guard.lock().await;
+        let mut max_slot_size = usize::MIN;
+        let mut min_slot_size = usize::MAX;
+        let mut found = None;
+        let mut free_slot_sizes = vec![];
         for g_index in 0..self.static_format.group_count {
             let group =
                 GroupLayout::derive_from_group_index(g_index, &self.geometry).ok_or_else(|| {
                     eyre::eyre!("Failed calculating group layout for index {g_index}")
                 })?;
 
-            let slot = group.data_bitmap_region.to_addr_slot();
-            let raw_bitmap = self.ctrl.raw_read(slot.addr.into(), slot.capacity).await?;
+            let bitmap_slot = group.data_bitmap_region.to_addr_slot();
+            let raw_bitmap = self
+                .ctrl
+                .raw_read(bitmap_slot.addr.into(), bitmap_slot.capacity)
+                .await?;
             let bitmap = Bitmap::deserialize(&raw_bitmap)?;
 
-            // for i in 0..self.geometry.usable_blocks_per_group as usize {
-            //     if !bitmap
-            //         .get(i)
-            //         .wrap_err("Parsing block map allocation state")?
-            //     {
-            //         free_blocks += 1;
-            //     }
-            // }
+            let zero_runs =
+                bitmap.runs_of(false, Some(self.geometry.usable_blocks_per_group as usize));
+            for slot in zero_runs {
+                max_slot_size = max_slot_size.max(slot.size);
+                min_slot_size = min_slot_size.min(slot.size);
+                free_slot_sizes.push(slot.size * self.static_format.block_size_bytes as usize);
+                if slot.size >= wanted_size {
+                    found = Some((slot.start, group, bitmap, bitmap_slot.addr));
+                    break;
+                }
+            }
+
+            if found.is_some() {
+                break;
+            }
         }
-        todo!()
+
+        if let Some((start_block, group, mut bitmap, bitmap_addr)) = found {
+            let data_offset = group.data_region.start.get();
+            let addr = data_offset + (start_block as u64) * self.static_format.block_size_bytes;
+            bitmap.set_range(start_block, wanted_size, true)?;
+            // commit
+            self.ctrl
+                .raw_write(bitmap_addr.into(), &bitmap.serialize()?)
+                .await?;
+            return Ok(addr);
+        }
+
+        Err(BruteFsError::Insufficient {
+            free_slot_sizes,
+            wanted: wanted_size,
+            max_slot_size: if max_slot_size == usize::MIN {
+                0
+            } else {
+                max_slot_size
+            },
+            min_slot_size: if min_slot_size == usize::MAX {
+                0
+            } else {
+                min_slot_size
+            },
+        })
+    }
+
+    pub async fn mark_as_reusable(&self, addr_slot: AddressSlot) -> eyre::Result<()> {
+        let addr = addr_slot.addr.get();
+        let size = addr_slot.capacity;
+        tracing::debug!("Marking slot 0x{addr:x} of size {size} as reusable");
+
+        let group = GroupLayout::derive_from_address(addr, &self.geometry)
+            .ok_or_else(|| eyre::eyre!("Could not derive group for address slot {addr_slot}"))?;
+
+        let bitmap_slot = group.data_bitmap_region.to_addr_slot();
+        let raw_bitmap = self
+            .ctrl
+            .raw_read(bitmap_slot.addr.into(), bitmap_slot.capacity)
+            .await?;
+        let mut bitmap = Bitmap::deserialize(&raw_bitmap)?;
+
+        let block_start =
+            (addr - group.data_region.start.get()) / self.static_format.block_size_bytes as u64;
+        let blocks_count = size / self.static_format.block_size_bytes as usize;
+
+        bitmap.set_range(block_start as usize, blocks_count, false)?;
+
+        // commit
+        self.ctrl
+            .raw_write(bitmap_slot.addr.into(), &bitmap.serialize()?)
+            .await
+    }
+
+    pub async fn allocate_and_write_extent(&self, data: Vec<u8>) -> Result<MaybeU64, BruteFsError> {
+        tracing::debug!(
+            "Trying to allocate and write {} B into one or many extents",
+            data.len()
+        );
+
+        let single_extent_needed_blocks = (Extent::emulate_serialized_size(data.len())
+            + self.static_format.block_size_bytes as usize
+            - 1)
+            / self.static_format.block_size_bytes as usize;
+
+        match self.allocate(single_extent_needed_blocks).await {
+            Ok(addr) => {
+                self.ctrl
+                    .write(
+                        addr as usize,
+                        &Extent {
+                            next: MaybeU64::default(),
+                            data,
+                        }
+                        .serialize()
+                        .map_err(|e| BruteFsError::Error { err: e.to_string() })?,
+                    )
+                    .await
+                    .map_err(|e| BruteFsError::Error { err: e.to_string() })?;
+
+                return Ok(MaybeU64::from(addr));
+            }
+            // fallback to fragmented layout planning
+            Err(BruteFsError::Insufficient {
+                free_slot_sizes, ..
+            }) => {
+                if free_slot_sizes.is_empty() {
+                    return Err(BruteFsError::Insufficient {
+                        wanted: single_extent_needed_blocks,
+                        max_slot_size: 0,
+                        min_slot_size: 0,
+                        free_slot_sizes,
+                    });
+                }
+
+                let mut available_slots = free_slot_sizes;
+                available_slots.sort_by(|a, b| b.cmp(a));
+
+                let mut data_slice = &data[..];
+                let mut allocation_plan = vec![];
+                for slot_blocks in available_slots {
+                    if data_slice.is_empty() {
+                        break;
+                    }
+                    let slot_bytes_capacity =
+                        slot_blocks * self.static_format.block_size_bytes as usize;
+
+                    let metadata_overhead = Extent::emulate_serialized_size(0);
+                    if slot_bytes_capacity <= metadata_overhead {
+                        continue; // slot too microscopic to even store an extent header
+                    }
+
+                    let max_payload_for_slot = slot_bytes_capacity - metadata_overhead;
+                    let chunk_size = std::cmp::min(data_slice.len(), max_payload_for_slot);
+
+                    let needed_bytes = Extent::emulate_serialized_size(chunk_size);
+                    let needed_blocks =
+                        (needed_bytes + self.static_format.block_size_bytes as usize - 1)
+                            / self.static_format.block_size_bytes as usize;
+                    match self.allocate(needed_blocks).await {
+                        Ok(addr) => {
+                            let (current_chunk, remaining) = data_slice.split_at(chunk_size);
+                            allocation_plan.push((addr, current_chunk.to_vec()));
+                            data_slice = remaining;
+                        }
+                        Err(_) => {
+                            // alloc can fail due to race conditions or bitmap layout variations
+                            continue;
+                        }
+                    }
+                }
+
+                // we might run out of space options before consuming the input data payload
+                if !data_slice.is_empty() {
+                    // Note: inefficient, but alloc are upfront cost so..
+                    // rollback allocated segments to prevent storage leaks
+                    for (addr, chunk) in allocation_plan {
+                        let needed_bytes = Extent::emulate_serialized_size(chunk.len());
+                        let capacity =
+                            ((needed_bytes + self.static_format.block_size_bytes as usize - 1)
+                                / self.static_format.block_size_bytes as usize)
+                                * self.static_format.block_size_bytes as usize;
+
+                        let _ = self
+                            .mark_as_reusable(AddressSlot {
+                                addr: MaybeU64::from(addr),
+                                capacity,
+                            })
+                            .await;
+                    }
+
+                    return Err(BruteFsError::Insufficient {
+                        wanted: single_extent_needed_blocks,
+                        max_slot_size: 0,
+                        min_slot_size: 0,
+                        free_slot_sizes: vec![],
+                    });
+                }
+
+                // TODO:
+                // we own a lock but I think best is have in storage lock at this point
+
+                // commmit!
+                let mut next_link = MaybeU64::default();
+                for (addr, chunk_data) in allocation_plan.into_iter().rev() {
+                    let extent = Extent {
+                        next: next_link,
+                        data: chunk_data,
+                    };
+
+                    self.ctrl
+                        .write(
+                            addr as usize,
+                            &extent
+                                .serialize()
+                                .map_err(|e| BruteFsError::Error { err: e.to_string() })?,
+                        )
+                        .await
+                        .map_err(|e| BruteFsError::Error { err: e.to_string() })?;
+
+                    next_link = MaybeU64::from(addr);
+                }
+
+                Ok(next_link)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     pub async fn free_full_extent(&self, start_extent_addr: MaybeU64) -> eyre::Result<()> {
-        tracing::debug!("Freeing extent at 0x{:x}", start_extent_addr.get());
-        todo!()
+        tracing::debug!(
+            "Freeing extent chain starting at 0x{:x}",
+            start_extent_addr.get()
+        );
+
+        let mut addr = start_extent_addr;
+        while let Some(current_addr) = addr.to_optional() {
+            let extent = self.read_extent(current_addr).await?;
+            let next_hop = extent.next;
+
+            let physical_capacity = self.static_format.block_size_bytes as usize;
+            self.mark_as_reusable(AddressSlot {
+                addr: MaybeU64::from(current_addr),
+                capacity: physical_capacity,
+            })
+            .await?;
+
+            addr = next_hop;
+        }
+
+        Ok(())
     }
 
     pub async fn free_all<A>(&self, addresses: A) -> eyre::Result<()>

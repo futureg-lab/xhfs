@@ -79,6 +79,7 @@ pub enum BruteFsError {
         wanted: usize,
         max_slot_size: usize,
         min_slot_size: usize,
+        free_slot_sizes: Vec<usize>,
     },
     Error {
         err: String,
@@ -92,10 +93,12 @@ impl Display for BruteFsError {
                 wanted,
                 max_slot_size,
                 min_slot_size,
+                free_slot_sizes,
             } => {
                 write!(
                     f,
-                    "Insufficient space, operation requires {wanted} B, fragment available max {max_slot_size} B, min {min_slot_size}"
+                    "Insufficient space, operation requires {wanted} B, found {} fragments: available max {max_slot_size} B, min {min_slot_size}",
+                    free_slot_sizes.len()
                 )
             }
             BruteFsError::Error { err } => write!(f, "{err}"),
@@ -303,8 +306,12 @@ impl Extent {
         })
     }
 
+    pub fn emulate_serialized_size(data_len: usize) -> usize {
+        8 + 8 + data_len
+    }
+
     pub fn serialized_size(&self) -> usize {
-        8 + 8 + self.data.len()
+        Self::emulate_serialized_size(self.data.len())
     }
 }
 
@@ -749,6 +756,20 @@ impl Bitmap {
         }
 
         runs
+    }
+
+    pub fn set_range(&mut self, start: usize, length: usize, value: bool) -> eyre::Result<()> {
+        let end = start + length;
+        if end > self.map.len() {
+            return Err(eyre::eyre!(
+                "Out of bounds: range {}..{} exceeds bitmap capacity {}",
+                start,
+                end,
+                self.map.len()
+            ));
+        }
+        self.map[start..end].fill(value);
+        Ok(())
     }
 
     pub fn serialize(&self) -> eyre::Result<Vec<u8>> {
