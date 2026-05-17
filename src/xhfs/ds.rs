@@ -385,10 +385,10 @@ impl INode {
 
 impl Display for INode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "- Number of Links: {:?}", self.nlink)?;
+        writeln!(f, "- Number of Links: {}", self.nlink)?;
         writeln!(f, "- Kind: {:?}", self.kind)?;
         if !matches!(self.kind, INodeKind::Directory) {
-            write!(f, "- Size: {} B", self.total_file_size)?;
+            writeln!(f, "- Size: {} B", self.total_file_size)?;
         }
         writeln!(f, "- Creation time: {}", u64_to_utc_datetime(self.ctime))?;
         writeln!(
@@ -922,7 +922,7 @@ impl Display for GeometryLayout {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "Geometry Layout (relative):")?;
         writeln!(f, "  Group Stride:        {} B", self.group_stride)?;
-        writeln!(f, "  Inodes per Group:    {}", self.n_inodes_in_group)?;
+        writeln!(f, "  INodes per Group:    {}", self.n_inodes_in_group)?;
         writeln!(f, "  Usable Blocks/Group: {}", self.usable_blocks_per_group)?;
         writeln!(f, "  Header Region:       {}", self.rel_header_region)?;
         writeln!(f, "  Data Bitmap Region:  {}", self.rel_data_bitmap_region)?;

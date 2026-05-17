@@ -1,14 +1,14 @@
 [package]
 edition = "2024"
 name = "xhfs"
-version = "0.2.0"
+version = "0.2.1"
 license = "MPL-2.0"
 description = "Bruteforce your way into storing files anywhere across an arbitrary combination of arbitrary devices."
 authors = ["michael-0acf4 <root@afmichael.dev>"]
 repository = "https://github.com/futureg-lab/xhfs"
 readme = "README.md"
 keywords = ["fs", "storage", "io"]
-categories = ["command-line-utilities", "filesystem", "storage", "engine"]
+categories = ["command-line-utilities", "filesystem", "database-implementations"]
 include = [
     "src/**/*.rs",
     "Cargo.toml",

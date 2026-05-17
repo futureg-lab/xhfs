@@ -37,7 +37,7 @@ pub enum Commands {
     /// Format a new XHFS
     Format(GlobalOptions),
     /// Show XHFS/device information
-    Infos(GlobalOptions),
+    Info(GlobalOptions),
     /// XHFS operations
     X(FsCommands),
     /// Inspect current filesystem
@@ -166,7 +166,7 @@ impl MainCommand {
                 out.flush().await?;
             }
             Commands::X(x) => x.run().await?,
-            Commands::Infos(global_options) => {
+            Commands::Info(global_options) => {
                 let bfs = global_options.get_bfs().await?;
                 println!("{}", bfs.format_headers_report().await?);
             }

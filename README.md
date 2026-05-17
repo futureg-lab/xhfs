@@ -20,20 +20,17 @@ you may argue makes it slower for seek operations but still good enough.
 
 # Use-cases
 
-- Basic: You can setup blob file replicas accross drives on top of your local
+- Basic: You can setup blob file replicas across drives on top of your local
   filesystem.
-
 - As a storage layer on top of an existing one:
-  - Split your XHFS storage into multiple files, and store that on a localled
-    synchronized folder using nullfs, Google Drive, Mega, Onedrive, Syncthing or
-    anything similar: you get encrypted storage layer that can be shared
+  - Split your XHFS storage into multiple files, then store them on a locally
+    synchronized folder using nullfs, Syncthing, Google Drive, Mega, OneDrive or
+    anything similar. You get an encrypted storage layer that can be shared
     publicly + automatic backups.
-
-- Distributed: Out of the box, XHFS makes no assumption on the underlying device
-  as long as we can read/write arbitrary data.
-
+- Distributed: Out of the box, XHFS makes no assumptions about the underlying
+  device as long as we can read/write/seek arbitrary data.
 - As Yet Another Filesystem: The wiring is already there, you can hack your way
-  into formating a physical block device, or write a driver for it.
+  into formatting a physical block device or write a driver for it.
 
 # Example
 
@@ -76,7 +73,8 @@ configuration:
   layout: [dev1, dev2]
 ```
 
-All you have to do left is format the drive if not done yet then play with it.
+All that is left to do is format the drive (if you haven't done so yet) and then
+start playing with it.
 
 ```bash
 # setup the File System if not formatted yet
@@ -134,16 +132,16 @@ cargo install xhfs
 
 # Inspection tools
 
-The command line has a few sets of utilities you can use to inspect the
+The command line provides a few sets of utilities you can use to inspect the
 formatted filesystem.
 
 ## General state
 
 ```bash
-xhfs infos
+xhfs info
 ```
 
-The infos command will show you the general layout of what constitutes your
+The `info` command will show you the general layout of what constitutes your
 storage, this includes the remaining usable space and metadata layout.
 
 ```
