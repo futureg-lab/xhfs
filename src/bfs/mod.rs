@@ -120,7 +120,7 @@ impl BruteFS {
 
         let bfs = Self::from_formatted(ctrl, password).await?;
 
-        bfs.register_node(
+        bfs.register_inode(
             &INode {
                 kind: INodeKind::Directory,
                 inumber: 1,
@@ -153,7 +153,7 @@ impl BruteFS {
     }
 
     async fn resolve_inode(&self, inumber: u64) -> eyre::Result<Option<INode>> {
-        tracing::debug!("Resolving INode");
+        tracing::debug!("Resolving INode {inumber}");
         if let Some((slot, group)) = self
             .resolve_inode_addr(inumber)
             .zip(GroupLayout::derive_from_inode(inumber, &self.geometry))
@@ -163,15 +163,15 @@ impl BruteFS {
                 .ctrl
                 .raw_read(bitmap_slot.addr.into(), bitmap_slot.capacity)
                 .await?;
-            tracing::debug!("Resolving INode within bitmap {bitmap_slot}");
+            tracing::debug!("Resolving INode {inumber} within bitmap {bitmap_slot}");
 
             let bitmap = Bitmap::deserialize(&raw_bitmap)?;
 
             let inode_index_in_group = (inumber - 1) % self.geometry.n_inodes_in_group;
-            tracing::debug!("INode index within group is {inode_index_in_group}");
+            tracing::debug!("INode {inumber} index within group is {inode_index_in_group}");
             if !bitmap
                 .get(inode_index_in_group as usize)
-                .wrap_err("Resolving INode")?
+                .wrap_err("Resolving INode within bitmap")?
             {
                 return Ok(None);
             }
@@ -185,9 +185,49 @@ impl BruteFS {
         Ok(None)
     }
 
+    async fn delete_inode_with_extent(&self, inumber: u64) -> eyre::Result<bool> {
+        tracing::debug!("Resolving INode {inumber} for deletion");
+        let _guard = self.alloc_guard.lock().await;
+        let group = GroupLayout::derive_from_inode(inumber, &self.geometry)
+            .ok_or_else(|| eyre::eyre!("Unable to derive group layout for inumber {inumber}"))?;
+
+        let bitmap_slot = group.inode_bitmap_region.to_addr_slot();
+        let raw_bitmap = self
+            .ctrl
+            .raw_read(bitmap_slot.addr.into(), bitmap_slot.capacity)
+            .await?;
+
+        let mut bitmap = Bitmap::deserialize(&raw_bitmap)?;
+        let inode_index_in_group = (inumber - 1) % self.geometry.n_inodes_in_group;
+        if !bitmap
+            .get(inode_index_in_group as usize)
+            .wrap_err("Resolving INode within bitmap for deletion")?
+        {
+            return Ok(false);
+        }
+
+        if let Some(inode) = self.resolve_inode(inumber).await? {
+            tracing::debug!(
+                "Cascading deletion to extent chain starting at 0x{:x}",
+                inode.extent_addr.get()
+            );
+            self.free_full_extent(inode.extent_addr).await?;
+        }
+
+        bitmap.set(inode_index_in_group as usize, false)?;
+
+        // commit
+        self.ctrl
+            .raw_write(bitmap_slot.addr.into(), &bitmap.serialize()?)
+            .await?;
+
+        Ok(true)
+    }
+
     pub async fn allocate_inode_near(
         &self,
         hint_inumber: u64,
+        extent_addr: MaybeU64,
         kind: INodeKind,
     ) -> eyre::Result<INode> {
         let _guard = self.alloc_guard.lock().await;
@@ -235,7 +275,7 @@ impl BruteFS {
             kind,
             nlink: 1,
             total_file_size: 0,
-            extent_addr: MaybeU64::from(0),
+            extent_addr,
             mtime: utc_now_u64(),
             ctime: utc_now_u64(),
         };
@@ -260,7 +300,7 @@ impl BruteFS {
         Ok(inode)
     }
 
-    async fn register_node(&self, inode: &INode, overwrite: bool) -> eyre::Result<()> {
+    async fn register_inode(&self, inode: &INode, overwrite: bool) -> eyre::Result<()> {
         let _guard = self.alloc_guard.lock().await;
         let group = GroupLayout::derive_from_inode(inode.inumber, &self.geometry)
             .wrap_err("Unable to derive group when registering INode")?;
@@ -371,7 +411,7 @@ impl BruteFS {
 
     pub async fn resolve_path<P: Into<PathBuf>>(&self, path: P) -> eyre::Result<INode> {
         let path: PathBuf = path.into();
-        tracing::debug!("Resolving {path:?}");
+        tracing::debug!("Resolving path {path:?}");
         let components = path_to_string_list(path);
         let mut inode = self.get_root_inode().await?;
 
@@ -379,8 +419,10 @@ impl BruteFS {
             match inode.kind {
                 INodeKind::Directory => {
                     tracing::debug!(" > Enter dir {component}");
-                    let payload = self.read_full_data_from_extent(inode.extent_addr).await?;
-                    let directory = Directory::deserialize(&payload)?;
+                    let directory = {
+                        let payload = self.read_full_data_from_extent(inode.extent_addr).await?;
+                        Directory::deserialize(&payload)?
+                    };
 
                     let child_inumber = directory
                         .entries
@@ -439,8 +481,10 @@ impl BruteFS {
         let inode = self.resolve_path(&path).await?;
         match inode.kind {
             INodeKind::Directory => {
-                let payload = self.read_full_data_from_extent(inode.extent_addr).await?;
-                let directory = Directory::deserialize(&payload)?;
+                let directory = {
+                    let payload = self.read_full_data_from_extent(inode.extent_addr).await?;
+                    Directory::deserialize(&payload)?
+                };
                 Ok(directory
                     .entries
                     .into_iter()
@@ -581,71 +625,53 @@ impl BruteFS {
         Ok(())
     }
 
-    #[allow(unused)]
     pub async fn unlink<P: Into<PathBuf>>(&self, path: P) -> eyre::Result<()> {
-        // let path: PathBuf = path.into();
-        // let (mut parent_inode, filename) = self.resolve_parent(&path).await?;
-        // let payload = self
-        //     .read_full_data_from_extent(parent_inode.extent_addr)
-        //     .await?;
+        let path: PathBuf = path.into();
+        let (mut parent_inode, filename) = self.resolve_parent(&path).await?;
+        let old_parent_extent_addr = parent_inode.extent_addr;
+        let mut directory = {
+            let payload = self
+                .read_full_data_from_extent(parent_inode.extent_addr)
+                .await?;
+            Directory::deserialize(&payload)
+        }?;
 
-        // let mut directory = Directory::deserialize(&payload)?;
-        // let entry_index = directory
-        //     .entries
-        //     .iter()
-        //     .position(|(name, _)| name == &filename)
-        //     .ok_or_else(|| eyre::eyre!("Path does not exist"))?;
+        let entry_index = directory
+            .entries
+            .iter()
+            .position(|(name, _)| name == &filename)
+            .ok_or_else(|| eyre::eyre!("Path does not exist"))?;
 
-        // let (_, inode_addr) = directory.entries.remove(entry_index);
-        // let inode = INode::deserialize(
-        //     &self
-        //         .ctrl
-        //         .read(inode_addr as usize, INode::serialized_size())
-        //         .await?,
-        // )?;
+        let (_, inumber) = directory.entries.remove(entry_index);
+        let inode = self
+            .resolve_inode(inumber)
+            .await?
+            .ok_or_else(|| eyre::eyre!("Resolving INode number {inumber} in direntry"))?;
 
-        // let mut maybe_garbages = vec![];
-        // match inode.kind {
-        //     INodeKind::File | INodeKind::Symlink => {
-        //         self.free_full_extent(inode.extent_addr).await?;
-        //     }
-        //     INodeKind::Directory => {
-        //         let dir_payload = self.read_full_data_from_extent(inode.extent_addr).await?;
-        //         let dir = Directory::deserialize(&dir_payload)?;
-        //         if !dir.entries.is_empty() {
-        //             eyre::bail!("Directory is not empty");
-        //         }
+        if let INodeKind::Directory = inode.kind {
+            let dir_payload = self.read_full_data_from_extent(inode.extent_addr).await?;
+            let dir = Directory::deserialize(&dir_payload)?;
+            if !dir.entries.is_empty() {
+                eyre::bail!("Directory is not empty");
+            }
+        }
 
-        //         maybe_garbages.push(inode.extent_addr);
-        //     }
-        // }
+        // commit sequence
+        {
+            let deleted = self.delete_inode_with_extent(inode.inumber).await?;
+            if !deleted {
+                eyre::bail!("Failed to delete target inode or already unallocated");
+            }
+            let new_dir_extent_addr = self
+                .allocate_and_write_extent(directory.serialize()?)
+                .await?;
 
-        // tracing::debug!("Rewrite parent directory entries");
-        // maybe_garbages.push(parent_inode.extent_addr);
+            parent_inode.extent_addr = new_dir_extent_addr;
+            parent_inode.mtime = utc_now_u64();
+            self.register_inode(&parent_inode, true).await?;
+            self.free_full_extent(old_parent_extent_addr).await?;
+        }
 
-        // let new_dir_extent = Extent {
-        //     next: MaybeU64::default(),
-        //     data: directory.serialize()?,
-        // };
-        // let new_dir_extent_addr = self.allocate(new_dir_extent.serialized_size()).await?;
-        // self.ctrl
-        //     .write(new_dir_extent_addr as usize, &new_dir_extent.serialize()?)
-        //     .await?;
-
-        // parent_inode.extent_addr = MaybeU64::from(new_dir_extent_addr);
-        // parent_inode.mtime = utc_now_u64();
-
-        // self.ctrl
-        //     .write(parent_addr as usize, &parent_inode.serialize()?)
-        //     .await?;
-
-        // self.mark_as_reusable(AddressSlot {
-        //     addr: MaybeU64::from(inode_addr),
-        //     capacity: INode::serialized_size(),
-        // })
-        // .await?;
-
-        // self.free_all(maybe_garbages).await?;
         Ok(())
     }
 
@@ -666,14 +692,18 @@ impl BruteFS {
         }
 
         let path: PathBuf = path.into();
+        tracing::debug!("Trying to write into {}", path.display());
         let (mut parent_inode, filename) = self.resolve_parent(&path).await?;
         let payload = self
             .read_full_data_from_extent(parent_inode.extent_addr)
             .await?;
 
         let mut directory = Directory::deserialize(&payload)?;
+        println!("{directory:?}");
+        tracing::debug!("Looking for dir entries of the same name as '{filename}'");
         for (name, inumber) in &directory.entries {
             if name == &filename {
+                tracing::debug!("FOUND dir entry of the same name as '{filename}'");
                 let mut inode = self
                     .resolve_inode(*inumber)
                     .await?
@@ -687,16 +717,7 @@ impl BruteFS {
                         }
 
                         let old_extent_addr = inode.extent_addr;
-                        let extent = Extent {
-                            next: MaybeU64::default(),
-                            data,
-                        };
-                        let extent_addr = self.allocate(extent.serialized_size()).await?;
-
-                        self.ctrl
-                            .write(extent_addr as usize, &extent.serialize()?)
-                            .await?;
-                        inode.extent_addr = MaybeU64::from(extent_addr);
+                        inode.extent_addr = self.allocate_and_write_extent(data).await?;
                         inode.mtime = utc_now_u64();
                         self.update_inode(inode).await?;
 
@@ -713,53 +734,36 @@ impl BruteFS {
             }
         }
 
-        tracing::debug!("Creating new file");
-        let file_size = data.len() as u64;
-        let extent = Extent {
-            next: MaybeU64::default(),
-            data,
-        };
+        let size = data.len();
+        tracing::debug!("Creating new file of size {size} B");
+        let extent_addr = self.allocate_and_write_extent(data).await?;
 
-        let extent_addr = self.allocate(extent.serialized_size()).await?;
-        self.ctrl
-            .write(extent_addr as usize, &extent.serialize()?)
+        // assume we never run of INodes
+        let mut inode = self
+            .allocate_inode_near(
+                parent_inode.inumber,
+                extent_addr,
+                if is_symlink {
+                    INodeKind::Symlink
+                } else {
+                    INodeKind::File
+                },
+            )
+            .await?;
+        inode.total_file_size = size as u64;
+
+        directory.entries.push((filename, inode.inumber));
+
+        let new_dir_extent_addr = self
+            .allocate_and_write_extent(directory.serialize()?)
             .await?;
 
-        // println!("File size {filename} => {file_size} B");
-
-        let inode = INode {
-            inumber: 4,
-            nlink: 42,
-            ctime: utc_now_u64(),
-            mtime: utc_now_u64(),
-            total_file_size: file_size,
-            extent_addr: MaybeU64::from(extent_addr),
-            kind: if is_symlink {
-                INodeKind::Symlink
-            } else {
-                INodeKind::File
-            },
-        };
-        let inode_addr = self.allocate(INode::serialized_size()).await?;
-        self.ctrl
-            .write(inode_addr as usize, &inode.serialize()?)
-            .await?;
-        directory.entries.push((filename, inode_addr));
-
-        let new_dir_extent = Extent {
-            next: MaybeU64::default(),
-            data: directory.serialize()?,
-        };
-        let new_dir_extent_addr = self.allocate(new_dir_extent.serialized_size()).await?;
-        self.ctrl
-            .write(new_dir_extent_addr as usize, &new_dir_extent.serialize()?)
-            .await?;
         let old_parent_extent = parent_inode.extent_addr;
-        parent_inode.extent_addr = MaybeU64::from(new_dir_extent_addr);
+        parent_inode.extent_addr = new_dir_extent_addr;
         parent_inode.mtime = utc_now_u64();
 
+        // commit
         self.update_inode(parent_inode).await?;
-
         self.free_full_extent(old_parent_extent).await?;
 
         Ok(())
@@ -879,7 +883,11 @@ impl BruteFS {
 
             tracing::debug!("Creating new dir inode at {component}");
             let new_inode = self
-                .allocate_inode_near(curr_inode.inumber, INodeKind::Directory)
+                .allocate_inode_near(
+                    curr_inode.inumber,
+                    MaybeU64::default(),
+                    INodeKind::Directory,
+                )
                 .await?;
 
             created_new = true;
@@ -893,7 +901,7 @@ impl BruteFS {
             curr_inode.mtime = utc_now_u64();
 
             // commit
-            self.register_node(&curr_inode, true).await?;
+            self.register_inode(&curr_inode, true).await?;
             self.free_full_extent(old_extent_addr).await?;
 
             curr_inode = new_inode;
@@ -910,7 +918,10 @@ impl BruteFS {
             INodeKind::Directory => Err(BruteFsError::from_report(eyre::eyre!(
                 "Cannot fread directory"
             ))),
-            INodeKind::File => self.read_full_data_from_extent(inode.extent_addr).await,
+            INodeKind::File => {
+                tracing::debug!("Trying to read file from path {}", path.display());
+                self.read_full_data_from_extent(inode.extent_addr).await
+            }
             INodeKind::Symlink => {
                 tracing::debug!("Trying to read file from symlink");
                 let raw_path = self.read_full_data_from_extent(inode.extent_addr).await?;
@@ -1013,7 +1024,7 @@ impl BruteFS {
 
     pub async fn update_inode(&self, mut inode: INode) -> eyre::Result<()> {
         inode.mtime = utc_now_u64();
-        self.register_node(&inode, true).await
+        self.register_inode(&inode, true).await
     }
 
     pub async fn read_extent(&self, addr: u64) -> Result<Extent, BruteFsError> {
@@ -1318,11 +1329,13 @@ impl BruteFS {
         );
 
         let mut addr = start_extent_addr;
+        let block_size = self.static_format.block_size_bytes as usize;
         while let Some(current_addr) = addr.to_optional() {
             let extent = self.read_extent(current_addr).await?;
             let next_hop = extent.next;
 
-            let physical_capacity = self.static_format.block_size_bytes as usize;
+            let exact_bytes = extent.serialized_size();
+            let physical_capacity = ((exact_bytes + block_size - 1) / block_size) * block_size;
             self.mark_as_reusable(AddressSlot {
                 addr: MaybeU64::from(current_addr),
                 capacity: physical_capacity,
@@ -1396,6 +1409,11 @@ impl BruteFS {
         while let Some(next_addr) = addr.to_optional() {
             tracing::debug!("Resolving extent 0x{next_addr:x}");
             let extent = self.read_extent(next_addr).await?;
+            tracing::debug!(
+                "  Extent at 0x{:x} is of size {} B",
+                next_addr,
+                extent.data.len()
+            );
             addr = extent.next;
             data.extend(extent.data);
         }

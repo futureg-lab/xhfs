@@ -75,7 +75,7 @@ pub struct UploadCommand {
     /// Local source file
     pub src_path: PathBuf,
     /// Destination path inside brutefs
-    pub dest_path: PathBuf,
+    pub dest_path: Option<PathBuf>,
     #[arg(short, long, default_value = "false")]
     pub overwrite: bool,
     #[arg(short, long, default_value = "1024")]
@@ -112,9 +112,19 @@ impl MainCommand {
             Commands::Upload(u) => {
                 let bfs = u.global.get_bfs().await?;
                 let data = fs::read(&u.src_path).await?;
+                let dest_path = match &u.dest_path {
+                    Some(path) => path.to_owned(),
+                    None => PathBuf::from(u.src_path.file_name().ok_or_else(|| {
+                        eyre::eyre!(
+                            "Could not derive destination path from source {}",
+                            u.src_path.display()
+                        )
+                    })?),
+                };
+
                 if u.single_block {
                     bfs.fwrite(
-                        &u.dest_path,
+                        &dest_path,
                         data,
                         WriteOption {
                             overwrite: u.overwrite,
@@ -124,7 +134,7 @@ impl MainCommand {
                 } else {
                     let file = File::open(&u.src_path).await?;
                     bfs.fwrite_stream(
-                        &u.dest_path,
+                        &dest_path,
                         file,
                         u.block_size,
                         WriteOption {

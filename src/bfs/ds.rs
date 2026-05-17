@@ -11,6 +11,9 @@ pub enum INodeKind {
     File,
     Directory,
     Symlink,
+    // TODO: hardlinks are easy doable!
+    // payload is inumber instead of path + increase nlink
+    // Hardlink,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -377,14 +380,15 @@ impl INode {
 
 impl Display for INode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "- Kind: {:?}\n", self.kind)?;
+        writeln!(f, "- Number of Links: {:?}", self.nlink)?;
+        writeln!(f, "- Kind: {:?}", self.kind)?;
         if !matches!(self.kind, INodeKind::Directory) {
-            write!(f, "- Size: {} B\n", self.total_file_size)?;
+            write!(f, "- Size: {} B", self.total_file_size)?;
         }
-        write!(f, "- Creation time: {}\n", u64_to_utc_datetime(self.ctime))?;
-        write!(
+        writeln!(f, "- Creation time: {}", u64_to_utc_datetime(self.ctime))?;
+        writeln!(
             f,
-            "- Modification time: {}\n",
+            "- Modification time: {}",
             u64_to_utc_datetime(self.mtime)
         )?;
         write!(
