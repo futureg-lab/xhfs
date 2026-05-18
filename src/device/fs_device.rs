@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use std::path::PathBuf;
 use tokio::{
     fs::{self, OpenOptions},
-    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
+    io::{AsyncSeekExt, AsyncWriteExt},
 };
 
 pub struct FsDevice {
@@ -69,10 +69,12 @@ impl Device for FsDevice {
         file.seek(std::io::SeekFrom::Start(addr as u64)).await?;
 
         let mut buf = vec![0u8; size];
-        let read = file.read(&mut buf).await?;
-        if read != size {
-            eyre::bail!("short read: expected {} bytes got {}", size, read);
-        }
+
+        // Note:
+        // read_exact will internally loop, repoll, and handle
+        // It will only fail if it hits an actual physical EOF early
+        // When the file block is too large, we can hit a short read with basic read
+        tokio::io::AsyncReadExt::read_exact(&mut file, &mut buf).await?;
 
         Ok(buf)
     }

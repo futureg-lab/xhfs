@@ -37,6 +37,12 @@ pub struct WriteOption {
     pub overwrite: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct AllocationSlot {
+    pub absolute_byte_addr: u64,
+    pub block_count: usize,
+}
+
 impl XHFS {
     pub async fn from_formatted(ctrl: Controller, password: Option<String>) -> eyre::Result<Self> {
         let header_size = XHFSHeader::template().serialize()?.len();
@@ -45,23 +51,19 @@ impl XHFS {
             ctrl,
             alloc_guard: Mutex::new(()),
             static_format: Format {
+                param_data_block_count_per_group: 0,
+                param_inode_count_per_group: 0,
                 block_size_bytes: 0,
-                blocks_per_group: 0,
                 group_count: 0,
             },
             geometry: Default::default(),
         };
 
         let header = bfs.get_header().await?;
-        let total_bytes = bfs
-            .ctrl
-            .total_capacity()
-            .ok_or_else(|| eyre::eyre!("Failed calculating total capacity"))?;
 
         bfs.geometry = header.calculate_relative_geometry()?.0;
         bfs.static_format = header.format;
-        bfs.static_format
-            .validate(total_bytes.saturating_sub(header_size) as u64)?;
+        bfs.static_format.validate()?;
 
         if let Some(password) = password {
             bfs.ctrl
@@ -83,7 +85,7 @@ impl XHFS {
             .total_capacity()
             .ok_or_else(|| eyre::eyre!("Failed calculating total capacity"))?
             as u64;
-        header.format = Format::infer_from_free_space(total_capacity);
+        header.format = Format::infer_from_free_space(total_capacity, 20_480, 4096);
 
         let (g, b) = header.calculate_relative_geometry()?;
         let mut offset = 0;
@@ -129,6 +131,7 @@ impl XHFS {
                 extent_addr: MaybeU64::default(),
                 mtime: utc_now_u64(),
                 ctime: utc_now_u64(),
+                extra_metadata: [0; 32],
             },
             false,
         )
@@ -279,6 +282,7 @@ impl XHFS {
             extent_addr,
             mtime: utc_now_u64(),
             ctime: utc_now_u64(),
+            extra_metadata: [0; 32],
         };
 
         let inode_slot = self.resolve_inode_addr(inumber).ok_or_else(|| {
@@ -684,9 +688,11 @@ impl XHFS {
     ) -> Result<(), XHFSError> {
         let remaining = self.total_remaining_capacity().await?;
         let inp_len = data.len();
-        if inp_len > remaining {
+        if inp_len >= remaining {
             return Err(XHFSError::from_report(eyre::eyre!(
-                "Insufficient space, operation requires {} B more",
+                "Insufficient space, input size is {}, remaining {}, operation requires {} B more",
+                inp_len,
+                remaining,
                 inp_len.saturating_sub(remaining)
             )));
         }
@@ -1094,20 +1100,18 @@ impl XHFS {
         }))
     }
 
-    pub async fn allocate(&self, wanted_size: usize) -> Result<u64, XHFSError> {
-        tracing::debug!("Trying to allocate {wanted_size} blocks");
-
+    pub async fn allocate(
+        &self,
+        mut wanted_blocks: usize,
+    ) -> Result<Vec<AllocationSlot>, XHFSError> {
+        tracing::debug!("Planning allocation for {wanted_blocks} blocks");
         let _guard = self.alloc_guard.lock().await;
-        let mut max_slot_size = usize::MIN;
-        let mut min_slot_size = usize::MAX;
-        let mut found = None;
-        let mut free_slot_sizes = vec![];
-        for g_index in 0..self.static_format.group_count {
-            let group =
-                GroupLayout::derive_from_group_index(g_index, &self.geometry).ok_or_else(|| {
-                    eyre::eyre!("Failed calculating group layout for index {g_index}")
-                })?;
+        let mut planned_allocations = vec![];
+        let mut bitmaps_to_commit = vec![];
 
+        // SIMPLE: contiguous block search
+        'outer: for g_index in 0..self.static_format.group_count {
+            let group = GroupLayout::derive_from_group_index(g_index, &self.geometry).unwrap();
             let bitmap_slot = group.data_bitmap_region.to_addr_slot();
             let raw_bitmap = self
                 .ctrl
@@ -1118,45 +1122,85 @@ impl XHFS {
             let zero_runs =
                 bitmap.runs_of(false, Some(self.geometry.usable_blocks_per_group as usize));
             for slot in zero_runs {
-                max_slot_size = max_slot_size.max(slot.size);
-                min_slot_size = min_slot_size.min(slot.size);
-                free_slot_sizes.push(slot.size * self.static_format.block_size_bytes as usize);
-                if slot.size >= wanted_size {
-                    found = Some((slot.start, group, bitmap, bitmap_slot.addr));
-                    break;
+                if slot.size >= wanted_blocks {
+                    let mut mut_bitmap = bitmap.clone();
+                    mut_bitmap.set_range(slot.start, wanted_blocks, true)?;
+
+                    let data_offset = group.data_region.start.get();
+                    let absolute_byte_addr =
+                        data_offset + (slot.start as u64) * self.static_format.block_size_bytes;
+
+                    planned_allocations.push(AllocationSlot {
+                        absolute_byte_addr,
+                        block_count: wanted_blocks,
+                    });
+                    bitmaps_to_commit.push((bitmap_slot.addr, mut_bitmap));
+                    wanted_blocks = 0;
+                    break 'outer;
                 }
             }
+        }
 
-            if found.is_some() {
-                break;
+        // FALLBACK: collect fragments across groups
+        if wanted_blocks > 0 {
+            for g_index in 0..self.static_format.group_count {
+                if wanted_blocks == 0 {
+                    break;
+                }
+                let group = GroupLayout::derive_from_group_index(g_index, &self.geometry).unwrap();
+                let bitmap_slot = group.data_bitmap_region.to_addr_slot();
+                let raw_bitmap = self
+                    .ctrl
+                    .raw_read(bitmap_slot.addr.into(), bitmap_slot.capacity)
+                    .await?;
+                let mut bitmap = Bitmap::deserialize(&raw_bitmap)?;
+
+                let zero_runs =
+                    bitmap.runs_of(false, Some(self.geometry.usable_blocks_per_group as usize));
+                let mut bitmap_changed = false;
+                for slot in zero_runs {
+                    if wanted_blocks == 0 {
+                        break;
+                    }
+                    let blocks_to_take = slot.size.min(wanted_blocks);
+                    bitmap.set_range(slot.start, blocks_to_take, true)?;
+                    bitmap_changed = true;
+
+                    let data_offset = group.data_region.start.get();
+                    let absolute_byte_addr =
+                        data_offset + (slot.start as u64) * self.static_format.block_size_bytes;
+
+                    planned_allocations.push(AllocationSlot {
+                        absolute_byte_addr,
+                        block_count: blocks_to_take,
+                    });
+                    wanted_blocks -= blocks_to_take;
+                }
+
+                if bitmap_changed {
+                    bitmaps_to_commit.push((bitmap_slot.addr, bitmap));
+                }
             }
         }
 
-        if let Some((start_block, group, mut bitmap, bitmap_addr)) = found {
-            let data_offset = group.data_region.start.get();
-            let addr = data_offset + (start_block as u64) * self.static_format.block_size_bytes;
-            bitmap.set_range(start_block, wanted_size, true)?;
-            // commit
-            self.ctrl
-                .raw_write(bitmap_addr.into(), &bitmap.serialize()?)
-                .await?;
-            return Ok(addr);
+        if wanted_blocks > 0 {
+            return Err(XHFSError::Insufficient {
+                operation: "allocate".to_string(),
+                free_slot_sizes: vec![],
+                wanted: wanted_blocks,
+                max_slot_size: 0,
+                min_slot_size: 0,
+            });
         }
 
-        Err(XHFSError::Insufficient {
-            free_slot_sizes,
-            wanted: wanted_size,
-            max_slot_size: if max_slot_size == usize::MIN {
-                0
-            } else {
-                max_slot_size
-            },
-            min_slot_size: if min_slot_size == usize::MAX {
-                0
-            } else {
-                min_slot_size
-            },
-        })
+        // commit!
+        for (bitmap_addr, updated_bitmap) in bitmaps_to_commit {
+            self.ctrl
+                .raw_write(bitmap_addr.into(), &updated_bitmap.serialize()?)
+                .await?;
+        }
+
+        Ok(planned_allocations)
     }
 
     pub async fn mark_as_reusable(&self, addr_slot: AddressSlot) -> eyre::Result<()> {
@@ -1174,11 +1218,21 @@ impl XHFS {
             .await?;
         let mut bitmap = Bitmap::deserialize(&raw_bitmap)?;
 
-        let block_start =
-            (addr - group.data_region.start.get()) / self.static_format.block_size_bytes as u64;
-        let blocks_count = size / self.static_format.block_size_bytes as usize;
-
-        bitmap.set_range(block_start as usize, blocks_count, false)?;
+        let block_size = self.static_format.block_size_bytes as u64;
+        let block_start = (addr - group.data_region.start.get()) / block_size;
+        // make trailing partial block fully freed
+        let blocks_count = (size as u64 + block_size - 1) / block_size;
+        // ensure we don't spil past this group's legal bitmap bounds
+        let max_blocks = self.geometry.usable_blocks_per_group as u64;
+        if block_start + blocks_count > max_blocks {
+            eyre::bail!(
+                "Bitmap boundary violation in group! Trying to free blocks {}..{} but max is {}",
+                block_start,
+                block_start + blocks_count,
+                max_blocks
+            );
+        }
+        bitmap.set_range(block_start as usize, blocks_count as usize, false)?;
 
         // commit
         self.ctrl
@@ -1187,138 +1241,78 @@ impl XHFS {
     }
 
     pub async fn allocate_and_write_extent(&self, data: Vec<u8>) -> Result<MaybeU64, XHFSError> {
-        tracing::debug!(
-            "Trying to allocate and write {} B into one or many extents",
-            data.len()
-        );
+        tracing::debug!("Allocating and writing {} B", data.len());
 
-        let single_extent_needed_blocks = (Extent::emulate_serialized_size(data.len())
-            + self.static_format.block_size_bytes as usize
-            - 1)
-            / self.static_format.block_size_bytes as usize;
+        let metadata_overhead = Extent::emulate_serialized_size(0);
+        let block_size = self.static_format.block_size_bytes as usize;
 
-        match self.allocate(single_extent_needed_blocks).await {
-            Ok(addr) => {
-                self.ctrl
-                    .write(
-                        addr as usize,
-                        &Extent {
-                            next: MaybeU64::default(),
-                            data,
-                        }
+        // PREFLIGHT
+        let mut remaining_payload = data.len();
+        let mut exact_blocks_needed = 0;
+        let max_usable_blocks_per_group = self.geometry.usable_blocks_per_group as usize;
+        while remaining_payload > 0 {
+            let max_slot_bytes = max_usable_blocks_per_group * block_size;
+            if max_slot_bytes <= metadata_overhead {
+                return Err(XHFSError::Error {
+                    err: "Group capacity smaller than extent metadata overhead".to_string(),
+                });
+            }
+            let max_payload_per_slot = max_slot_bytes - metadata_overhead;
+            let chunk_size = std::cmp::min(remaining_payload, max_payload_per_slot);
+            let extent_bytes = Extent::emulate_serialized_size(chunk_size);
+            let blocks_for_chunk = (extent_bytes + block_size - 1) / block_size;
+
+            exact_blocks_needed += blocks_for_chunk;
+            remaining_payload -= chunk_size;
+        }
+
+        let allocation_slots = self.allocate(exact_blocks_needed).await?;
+        let mut data_slice = &data[..];
+        let mut serialization_plan = vec![];
+        for slot in allocation_slots {
+            if data_slice.is_empty() {
+                break;
+            }
+            let slot_bytes_capacity = slot.block_count * block_size;
+            if slot_bytes_capacity <= metadata_overhead {
+                continue;
+            }
+            let max_payload_for_slot = slot_bytes_capacity - metadata_overhead;
+            let chunk_size = std::cmp::min(data_slice.len(), max_payload_for_slot);
+            let (current_chunk, remaining) = data_slice.split_at(chunk_size);
+            serialization_plan.push((slot.absolute_byte_addr, current_chunk.to_vec()));
+            data_slice = remaining;
+        }
+
+        if !data_slice.is_empty() {
+            return Err(XHFSError::Error {
+                err: format!(
+                    "Layout mismatch: {} bytes left unallocated",
+                    data_slice.len()
+                ),
+            });
+        }
+
+        // commit! (reverse)
+        let mut next_link = MaybeU64::default();
+        for (absolute_byte_addr, chunk_data) in serialization_plan.into_iter().rev() {
+            let extent = Extent {
+                next: next_link,
+                data: chunk_data,
+            };
+            self.ctrl
+                .write(
+                    absolute_byte_addr as usize,
+                    &extent
                         .serialize()
                         .map_err(|e| XHFSError::Error { err: e.to_string() })?,
-                    )
-                    .await
-                    .map_err(|e| XHFSError::Error { err: e.to_string() })?;
-
-                return Ok(MaybeU64::from(addr));
-            }
-            // fallback to fragmented layout planning
-            Err(XHFSError::Insufficient {
-                free_slot_sizes, ..
-            }) => {
-                if free_slot_sizes.is_empty() {
-                    return Err(XHFSError::Insufficient {
-                        wanted: single_extent_needed_blocks,
-                        max_slot_size: 0,
-                        min_slot_size: 0,
-                        free_slot_sizes,
-                    });
-                }
-
-                let mut available_slots = free_slot_sizes;
-                available_slots.sort_by(|a, b| b.cmp(a));
-
-                let mut data_slice = &data[..];
-                let mut allocation_plan = vec![];
-                for slot_blocks in available_slots {
-                    if data_slice.is_empty() {
-                        break;
-                    }
-                    let slot_bytes_capacity =
-                        slot_blocks * self.static_format.block_size_bytes as usize;
-
-                    let metadata_overhead = Extent::emulate_serialized_size(0);
-                    if slot_bytes_capacity <= metadata_overhead {
-                        continue; // slot too microscopic to even store an extent header
-                    }
-
-                    let max_payload_for_slot = slot_bytes_capacity - metadata_overhead;
-                    let chunk_size = std::cmp::min(data_slice.len(), max_payload_for_slot);
-
-                    let needed_bytes = Extent::emulate_serialized_size(chunk_size);
-                    let needed_blocks =
-                        (needed_bytes + self.static_format.block_size_bytes as usize - 1)
-                            / self.static_format.block_size_bytes as usize;
-                    match self.allocate(needed_blocks).await {
-                        Ok(addr) => {
-                            let (current_chunk, remaining) = data_slice.split_at(chunk_size);
-                            allocation_plan.push((addr, current_chunk.to_vec()));
-                            data_slice = remaining;
-                        }
-                        Err(_) => {
-                            // alloc can fail due to race conditions or bitmap layout variations
-                            continue;
-                        }
-                    }
-                }
-
-                // we might run out of space options before consuming the input data payload
-                if !data_slice.is_empty() {
-                    // Note: inefficient, but alloc are upfront cost so..
-                    // rollback allocated segments to prevent storage leaks
-                    for (addr, chunk) in allocation_plan {
-                        let needed_bytes = Extent::emulate_serialized_size(chunk.len());
-                        let capacity =
-                            ((needed_bytes + self.static_format.block_size_bytes as usize - 1)
-                                / self.static_format.block_size_bytes as usize)
-                                * self.static_format.block_size_bytes as usize;
-
-                        let _ = self
-                            .mark_as_reusable(AddressSlot {
-                                addr: MaybeU64::from(addr),
-                                capacity,
-                            })
-                            .await;
-                    }
-
-                    return Err(XHFSError::Insufficient {
-                        wanted: single_extent_needed_blocks,
-                        max_slot_size: 0,
-                        min_slot_size: 0,
-                        free_slot_sizes: vec![],
-                    });
-                }
-
-                // TODO:
-                // we own a lock but I think best is have in storage lock at this point
-
-                // commmit!
-                let mut next_link = MaybeU64::default();
-                for (addr, chunk_data) in allocation_plan.into_iter().rev() {
-                    let extent = Extent {
-                        next: next_link,
-                        data: chunk_data,
-                    };
-
-                    self.ctrl
-                        .write(
-                            addr as usize,
-                            &extent
-                                .serialize()
-                                .map_err(|e| XHFSError::Error { err: e.to_string() })?,
-                        )
-                        .await
-                        .map_err(|e| XHFSError::Error { err: e.to_string() })?;
-
-                    next_link = MaybeU64::from(addr);
-                }
-
-                Ok(next_link)
-            }
-            Err(e) => Err(e),
+                )
+                .await
+                .map_err(|e| XHFSError::Error { err: e.to_string() })?;
+            next_link = MaybeU64::from(absolute_byte_addr);
         }
+
+        Ok(next_link)
     }
 
     pub async fn free_full_extent(&self, start_extent_addr: MaybeU64) -> eyre::Result<()> {
