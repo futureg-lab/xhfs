@@ -666,11 +666,20 @@ impl XHFS {
             if !deleted {
                 eyre::bail!("Failed to delete target inode or already unallocated");
             }
-            let new_dir_extent_addr = self
-                .allocate_and_write_extent(directory.serialize()?)
-                .await?;
+            // NOTE+FIX(VERY VERY IMPORTANT DETAIL):
+            // For every remaining INode, a full disk cleanup will leak 1 block (exactly 4096 B)
+            // e.g. write foo.mp4, then rm foo.mp4, the remaining space will be missing 1 block
+            // why? because we got a phantom extent of size 0 hiding in INode the INode directory
+            // directory.len() => 0 => will waste 4KB
+            if !directory.entries.is_empty() {
+                let new_dir_extent_addr = self
+                    .allocate_and_write_extent(directory.serialize()?)
+                    .await?;
+                parent_inode.extent_addr = new_dir_extent_addr;
+            } else {
+                parent_inode.extent_addr = MaybeU64::from(0);
+            }
 
-            parent_inode.extent_addr = new_dir_extent_addr;
             parent_inode.mtime = utc_now_u64();
             self.register_inode(&parent_inode, true).await?;
             self.free_full_extent(old_parent_extent_addr).await?;
@@ -992,7 +1001,8 @@ impl XHFS {
         match inode.kind {
             INodeKind::File => {
                 inode.total_file_size += data.len() as u64;
-                self.append_or_allocate_extent(inode.extent_addr, data)
+                inode.extent_addr = self
+                    .append_or_allocate_extent(inode.extent_addr, data)
                     .await?;
                 self.update_inode_mtime_now(inode).await?;
             }
@@ -1042,7 +1052,10 @@ impl XHFS {
         Ok(out)
     }
 
-    pub async fn read_extent_metadata(&self, addr: u64) -> eyre::Result<(RegionSlot, AddressSlot)> {
+    pub async fn read_extent_metadata(
+        &self,
+        addr: u64,
+    ) -> eyre::Result<(RegionSlot, MaybeU64, u64)> {
         let extent_header = self.ctrl.read(addr as usize, 16).await?;
         let curr_extent_data_size = u64::from_le_bytes(extent_header[0..8].try_into()?);
         eyre::ensure!(Extent::HEADER_NEXT_OFFSET == 8);
@@ -1057,10 +1070,8 @@ impl XHFS {
                 start: MaybeU64::from(addr),
                 end: MaybeU64::from(addr + aligned_capacity),
             },
-            AddressSlot {
-                addr: next_extent,
-                capacity: aligned_capacity as usize,
-            },
+            next_extent,
+            curr_extent_data_size,
         ))
     }
 
@@ -1169,7 +1180,12 @@ impl XHFS {
                     let data_offset = group.data_region.start.get();
                     let absolute_byte_addr =
                         data_offset + (slot.start as u64) * self.static_format.block_size_bytes;
-
+                    tracing::warn!(
+                        "PLANNING ALLOCATED: group index {}, start block {}, count {}",
+                        g_index,
+                        slot.start,
+                        blocks_to_take
+                    );
                     planned_allocations.push(AllocationSlot {
                         absolute_byte_addr,
                         block_count: blocks_to_take,
@@ -1221,7 +1237,8 @@ impl XHFS {
         let block_size = self.static_format.block_size_bytes as u64;
         let block_start = (addr - group.data_region.start.get()) / block_size;
         // make trailing partial block fully freed
-        let blocks_count = (size as u64 + block_size - 1) / block_size;
+        let calculated_blocks = (size as u64 + block_size - 1) / block_size;
+        let blocks_count = calculated_blocks.max(1);
         // ensure we don't spil past this group's legal bitmap bounds
         let max_blocks = self.geometry.usable_blocks_per_group as u64;
         if block_start + blocks_count > max_blocks {
@@ -1235,6 +1252,7 @@ impl XHFS {
         bitmap.set_range(block_start as usize, blocks_count as usize, false)?;
 
         // commit
+        tracing::warn!("FREED: start block {block_start}, count {blocks_count}");
         self.ctrl
             .raw_write(bitmap_slot.addr.into(), &bitmap.serialize()?)
             .await
@@ -1322,16 +1340,13 @@ impl XHFS {
         );
 
         let mut addr = start_extent_addr;
-        let block_size = self.static_format.block_size_bytes as usize;
-        while let Some(current_addr) = addr.to_optional() {
-            let (_, meta) = self.read_extent_metadata(current_addr).await?;
-            let next_hop = meta.addr;
 
-            let exact_bytes = meta.capacity;
-            let physical_capacity = ((exact_bytes + block_size - 1) / block_size) * block_size;
+        while let Some(current_addr) = addr.to_optional() {
+            let (curr_region, next_hop, _) = self.read_extent_metadata(current_addr).await?;
+
             self.mark_as_reusable(AddressSlot {
                 addr: MaybeU64::from(current_addr),
-                capacity: physical_capacity,
+                capacity: curr_region.size_span() as usize,
             })
             .await?;
 
@@ -1370,9 +1385,8 @@ impl XHFS {
         let mut addr = start_extent_addr;
 
         while let Some(current_addr) = addr.to_optional() {
-            let (_, meta) = self.read_extent_metadata(current_addr).await?;
             last_extent = Some(current_addr);
-            let next_addr = meta.addr;
+            let (_, next_addr, _) = self.read_extent_metadata(current_addr).await?;
             addr = next_addr;
         }
 
@@ -1420,8 +1434,8 @@ impl XHFS {
                 break;
             }
             tracing::debug!("Resolving {i}-th extent metadata 0x{next_addr:x}");
-            let (block_slot, addr_slot) = self.read_extent_metadata(next_addr).await?;
-            addr = addr_slot.addr;
+            let (block_slot, next_addr, _) = self.read_extent_metadata(next_addr).await?;
+            addr = next_addr;
             blocks.push(block_slot);
             i += 1;
         }

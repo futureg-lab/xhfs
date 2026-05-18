@@ -187,14 +187,14 @@ impl RegionSlot {
         (self.start.get(), self.end.get())
     }
 
-    pub fn size(&self) -> u64 {
-        self.end.get().saturating_sub(self.start.get()) + 1
+    pub fn size_span(&self) -> u64 {
+        self.end.get().saturating_sub(self.start.get())
     }
 
     pub fn to_addr_slot(&self) -> AddressSlot {
         AddressSlot {
             addr: self.start,
-            capacity: self.size() as usize,
+            capacity: 1 + self.size_span() as usize, // like index 0 arrays
         }
     }
 }

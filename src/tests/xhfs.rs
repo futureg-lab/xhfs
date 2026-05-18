@@ -2,7 +2,7 @@ use crate::{
     device::{Device, disk::Controller, kv_device::*, logical::LogicalDevice},
     xhfs::{WriteOption, XHFS, ds::*},
 };
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, io::Cursor, sync::Arc};
 use tokio::sync::RwLock;
 
 async fn create_simple_memory_brute_fs(capacity: usize) -> eyre::Result<XHFS> {
@@ -141,7 +141,7 @@ async fn test_xhfs_ref_manips_and_stats() -> eyre::Result<()> {
     bfs.mkdir("/many/entries/c", true).await?;
     bfs.fwrite(
         "/many/entries/d.txt",
-        "HELLO".as_bytes().to_vec(),
+        b"HELLO".to_vec(),
         WriteOption { overwrite: false },
     )
     .await?;
@@ -149,16 +149,15 @@ async fn test_xhfs_ref_manips_and_stats() -> eyre::Result<()> {
     {
         // extent 1 = HELLO
         // extent 2 = ABC
-        bfs.fappend("/many/entries/d.txt", "ABC".as_bytes().to_vec())
-            .await?;
+        bfs.fappend("/many/entries/d.txt", b"ABC".to_vec()).await?;
         assert_eq!(
             bfs.fread("/many/entries/d.txt").await?,
-            "HELLOABC".as_bytes(),
+            b"HELLOABC",
             "fappend works"
         );
         assert_eq!(
             bfs.fseek("/many/entries/d.txt", 4, 7).await?,
-            "OAB".as_bytes(),
+            b"OAB",
             "extent boundaries are contiguous from user POV"
         );
     }
@@ -214,6 +213,37 @@ async fn test_xhfs_ref_manips_and_stats() -> eyre::Result<()> {
         INodeKind::Symlink,
         "stats should not resolve symlink"
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_fstream_from_no_file() -> eyre::Result<()> {
+    let bfs = create_simple_memory_brute_fs(128 * 1000 * 1000).await?;
+    let mut memory_stream = Cursor::new(b"123456789".to_vec());
+    let block_size = 4;
+    bfs.fwrite_stream(
+        "hello.txt",
+        &mut memory_stream,
+        block_size,
+        WriteOption { overwrite: false },
+    )
+    .await?;
+
+    assert_eq!(bfs.fread("hello.txt").await?, b"123456789");
+
+    let inode = bfs.resolve_path("hello.txt").await?;
+
+    let meta_exts = bfs
+        .find_full_extent_metadata(inode.extent_addr, Some(10))
+        .await?;
+    let header = bfs.get_header().await?;
+
+    assert_eq!(meta_exts.len(), 3, "each write shot should use 1 extent");
+    // each burst of 4 bytes waste 4096 B (1 block) - 4B - 16B extent header space
+    assert_eq!(meta_exts[0].size_span(), header.format.block_size_bytes);
+    assert_eq!(meta_exts[1].size_span(), header.format.block_size_bytes);
+    assert_eq!(meta_exts[2].size_span(), header.format.block_size_bytes);
 
     Ok(())
 }
