@@ -5,7 +5,7 @@ use crate::{
 use std::{collections::HashMap, io::Cursor, sync::Arc};
 use tokio::sync::RwLock;
 
-async fn create_simple_memory_brute_fs(capacity: usize) -> eyre::Result<XHFS> {
+async fn create_simple_memory_xhfs(capacity: usize) -> eyre::Result<XHFS> {
     if capacity % 8 != 0 {
         eyre::bail!("Test fs expects % 8");
     }
@@ -21,7 +21,7 @@ async fn create_simple_memory_brute_fs(capacity: usize) -> eyre::Result<XHFS> {
 
 #[tokio::test]
 async fn test_xhfs_core_ops() -> eyre::Result<()> {
-    let bfs = create_simple_memory_brute_fs(128 * 1000 * 1000).await?;
+    let bfs = create_simple_memory_xhfs(128 * 1000 * 1000).await?;
 
     assert!(bfs.mkdir("/", false).await? == false, "root is not new");
 
@@ -134,7 +134,7 @@ async fn test_xhfs_core_ops() -> eyre::Result<()> {
 
 #[tokio::test]
 async fn test_xhfs_ref_manips_and_stats() -> eyre::Result<()> {
-    let bfs = create_simple_memory_brute_fs(128 * 1000 * 1000).await?;
+    let bfs = create_simple_memory_xhfs(128 * 1000 * 1000).await?;
 
     bfs.mkdir("/many/entries/a", true).await?;
     bfs.mkdir("/many/entries/b", true).await?;
@@ -219,7 +219,7 @@ async fn test_xhfs_ref_manips_and_stats() -> eyre::Result<()> {
 
 #[tokio::test]
 async fn test_fstream_from_no_file() -> eyre::Result<()> {
-    let bfs = create_simple_memory_brute_fs(128 * 1000 * 1000).await?;
+    let bfs = create_simple_memory_xhfs(128 * 1000 * 1000).await?;
     let mut memory_stream = Cursor::new(b"123456789".to_vec());
     let block_size = 4;
     bfs.fwrite_stream(
@@ -244,6 +244,51 @@ async fn test_fstream_from_no_file() -> eyre::Result<()> {
     assert_eq!(meta_exts[0].size_span(), header.format.block_size_bytes);
     assert_eq!(meta_exts[1].size_span(), header.format.block_size_bytes);
     assert_eq!(meta_exts[2].size_span(), header.format.block_size_bytes);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_bfs_real_prelayout_deduction() -> eyre::Result<()> {
+    {
+        let bfs = create_simple_memory_xhfs(30 * 1000 * 1000).await?;
+        let format = bfs.get_header().await?.format;
+        assert_eq!(
+            format,
+            Format {
+                param_data_block_count_per_group: 20480,
+                param_inode_count_per_group: 4096,
+                block_size_bytes: 4096,
+                group_count: 1 // many to few
+            }
+        );
+    }
+    {
+        let bfs = create_simple_memory_xhfs(128 * 1000 * 1000).await?;
+        let format = bfs.get_header().await?.format;
+        assert_eq!(
+            format,
+            Format {
+                param_data_block_count_per_group: 20480,
+                param_inode_count_per_group: 4096,
+                block_size_bytes: 4096,
+                group_count: 2
+            }
+        );
+    }
+    {
+        let bfs = create_simple_memory_xhfs(800 * 1000 * 1000).await?;
+        let format = bfs.get_header().await?.format;
+        assert_eq!(
+            format,
+            Format {
+                param_data_block_count_per_group: 20480,
+                param_inode_count_per_group: 4096,
+                block_size_bytes: 4096,
+                group_count: 10
+            }
+        );
+    }
 
     Ok(())
 }
