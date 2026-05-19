@@ -158,22 +158,13 @@ impl InspectSubcommands {
                 let mut offset = 0;
                 for gc in start_idx..=end_idx {
                     println!("Group #{} (idx {}) at 0x{:08x}", gc + 1, gc, offset);
-                    let region = g.rel_data_bitmap_region.add_offset(offset);
 
-                    println!("Data Region:  {region}");
-                    let data_bitmap = {
-                        let slot = region.to_addr_slot();
-                        let data = xhfs
-                            .ctrl
-                            .raw_read(slot.addr.into(), slot.capacity as usize)
-                            .await?;
-                        Bitmap::deserialize(&data)?
-                    };
-                    print_bitmap(&data_bitmap, v.columns, v.global.verbose);
-
-                    let region = g.rel_inode_bitmap_region.add_offset(offset);
-                    println!("INode Region: {region}");
+                    println!(
+                        "INode Table Region:  {}",
+                        g.rel_inode_table_region.add_offset(offset)
+                    );
                     let inode_bitmap = {
+                        let region = g.rel_inode_bitmap_region.add_offset(offset);
                         let slot = region.to_addr_slot();
                         let data = xhfs
                             .ctrl
@@ -182,6 +173,18 @@ impl InspectSubcommands {
                         Bitmap::deserialize(&data)?
                     };
                     print_bitmap(&inode_bitmap, v.columns, v.global.verbose);
+
+                    println!("Data Region:  {}", g.rel_data_region.add_offset(offset));
+                    let data_bitmap = {
+                        let region = g.rel_data_bitmap_region.add_offset(offset);
+                        let slot = region.to_addr_slot();
+                        let data = xhfs
+                            .ctrl
+                            .raw_read(slot.addr.into(), slot.capacity as usize)
+                            .await?;
+                        Bitmap::deserialize(&data)?
+                    };
+                    print_bitmap(&data_bitmap, v.columns, v.global.verbose);
 
                     offset += g.group_stride;
                     println!();
