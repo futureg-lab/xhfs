@@ -211,6 +211,17 @@ async fn test_xhfs_ref_manips_and_stats() -> eyre::Result<()> {
     );
 
     assert_eq!(
+        xhfs.fseek("/file.link", 4, 7).await?,
+        b"OAB",
+        "Symlink + extent boundaries are contiguous from user POV"
+    );
+    assert_eq!(
+        xhfs.fseek("/file.hardlink", 4, 7).await?,
+        b"OAB",
+        "Hardlink + extent boundaries are contiguous from user POV"
+    );
+
+    assert_eq!(
         xhfs.fread("/many/entries2/d.txt").await?,
         xhfs.fread("/many/entries2/other.txt").await?,
     );

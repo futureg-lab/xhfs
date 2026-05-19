@@ -212,7 +212,7 @@ impl XHFS {
         let mut worth_deleting = false;
         if let Some(mut inode) = self.resolve_inode(inumber).await? {
             if matches!(inode.kind, INodeKind::Hardlink) {
-                let target_inode = self.deref_hard_or_sym_links(inode.clone()).await?;
+                let target_inode = self.follow_link_or_noop(inode.clone()).await?;
                 self.delete_inode_with_extent(target_inode.inumber).await?;
             }
 
@@ -954,7 +954,7 @@ impl XHFS {
         Ok(created_new)
     }
 
-    async fn deref_hard_or_sym_links(&self, inode: INode) -> eyre::Result<INode, XHFSError> {
+    async fn follow_link_or_noop(&self, inode: INode) -> eyre::Result<INode, XHFSError> {
         match inode.kind {
             INodeKind::Hardlink => {
                 tracing::debug!("Trying to read file from Hardlink");
@@ -979,9 +979,7 @@ impl XHFS {
                 let referenced = self.resolve_path(symlink.path).await?;
                 Ok(referenced)
             }
-            _ => {
-                xhfs_bail!("Cannot dereference INode of type {:?}", inode.kind)
-            }
+            _ => Ok(inode),
         }
     }
 
@@ -994,7 +992,7 @@ impl XHFS {
             INodeKind::File => self.read_full_data_from_extent(inode.extent_addr).await,
             INodeKind::Symlink | INodeKind::Hardlink => {
                 tracing::debug!(" {:?} detected, following the payload", inode.kind);
-                let referenced_inode = self.deref_hard_or_sym_links(inode).await?;
+                let referenced_inode = self.follow_link_or_noop(inode).await?;
                 self.read_full_data_from_extent(referenced_inode.extent_addr)
                     .await
             }
@@ -1013,29 +1011,20 @@ impl XHFS {
     ) -> eyre::Result<Vec<u8>> {
         let path: PathBuf = path.into();
         let inode = self.resolve_path(&path).await?;
+        let inode = self.follow_link_or_noop(inode).await?;
         match inode.kind {
             INodeKind::File => {
                 self.seek_full_data_from_extent(inode.extent_addr, start, end)
                     .await
             }
-            INodeKind::Symlink => {
-                tracing::debug!("Trying to read+seek file from symlink");
-                let raw_path = self.read_full_data_from_extent(inode.extent_addr).await?;
-                let symlink = Symlink::deserialize(&raw_path)?;
-                tracing::debug!(
-                    " {} *=> {}",
-                    normalize_path(&path),
-                    normalize_path(&symlink.path)
-                );
-                if symlink.path == path {
-                    tracing::warn!("Invalid fs state: Symlink pointing to itself detected");
-                    eyre::bail!("Symlink pointing to itself detected");
-                }
-                self.fseek(symlink.path, start, end).await
-            }
-            INodeKind::Hardlink => todo!(),
             INodeKind::Directory => {
                 eyre::bail!("Cannot fread directory");
+            }
+            INodeKind::Symlink | INodeKind::Hardlink => {
+                eyre::bail!(
+                    "Unexpected {:?}, should have been solved upstream",
+                    inode.kind
+                )
             }
         }
     }
@@ -1054,12 +1043,12 @@ impl XHFS {
                 self.update_inode_mtime_now(inode).await?;
             }
             INodeKind::Symlink => {
-                let referenced = self.deref_hard_or_sym_links(inode.clone()).await?;
+                let referenced = self.follow_link_or_noop(inode.clone()).await?;
                 self.fappend_inode(referenced, data).await?;
             }
             INodeKind::Hardlink => {
                 tracing::debug!("Trying to fappend file from Hardlink");
-                let referenced = self.deref_hard_or_sym_links(inode.clone()).await?;
+                let referenced = self.follow_link_or_noop(inode.clone()).await?;
                 tracing::debug!(
                     " INode #{} *=> INode #{}",
                     inode.inumber,
@@ -1159,7 +1148,7 @@ impl XHFS {
         let inode = match self.resolve_path(path).await {
             Ok(inode) => {
                 if follow_hardlink && matches!(inode.kind, INodeKind::Hardlink) {
-                    self.deref_hard_or_sym_links(inode).await?
+                    self.follow_link_or_noop(inode).await?
                 } else {
                     inode
                 }
