@@ -19,6 +19,11 @@ pub enum InspectSubcommands {
     Dump(DumpBlock),
     /// Display a view of a block by range
     View(ViewBlock),
+    // TODO:
+    // --density 1 => 1 block per black char
+    // map: bool
+    // input is group range (if none, display all)
+    //Map()
 }
 
 #[derive(Args, Debug)]
@@ -82,14 +87,14 @@ impl InspectSubcommands {
     pub async fn run(&self) -> eyre::Result<()> {
         match self {
             InspectSubcommands::Inode(i) => {
-                let bfs = i.global.get_bfs().await?;
-                let inode = bfs.resolve_path(&i.path).await?;
+                let xhfs = i.global.get_xhfs().await?;
+                let inode = xhfs.resolve_path(&i.path).await?;
                 println!("INode #{}\n", inode.inumber);
                 println!("{inode}");
             }
             InspectSubcommands::Extent(e) => {
-                let bfs = e.global.get_bfs().await?;
-                let meta_exts = bfs
+                let xhfs = e.global.get_xhfs().await?;
+                let meta_exts = xhfs
                     .find_full_extent_metadata(MaybeU64::from(e.address), Some(e.max_follow))
                     .await?;
                 for (i, ext) in meta_exts.iter().enumerate() {
@@ -97,31 +102,31 @@ impl InspectSubcommands {
                 }
             }
             InspectSubcommands::Dump(d) => {
-                let bfs = d.global.get_bfs().await?;
+                let xhfs = d.global.get_xhfs().await?;
                 let size = d.end_address.saturating_sub(d.start_address);
                 if d.dest_path.exists() && !d.overwrite {
                     eyre::bail!("File {} already exists", d.dest_path.display());
                 }
                 let blob = if d.decrypt {
-                    bfs.ctrl
+                    xhfs.ctrl
                         .read(d.start_address as usize, size as usize)
                         .await?
                 } else {
-                    bfs.ctrl
+                    xhfs.ctrl
                         .raw_read(d.start_address as usize, size as usize)
                         .await?
                 };
                 fs::write(&d.dest_path, blob).await?;
             }
             InspectSubcommands::View(v) => {
-                let bfs = v.global.get_bfs().await?;
+                let xhfs = v.global.get_xhfs().await?;
                 let size = v.end_address.saturating_sub(v.start_address);
                 let blob = if v.decrypt {
-                    bfs.ctrl
+                    xhfs.ctrl
                         .read(v.start_address as usize, size as usize)
                         .await?
                 } else {
-                    bfs.ctrl
+                    xhfs.ctrl
                         .raw_read(v.start_address as usize, size as usize)
                         .await?
                 };

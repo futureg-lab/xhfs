@@ -5,9 +5,9 @@ use crate::{
 };
 use async_recursion::async_recursion;
 use eyre::{Context, ContextCompat};
-use std::{fmt::Debug, io::SeekFrom, path::PathBuf};
+use std::{fmt::Debug, path::PathBuf};
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt},
+    io::{AsyncRead, AsyncReadExt, AsyncSeek},
     sync::Mutex,
 };
 
@@ -85,7 +85,7 @@ impl XHFS {
             .total_capacity()
             .ok_or_else(|| eyre::eyre!("Failed calculating total capacity"))?
             as u64;
-        header.format = Format::infer_from_free_space(total_capacity, 20_480, 4096);
+        header.format = Format::infer_from_free_space(total_capacity, 20_480, 4096)?;
 
         let (g, b) = header.calculate_relative_geometry()?;
         let mut offset = 0;
@@ -750,6 +750,10 @@ impl XHFS {
 
         let size = data.len();
         tracing::debug!("Creating new file of size {size} B");
+        // FIXME:
+        // When extent payload is huge and we cut, it remains allocated!
+        // => we should have a marker
+        // fstream doesn't have the issue but it remains nice to have still..
         let extent_addr = self.allocate_and_write_extent(data).await?;
 
         // assume we never run of INodes
@@ -795,7 +799,7 @@ impl XHFS {
         &self,
         path: P,
         mut stream: R,
-        mut block_size: usize,
+        block_size: usize,
         opt: WriteOption,
     ) -> eyre::Result<()>
     where
@@ -805,7 +809,6 @@ impl XHFS {
         let path: PathBuf = path.into();
         self.fwrite(&path, vec![], opt).await?;
         let mut buf = vec![0u8; block_size];
-        let mut pos = stream.stream_position().await?;
         loop {
             if buf.len() != block_size {
                 buf.resize(block_size, 0);
@@ -817,23 +820,7 @@ impl XHFS {
             }
 
             let chunk = &buf[..n];
-            match self.fappend(&path, chunk.to_vec()).await {
-                Ok(_) => {
-                    pos += n as u64;
-                }
-                Err(e) => {
-                    if let XHFSError::Insufficient { max_slot_size, .. } = e {
-                        let new_size = max_slot_size.saturating_sub(16);
-                        if new_size == 0 {
-                            return Err(e.into());
-                        }
-                        block_size = new_size;
-                        stream.seek(SeekFrom::Start(pos)).await?;
-                        continue;
-                    }
-                    return Err(e.into());
-                }
-            }
+            self.fappend(&path, chunk.to_vec()).await?
         }
 
         Ok(())
@@ -1202,10 +1189,7 @@ impl XHFS {
         if wanted_blocks > 0 {
             return Err(XHFSError::Insufficient {
                 operation: "allocate".to_string(),
-                free_slot_sizes: vec![],
                 wanted: wanted_blocks,
-                max_slot_size: 0,
-                min_slot_size: 0,
             });
         }
 

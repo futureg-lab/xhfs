@@ -79,33 +79,15 @@ pub struct RegionSlot {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum XHFSError {
-    Insufficient {
-        operation: String,
-        wanted: usize,
-        max_slot_size: usize,
-        min_slot_size: usize,
-        free_slot_sizes: Vec<usize>,
-    },
-    Error {
-        err: String,
-    },
+    Insufficient { operation: String, wanted: usize },
+    Error { err: String },
 }
 
 impl Display for XHFSError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            XHFSError::Insufficient {
-                operation,
-                wanted,
-                max_slot_size,
-                min_slot_size,
-                free_slot_sizes,
-            } => {
-                write!(
-                    f,
-                    "Insufficient space, {operation} requires {wanted} B, found {} fragments: available max {max_slot_size} B, min {min_slot_size}",
-                    free_slot_sizes.len()
-                )
+            XHFSError::Insufficient { operation, wanted } => {
+                write!(f, "Insufficient space, {operation} requires {wanted} B")
             }
             XHFSError::Error { err } => write!(f, "{err}"),
         }
@@ -623,16 +605,15 @@ impl XHFSHeader {
 
         let total_group_bytes = rel_data_region.end.get() + 1;
         let group_stride = total_group_bytes;
-
         let geometry = GeometryLayout {
             rel_header_region,
             rel_data_bitmap_region,
             rel_inode_bitmap_region,
             rel_inode_table_region,
-            n_inodes_in_group: self.format.param_inode_count_per_group,
             rel_data_region,
             group_stride,
-            usable_blocks_per_group: self.format.param_data_block_count_per_group, // Absolute 1-to-1 match
+            usable_blocks_per_group: self.format.param_data_block_count_per_group,
+            n_inodes_in_group: self.format.param_inode_count_per_group,
         };
 
         let templates = BlockInitialValues {
@@ -848,7 +829,7 @@ impl Format {
         total_capacity_bytes: u64,
         data_block_count: u64,
         inode_count: u64,
-    ) -> Self {
+    ) -> eyre::Result<Self> {
         let block_size_bytes = if total_capacity_bytes <= 512 * 1024 {
             512
         } else if total_capacity_bytes <= 4 * 1024 * 1024 {
@@ -861,8 +842,8 @@ impl Format {
         let data_block_count = data_block_count.min(max_bits_per_block).max(1);
         let inode_count = inode_count.min(max_bits_per_block).max(1);
         let header_bytes = XHFSHeader::serialized_size() as u64;
-        let data_bitmap_bytes = ((data_block_count + 7) / 8).max(1);
-        let inode_bitmap_bytes = ((inode_count + 7) / 8).max(1);
+        let data_bitmap_bytes = ((data_block_count + 8 - 1) / 8).max(1);
+        let inode_bitmap_bytes = ((inode_count + 8 - 1) / 8).max(1);
         let inode_table_bytes = inode_count * INode::serialized_size() as u64;
         let data_blocks_bytes = data_block_count * block_size_bytes;
 
@@ -871,16 +852,19 @@ impl Format {
             + inode_bitmap_bytes
             + inode_table_bytes
             + data_blocks_bytes;
-        let group_count =
-            (total_capacity_bytes + total_bytes_per_group - 1) / total_bytes_per_group;
-        let group_count = group_count.max(1);
+        let group_count = total_capacity_bytes / total_bytes_per_group;
 
-        Self {
+        eyre::ensure!(
+            total_capacity_bytes >= total_bytes_per_group,
+            "Device capacity ({total_capacity_bytes} B) is too small to host a single block group configuration (requires {total_bytes_per_group} B)",
+        );
+
+        Ok(Self {
             param_data_block_count_per_group: data_block_count,
             param_inode_count_per_group: inode_count,
             block_size_bytes,
             group_count,
-        }
+        })
     }
 
     pub fn validate(&self) -> eyre::Result<()> {

@@ -1,25 +1,28 @@
 use crate::device::Device;
 use async_trait::async_trait;
 use std::path::PathBuf;
-use tokio::{
-    fs::{self, OpenOptions},
-    io::{AsyncSeekExt, AsyncWriteExt},
-};
+use tokio::fs::{self, File, OpenOptions};
+use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+use tokio::sync::Mutex;
 
 pub struct FsDevice {
-    file: PathBuf,
+    file: Mutex<File>,
     size: usize,
 }
 
 impl FsDevice {
     pub async fn new<P: Into<PathBuf>>(file: P, size: usize) -> eyre::Result<Self> {
-        let file: PathBuf = file.into();
-        match fs::metadata(&file).await {
+        let path: PathBuf = file.into();
+        let tokio_file = match fs::metadata(&path).await {
             Ok(meta) => {
                 let existing_size = meta.len() as usize;
                 if existing_size == size {
-                    tracing::warn!("Reusing existing {file:?}");
-                    return Ok(Self { file, size });
+                    tracing::warn!("Reusing existing {path:?}");
+                    OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(&path)
+                        .await?
                 } else {
                     eyre::bail!(
                         "File exists but has wrong size (expected {size}, got {existing_size})",
@@ -27,15 +30,24 @@ impl FsDevice {
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                tracing::warn!("Creating new file {file:?}");
-                fs::write(&file, vec![0u8; size])
+                tracing::warn!("Creating new file {path:?}");
+                fs::write(&path, vec![0u8; size])
                     .await
                     .map_err(|e| eyre::eyre!(e))?;
+
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&path)
+                    .await?
             }
             Err(e) => return Err(eyre::eyre!(e)),
-        }
+        };
 
-        Ok(Self { file, size })
+        Ok(Self {
+            file: Mutex::new(tokio_file),
+            size,
+        })
     }
 }
 
@@ -50,12 +62,7 @@ impl Device for FsDevice {
     }
 
     async fn write(&self, addr: usize, data: &[u8]) -> eyre::Result<()> {
-        let mut file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .read(true)
-            .open(&self.file)
-            .await?;
+        let mut file = self.file.lock().await;
         file.seek(std::io::SeekFrom::Start(addr as u64)).await?;
 
         file.write_all(data).await?;
@@ -65,7 +72,7 @@ impl Device for FsDevice {
     }
 
     async fn read(&self, addr: usize, size: usize) -> eyre::Result<Vec<u8>> {
-        let mut file = OpenOptions::new().read(true).open(&self.file).await?;
+        let mut file = self.file.lock().await;
         file.seek(std::io::SeekFrom::Start(addr as u64)).await?;
 
         let mut buf = vec![0u8; size];
@@ -74,7 +81,7 @@ impl Device for FsDevice {
         // read_exact will internally loop, repoll, and handle
         // It will only fail if it hits an actual physical EOF early
         // When the file block is too large, we can hit a short read with basic read
-        tokio::io::AsyncReadExt::read_exact(&mut file, &mut buf).await?;
+        tokio::io::AsyncReadExt::read_exact(&mut *file, &mut buf).await?;
 
         Ok(buf)
     }

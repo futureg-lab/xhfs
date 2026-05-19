@@ -109,12 +109,12 @@ impl FsCommands {
 impl LsCommand {
     pub async fn ls(&self) -> eyre::Result<()> {
         let ls = self;
-        let bfs = ls.global.get_bfs().await?;
-        let entries = bfs.ls(&ls.path).await?;
+        let xhfs = ls.global.get_xhfs().await?;
+        let entries = xhfs.ls(&ls.path).await?;
         for entry in entries {
             let full_path = ls.path.join(&entry);
             if ls.global.verbose {
-                let stat = bfs
+                let stat = xhfs
                     .stats(&full_path)
                     .await?
                     .ok_or_eyre(format!("Missing stat for {entry}"))?;
@@ -150,20 +150,20 @@ impl LsCommand {
 
     pub async fn tree(&self) -> eyre::Result<()> {
         let ls = self;
-        let bfs = ls.global.get_bfs().await?;
-        self.print_tree(&bfs, &self.path, "").await?;
+        let xhfs = ls.global.get_xhfs().await?;
+        self.print_tree(&xhfs, &self.path, "").await?;
         Ok(())
     }
 
     #[async_recursion(?Send)]
-    async fn print_tree(&self, bfs: &XHFS, path: &Path, prefix: &str) -> eyre::Result<()> {
-        let entries = bfs.ls(path).await?;
+    async fn print_tree(&self, xhfs: &XHFS, path: &Path, prefix: &str) -> eyre::Result<()> {
+        let entries = xhfs.ls(path).await?;
         let count = entries.len();
         for (i, entry) in entries.into_iter().enumerate() {
             let is_last = i == count - 1;
             let connector = if is_last { "└── " } else { "├── " };
             let full_path = path.join(&entry);
-            let stat = bfs.stats(&full_path).await?;
+            let stat = xhfs.stats(&full_path).await?;
 
             let mut info = String::new();
             if self.global.verbose {
@@ -186,7 +186,7 @@ impl LsCommand {
             if let Some(s) = stat {
                 if matches!(s.kind, INodeKind::Directory) {
                     let new_prefix = format!("{}{}", prefix, if is_last { "    " } else { "│   " });
-                    self.print_tree(bfs, &full_path, &new_prefix).await?;
+                    self.print_tree(xhfs, &full_path, &new_prefix).await?;
                 }
             }
         }
@@ -197,8 +197,8 @@ impl LsCommand {
 impl CopyCommand {
     pub async fn run(&self) -> eyre::Result<()> {
         let cp = self;
-        let bfs = cp.global.get_bfs().await?;
-        bfs.fcopy(
+        let xhfs = cp.global.get_xhfs().await?;
+        xhfs.fcopy(
             &cp.src,
             &cp.dest,
             WriteOption {
@@ -213,31 +213,31 @@ impl CopyCommand {
 impl MoveCommand {
     pub async fn run(&self) -> eyre::Result<()> {
         let cp = self;
-        let bfs = cp.global.get_bfs().await?;
-        bfs.fmove(&cp.src, &cp.dest).await?;
+        let xhfs = cp.global.get_xhfs().await?;
+        xhfs.fmove(&cp.src, &cp.dest).await?;
         Ok(())
     }
 }
 
 impl PathCommand {
     pub async fn mkdir(&self) -> eyre::Result<()> {
-        let bfs = self.global.get_bfs().await?;
-        bfs.mkdir(&self.path, self.recursive).await?;
+        let xhfs = self.global.get_xhfs().await?;
+        xhfs.mkdir(&self.path, self.recursive).await?;
         Ok(())
     }
 
     pub async fn rm(&self) -> eyre::Result<()> {
-        let bfs = self.global.get_bfs().await?;
+        let xhfs = self.global.get_xhfs().await?;
         if self.recursive {
             eyre::bail!("Recursive option not supported yet for unlink");
         }
-        bfs.unlink(&self.path).await?;
+        xhfs.unlink(&self.path).await?;
         Ok(())
     }
 
     pub async fn stats(&self) -> eyre::Result<()> {
-        let bfs = self.global.get_bfs().await?;
-        let stat = bfs.stats(&self.path).await?;
+        let xhfs = self.global.get_xhfs().await?;
+        let stat = xhfs.stats(&self.path).await?;
         if let Some(stat) = stat {
             let (kind, size_str) = match stat.kind {
                 INodeKind::File => {
@@ -270,8 +270,8 @@ impl PathCommand {
 
 impl LinkCommand {
     pub async fn run(&self) -> eyre::Result<()> {
-        let bfs = self.global.get_bfs().await?;
-        bfs.create_link(
+        let xhfs = self.global.get_xhfs().await?;
+        xhfs.create_link(
             &self.dest_path,
             &self.src_path,
             WriteOption {

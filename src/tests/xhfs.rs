@@ -21,75 +21,75 @@ async fn create_simple_memory_xhfs(capacity: usize) -> eyre::Result<XHFS> {
 
 #[tokio::test]
 async fn test_xhfs_core_ops() -> eyre::Result<()> {
-    let bfs = create_simple_memory_xhfs(128 * 1000 * 1000).await?;
+    let xhfs = create_simple_memory_xhfs(128 * 1000 * 1000).await?;
 
-    assert!(bfs.mkdir("/", false).await? == false, "root is not new");
+    assert!(xhfs.mkdir("/", false).await? == false, "root is not new");
 
-    bfs.mkdir("/hello", true).await?;
+    xhfs.mkdir("/hello", true).await?;
     assert!(
-        bfs.mkdir("/hello/not/recursive", false).await.is_err(),
+        xhfs.mkdir("/hello/not/recursive", false).await.is_err(),
         "not recursive fail if many components"
     );
-    bfs.mkdir("/hello/foo", true).await?;
-    bfs.mkdir("/hello/bar", true).await?;
-    bfs.mkdir("/hello/bar", true).await?;
-    bfs.mkdir("/hello/baz/aaa", true).await?;
-    bfs.mkdir("/hello/baz/bbb", true).await?;
-    bfs.fwrite(
+    xhfs.mkdir("/hello/foo", true).await?;
+    xhfs.mkdir("/hello/bar", true).await?;
+    xhfs.mkdir("/hello/bar", true).await?;
+    xhfs.mkdir("/hello/baz/aaa", true).await?;
+    xhfs.mkdir("/hello/baz/bbb", true).await?;
+    xhfs.fwrite(
         "/hello/baz/123.bin",
         vec![1, 2, 3],
         WriteOption { overwrite: false },
     )
     .await?;
-    bfs.mkdir("/world", true).await?;
+    xhfs.mkdir("/world", true).await?;
 
     {
         assert_eq!(
-            bfs.ls("/").await?,
+            xhfs.ls("/").await?,
             ["hello".to_string(), "world".to_string()]
         );
         assert_eq!(
-            bfs.ls("/hello").await?,
+            xhfs.ls("/hello").await?,
             ["foo".to_string(), "bar".to_string(), "baz".to_string()]
         );
-        assert_eq!(bfs.ls("/world").await?, [] as [String; 0]);
+        assert_eq!(xhfs.ls("/world").await?, [] as [String; 0]);
         assert_eq!(
-            bfs.ls("/hello/baz/").await?,
+            xhfs.ls("/hello/baz/").await?,
             ["aaa".to_string(), "bbb".to_string(), "123.bin".to_string()]
         );
     }
 
     {
         assert!(
-            bfs.unlink("/hello/baz").await.is_err(),
+            xhfs.unlink("/hello/baz").await.is_err(),
             "cannot unlink nested path"
         );
         assert!(
-            bfs.unlink("/hello/baz/123.bin").await.is_ok(),
+            xhfs.unlink("/hello/baz/123.bin").await.is_ok(),
             "unlink leaf file"
         );
         assert!(
-            bfs.unlink("/hello/baz/aaa").await.is_ok(),
+            xhfs.unlink("/hello/baz/aaa").await.is_ok(),
             "unlink leaf folder"
         );
-        assert_eq!(bfs.ls("/hello/baz/").await?, ["bbb".to_string()]);
+        assert_eq!(xhfs.ls("/hello/baz/").await?, ["bbb".to_string()]);
     }
 
     assert!(
-        bfs.fread("/hello/notexist.exe").await.is_err(),
+        xhfs.fread("/hello/notexist.exe").await.is_err(),
         "file does not exist works"
     );
 
     let data1 = "This is the content";
     let data2 = "Another content";
     {
-        bfs.fwrite(
+        xhfs.fwrite(
             "/hello/baz/bbb/content1.txt",
             data1.as_bytes().to_vec(),
             WriteOption { overwrite: false },
         )
         .await?;
-        bfs.fwrite(
+        xhfs.fwrite(
             "/hello/baz/bbb/content2.txt",
             data2.as_bytes().to_vec(),
             WriteOption { overwrite: false },
@@ -97,19 +97,19 @@ async fn test_xhfs_core_ops() -> eyre::Result<()> {
         .await?;
         assert_eq!(
             data1,
-            String::from_utf8(bfs.fread("/hello/baz/bbb/content1.txt").await?).unwrap(),
+            String::from_utf8(xhfs.fread("/hello/baz/bbb/content1.txt").await?).unwrap(),
             "reading written content 1"
         );
         assert_eq!(
             data2,
-            String::from_utf8(bfs.fread("/hello/baz/bbb/content2.txt").await?).unwrap(),
+            String::from_utf8(xhfs.fread("/hello/baz/bbb/content2.txt").await?).unwrap(),
             "reading written content 2"
         );
     }
 
     {
         let data1 = "Another content";
-        bfs.fwrite(
+        xhfs.fwrite(
             "/hello/baz/bbb/content1.txt",
             data1.as_bytes().to_vec(),
             WriteOption { overwrite: true },
@@ -119,12 +119,12 @@ async fn test_xhfs_core_ops() -> eyre::Result<()> {
         // also prove dir entry remap works fine
         assert_eq!(
             data1,
-            String::from_utf8(bfs.fread("/hello/baz/bbb/content1.txt").await?).unwrap(),
+            String::from_utf8(xhfs.fread("/hello/baz/bbb/content1.txt").await?).unwrap(),
             "reading written content 1 HAS changed"
         );
         assert_eq!(
             data2,
-            String::from_utf8(bfs.fread("/hello/baz/bbb/content2.txt").await?).unwrap(),
+            String::from_utf8(xhfs.fread("/hello/baz/bbb/content2.txt").await?).unwrap(),
             "reading written content 2 remains unchanged"
         );
     }
@@ -134,12 +134,12 @@ async fn test_xhfs_core_ops() -> eyre::Result<()> {
 
 #[tokio::test]
 async fn test_xhfs_ref_manips_and_stats() -> eyre::Result<()> {
-    let bfs = create_simple_memory_xhfs(128 * 1000 * 1000).await?;
+    let xhfs = create_simple_memory_xhfs(128 * 1000 * 1000).await?;
 
-    bfs.mkdir("/many/entries/a", true).await?;
-    bfs.mkdir("/many/entries/b", true).await?;
-    bfs.mkdir("/many/entries/c", true).await?;
-    bfs.fwrite(
+    xhfs.mkdir("/many/entries/a", true).await?;
+    xhfs.mkdir("/many/entries/b", true).await?;
+    xhfs.mkdir("/many/entries/c", true).await?;
+    xhfs.fwrite(
         "/many/entries/d.txt",
         b"HELLO".to_vec(),
         WriteOption { overwrite: false },
@@ -149,14 +149,14 @@ async fn test_xhfs_ref_manips_and_stats() -> eyre::Result<()> {
     {
         // extent 1 = HELLO
         // extent 2 = ABC
-        bfs.fappend("/many/entries/d.txt", b"ABC".to_vec()).await?;
+        xhfs.fappend("/many/entries/d.txt", b"ABC".to_vec()).await?;
         assert_eq!(
-            bfs.fread("/many/entries/d.txt").await?,
+            xhfs.fread("/many/entries/d.txt").await?,
             b"HELLOABC",
             "fappend works"
         );
         assert_eq!(
-            bfs.fseek("/many/entries/d.txt", 4, 7).await?,
+            xhfs.fseek("/many/entries/d.txt", 4, 7).await?,
             b"OAB",
             "extent boundaries are contiguous from user POV"
         );
@@ -164,20 +164,20 @@ async fn test_xhfs_ref_manips_and_stats() -> eyre::Result<()> {
 
     // non-trivial ref manips
     {
-        bfs.fcopy(
+        xhfs.fcopy(
             "/many/entries/d.txt",
             "/many/entries/other.txt",
             WriteOption { overwrite: false },
         )
         .await?;
-        bfs.fmove("/many/entries", "/many/entries2").await?;
-        bfs.create_link(
+        xhfs.fmove("/many/entries", "/many/entries2").await?;
+        xhfs.create_link(
             "/file.link",
             "/many/entries2/d.txt",
             WriteOption { overwrite: false },
         )
         .await?;
-        bfs.create_link(
+        xhfs.create_link(
             "/folder.link",
             "/many/entries2",
             WriteOption { overwrite: false },
@@ -186,21 +186,21 @@ async fn test_xhfs_ref_manips_and_stats() -> eyre::Result<()> {
     }
 
     assert_eq!(
-        bfs.ls("/many/entries2").await?,
-        bfs.ls("/folder.link").await?
+        xhfs.ls("/many/entries2").await?,
+        xhfs.ls("/folder.link").await?
     );
     assert_eq!(
-        bfs.fread("/many/entries2/d.txt").await?,
-        bfs.fread("/file.link").await?
+        xhfs.fread("/many/entries2/d.txt").await?,
+        xhfs.fread("/file.link").await?
     );
     assert_eq!(
-        bfs.fread("/many/entries2/d.txt").await?,
-        bfs.fread("/many/entries2/other.txt").await?,
+        xhfs.fread("/many/entries2/d.txt").await?,
+        xhfs.fread("/many/entries2/other.txt").await?,
     );
 
-    let dtxt_stats = bfs.stats("/many/entries2/d.txt").await?.unwrap();
-    let filelink_stats = bfs.stats("/file.link").await?.unwrap();
-    let folder_stats = bfs.stats("/many/entries2").await?.unwrap();
+    let dtxt_stats = xhfs.stats("/many/entries2/d.txt").await?.unwrap();
+    let filelink_stats = xhfs.stats("/file.link").await?.unwrap();
+    let folder_stats = xhfs.stats("/many/entries2").await?.unwrap();
 
     assert_eq!(
         folder_stats.size, None,
@@ -219,10 +219,10 @@ async fn test_xhfs_ref_manips_and_stats() -> eyre::Result<()> {
 
 #[tokio::test]
 async fn test_fstream_from_no_file() -> eyre::Result<()> {
-    let bfs = create_simple_memory_xhfs(128 * 1000 * 1000).await?;
+    let xhfs = create_simple_memory_xhfs(128 * 1000 * 1000).await?;
     let mut memory_stream = Cursor::new(b"123456789".to_vec());
     let block_size = 4;
-    bfs.fwrite_stream(
+    xhfs.fwrite_stream(
         "hello.txt",
         &mut memory_stream,
         block_size,
@@ -230,14 +230,14 @@ async fn test_fstream_from_no_file() -> eyre::Result<()> {
     )
     .await?;
 
-    assert_eq!(bfs.fread("hello.txt").await?, b"123456789");
+    assert_eq!(xhfs.fread("hello.txt").await?, b"123456789");
 
-    let inode = bfs.resolve_path("hello.txt").await?;
+    let inode = xhfs.resolve_path("hello.txt").await?;
 
-    let meta_exts = bfs
+    let meta_exts = xhfs
         .find_full_extent_metadata(inode.extent_addr, Some(10))
         .await?;
-    let header = bfs.get_header().await?;
+    let header = xhfs.get_header().await?;
 
     assert_eq!(meta_exts.len(), 3, "each write shot should use 1 extent");
     // each burst of 4 bytes waste 4096 B (1 block) - 4B - 16B extent header space
@@ -249,23 +249,28 @@ async fn test_fstream_from_no_file() -> eyre::Result<()> {
 }
 
 #[tokio::test]
-async fn test_bfs_real_prelayout_deduction() -> eyre::Result<()> {
+async fn test_xhfs_real_prelayout_deduction() -> eyre::Result<()> {
+    let mod_8_required_by_kv = 7;
     {
-        let bfs = create_simple_memory_xhfs(30 * 1000 * 1000).await?;
-        let format = bfs.get_header().await?.format;
+        let xhfs = create_simple_memory_xhfs(84221009 + mod_8_required_by_kv)
+            .await
+            .unwrap();
+        let format = xhfs.get_header().await?.format;
         assert_eq!(
             format,
             Format {
                 param_data_block_count_per_group: 20480,
                 param_inode_count_per_group: 4096,
                 block_size_bytes: 4096,
-                group_count: 1 // many to few
-            }
+                group_count: 1
+            },
         );
     }
     {
-        let bfs = create_simple_memory_xhfs(128 * 1000 * 1000).await?;
-        let format = bfs.get_header().await?.format;
+        let xhfs = create_simple_memory_xhfs(2 * (84221009 + mod_8_required_by_kv))
+            .await
+            .unwrap();
+        let format = xhfs.get_header().await?.format;
         assert_eq!(
             format,
             Format {
@@ -273,20 +278,20 @@ async fn test_bfs_real_prelayout_deduction() -> eyre::Result<()> {
                 param_inode_count_per_group: 4096,
                 block_size_bytes: 4096,
                 group_count: 2
-            }
+            },
         );
     }
     {
-        let bfs = create_simple_memory_xhfs(800 * 1000 * 1000).await?;
-        let format = bfs.get_header().await?.format;
+        let xhfs = create_simple_memory_xhfs(800 * 1000 * 1000).await.unwrap();
+        let format = xhfs.get_header().await?.format;
         assert_eq!(
             format,
             Format {
                 param_data_block_count_per_group: 20480,
                 param_inode_count_per_group: 4096,
                 block_size_bytes: 4096,
-                group_count: 10
-            }
+                group_count: 9
+            },
         );
     }
 

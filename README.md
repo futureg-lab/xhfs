@@ -62,14 +62,14 @@ configuration:
   logical:
     - name: dev1
       include: [bloc1, bloc2]
-      capacity: "2 MiB"
+      capacity: "80 MiB"
       max_concurrent: 2
     - name: dev2
       include: [bloc3]
-      capacity: "2 MiB"
+      capacity: "80 MiB"
       max_concurrent: 1
   # Final storage layout
-  # [dev1: 0 - 2MB] [dev2: 2MiB - 4MiB]
+  # [dev1: 0 - 80 MB] [dev2: 80 MiB - 160 MiB]
   layout: [dev1, dev2]
 ```
 
@@ -96,8 +96,8 @@ xhfs download test.txt my_physical_copy.txt
 # Installation
 
 Either download the binary from the
-[release](https://github.com/futureg-lab/xhfs/releases/tag/v0.2.2) page or
-install using cargo:
+[release](https://github.com/futureg-lab/xhfs/releases) page or install using
+cargo:
 
 ```bash
 cargo install xhfs
@@ -116,6 +116,7 @@ cargo install xhfs
 
 - [ ] File System
   - [x] Encryption (ChaCha20 stream cipher)
+  - [x] No journaling, CoW based
   - [x] xhfs core: fopen, fwrite, fseek, mkdir, fmove, fcopy, unlink
   - [x] native symlink support: create_link
   - [ ] native hardlink support: wip
