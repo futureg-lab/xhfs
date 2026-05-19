@@ -363,6 +363,16 @@ impl XHFS {
         Ok(())
     }
 
+    pub async fn update_inode_mtime_now(&self, mut inode: INode) -> eyre::Result<()> {
+        inode.mtime = utc_now_u64();
+        self.register_inode(&inode, true).await
+    }
+
+    pub async fn increment_inode_nlink(&self, mut inode: INode) -> eyre::Result<()> {
+        inode.nlink += 1;
+        self.register_inode(&inode, true).await
+    }
+
     pub async fn format_headers_report(&self) -> eyre::Result<String> {
         let mut out = String::new();
 
@@ -1071,16 +1081,6 @@ impl XHFS {
         let inode = self.resolve_path(&path).await?;
         self.fappend_inode(inode, data).await?;
         Ok(())
-    }
-
-    pub async fn update_inode_mtime_now(&self, mut inode: INode) -> eyre::Result<()> {
-        inode.mtime = utc_now_u64();
-        self.register_inode(&inode, true).await
-    }
-
-    pub async fn increment_inode_nlink(&self, mut inode: INode) -> eyre::Result<()> {
-        inode.nlink += 1;
-        self.register_inode(&inode, true).await
     }
 
     pub async fn read_extent(&self, addr: u64) -> Result<Extent, XHFSError> {
