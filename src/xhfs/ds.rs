@@ -11,9 +11,7 @@ pub enum INodeKind {
     File,
     Directory,
     Symlink,
-    // TODO: hardlinks are easy doable!
-    // payload is inumber instead of path + increase nlink
-    // Hardlink,
+    Hardlink,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,6 +23,7 @@ pub struct INode {
     pub extent_addr: MaybeU64,
     pub mtime: u64,
     pub ctime: u64,
+    pub extra_metadata: [u8; 32],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +41,7 @@ pub struct BitRunSlot {
 pub struct EntryStat {
     pub name: String,
     pub kind: INodeKind,
+    pub nlink: u64,
     pub size: Option<usize>,
     pub mtime: u64,
     pub ctime: u64,
@@ -60,8 +60,13 @@ pub struct Directory {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SymLink {
+pub struct Symlink {
     pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hardlink {
+    pub inumber: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -78,31 +83,15 @@ pub struct RegionSlot {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum XHFSError {
-    Insufficient {
-        wanted: usize,
-        max_slot_size: usize,
-        min_slot_size: usize,
-        free_slot_sizes: Vec<usize>,
-    },
-    Error {
-        err: String,
-    },
+    Insufficient { operation: String, wanted: usize },
+    Error { err: String },
 }
 
 impl Display for XHFSError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            XHFSError::Insufficient {
-                wanted,
-                max_slot_size,
-                min_slot_size,
-                free_slot_sizes,
-            } => {
-                write!(
-                    f,
-                    "Insufficient space, operation requires {wanted} B, found {} fragments: available max {max_slot_size} B, min {min_slot_size}",
-                    free_slot_sizes.len()
-                )
+            XHFSError::Insufficient { operation, wanted } => {
+                write!(f, "Insufficient space, {operation} requires {wanted} B")
             }
             XHFSError::Error { err } => write!(f, "{err}"),
         }
@@ -184,14 +173,14 @@ impl RegionSlot {
         (self.start.get(), self.end.get())
     }
 
-    pub fn size(&self) -> u64 {
-        self.end.get().saturating_sub(self.start.get()) + 1
+    pub fn size_span(&self) -> u64 {
+        self.end.get().saturating_sub(self.start.get())
     }
 
     pub fn to_addr_slot(&self) -> AddressSlot {
         AddressSlot {
             addr: self.start,
-            capacity: self.size() as usize,
+            capacity: 1 + self.size_span() as usize, // like index 0 arrays
         }
     }
 }
@@ -207,12 +196,14 @@ pub struct XHFSHeader {
     pub version: u8,
     pub format: Format,
     pub chacha20_nonce: [u8; 12],
+    pub extra_metadata: [u8; 32],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Format {
+    pub param_data_block_count_per_group: u64,
+    pub param_inode_count_per_group: u64,
     pub block_size_bytes: u64,
-    pub blocks_per_group: u64,
     pub group_count: u64,
 }
 
@@ -253,6 +244,7 @@ impl INodeKind {
             INodeKind::File => 0,
             INodeKind::Directory => 1,
             INodeKind::Symlink => 2,
+            INodeKind::Hardlink => 3,
         }
     }
 
@@ -261,6 +253,7 @@ impl INodeKind {
             0 => Self::File,
             1 => Self::Directory,
             2 => Self::Symlink,
+            3 => Self::Hardlink,
             _ => eyre::bail!("INodeKind of type {value} not understood"),
         })
     }
@@ -337,6 +330,7 @@ impl INode {
 
         buf.extend_from_slice(&self.mtime.to_le_bytes());
         buf.extend_from_slice(&self.ctime.to_le_bytes());
+        buf.extend_from_slice(&self.extra_metadata);
 
         Ok(buf)
     }
@@ -366,6 +360,9 @@ impl INode {
         let mtime = u64::from_le_bytes(data[addr_start..addr_start + 8].try_into()?);
         addr_start += 8;
         let ctime = u64::from_le_bytes(data[addr_start..addr_start + 8].try_into()?);
+        addr_start += 8;
+
+        let extra_metadata: [u8; 32] = data[addr_start..addr_start + 32].try_into()?;
 
         Ok(INode {
             inumber,
@@ -375,11 +372,12 @@ impl INode {
             total_file_size,
             mtime,
             ctime,
+            extra_metadata,
         })
     }
 
     pub fn serialized_size() -> usize {
-        8 + 1 + 8 + 8 + 8 + 8 + 8
+        8 + 1 + 8 + 8 + 8 + 8 + 8 + 32
     }
 }
 
@@ -481,16 +479,28 @@ impl Directory {
     }
 }
 
-impl SymLink {
+impl Symlink {
     pub fn serialize(&self) -> Vec<u8> {
         normalize_path(self.path.clone()).as_bytes().to_vec()
     }
 
     pub fn deserialize(data: &[u8]) -> eyre::Result<Self> {
-        let path = String::from_utf8(data.try_into()?).wrap_err_with(|| eyre::eyre!("dsads"))?;
+        let path = String::from_utf8(data.try_into()?)
+            .wrap_err_with(|| eyre::eyre!("Parsing Symlink path"))?;
         Ok(Self {
             path: PathBuf::from(path),
         })
+    }
+}
+
+impl Hardlink {
+    pub fn serialize(&self) -> Vec<u8> {
+        self.inumber.to_le_bytes().into_iter().collect()
+    }
+
+    pub fn deserialize(data: &[u8]) -> eyre::Result<Self> {
+        let inumber = u64::from_le_bytes(data.try_into()?);
+        Ok(Self { inumber })
     }
 }
 
@@ -499,10 +509,12 @@ impl XHFSHeader {
         let mut buf = Vec::with_capacity(Self::serialized_size());
         buf.extend_from_slice(b"XHFS");
         buf.push(self.version);
+        buf.extend_from_slice(&self.format.param_data_block_count_per_group.to_le_bytes());
+        buf.extend_from_slice(&self.format.param_inode_count_per_group.to_le_bytes());
         buf.extend_from_slice(&self.format.block_size_bytes.to_le_bytes());
-        buf.extend_from_slice(&self.format.blocks_per_group.to_le_bytes());
         buf.extend_from_slice(&self.format.group_count.to_le_bytes());
         buf.extend_from_slice(&self.chacha20_nonce);
+        buf.extend_from_slice(&self.extra_metadata);
 
         Ok(buf)
     }
@@ -518,38 +530,50 @@ impl XHFSHeader {
 
         let version = data[4];
         let mut addr_start = 5;
-        let block_size_bytes = u64::from_le_bytes(data[addr_start..addr_start + 8].try_into()?);
+        let param_data_block_count_per_group =
+            u64::from_le_bytes(data[addr_start..addr_start + 8].try_into()?);
         addr_start += 8;
-        let blocks_per_group = u64::from_le_bytes(data[addr_start..addr_start + 8].try_into()?);
+        let param_inode_count_per_group =
+            u64::from_le_bytes(data[addr_start..addr_start + 8].try_into()?);
+        addr_start += 8;
+
+        let block_size_bytes = u64::from_le_bytes(data[addr_start..addr_start + 8].try_into()?);
         addr_start += 8;
         let group_count = u64::from_le_bytes(data[addr_start..addr_start + 8].try_into()?);
         addr_start += 8;
         let chacha20_nonce = data[addr_start..addr_start + 12].try_into()?;
+        addr_start += 12;
+
+        let extra_metadata: [u8; 32] = data[addr_start..addr_start + 32].try_into()?;
 
         Ok(Self {
             version,
+            chacha20_nonce,
             format: Format {
+                param_data_block_count_per_group,
+                param_inode_count_per_group,
                 block_size_bytes,
-                blocks_per_group,
                 group_count,
             },
-            chacha20_nonce,
+            extra_metadata,
         })
     }
 
     pub fn serialized_size() -> usize {
-        4 + 1 + 8 + 8 + 8 + 12
+        4 + 1 + 8 + 8 + 8 + 8 + 12 + 32
     }
 
     pub fn template() -> Self {
         Self {
             version: 1,
+            chacha20_nonce: Default::default(),
+            extra_metadata: [0; 32],
             format: Format {
+                param_data_block_count_per_group: 0,
+                param_inode_count_per_group: 0,
                 block_size_bytes: 0,
-                blocks_per_group: 0,
                 group_count: 0,
             },
-            chacha20_nonce: Default::default(),
         }
     }
 
@@ -562,61 +586,54 @@ impl XHFSHeader {
             end: ((serialized_header.len() - 1) as u64).into(),
         };
 
-        let total_blocks_in_group = self.format.blocks_per_group as usize;
-        let data_block_bitmap = Bitmap::new_from_bits_count(total_blocks_in_group).serialize()?;
+        let data_block_bitmap =
+            Bitmap::new_from_bits_count(self.format.param_data_block_count_per_group as usize)
+                .serialize()?;
         let data_bitmap_start = rel_header_region.end.get() + 1;
         let rel_data_bitmap_region = RegionSlot {
             start: data_bitmap_start.into(),
             end: (data_bitmap_start + data_block_bitmap.len() as u64 - 1).into(),
         };
 
-        let n_inodes_in_group = 8 * self.format.block_size_bytes as usize;
         let inode_bitmap_placeholder =
-            Bitmap::new_from_bits_count(n_inodes_in_group).serialize()?; // default would be
+            Bitmap::new_from_bits_count(self.format.param_inode_count_per_group as usize)
+                .serialize()?;
         let inode_bitmap_start = rel_data_bitmap_region.end.get() + 1;
         let rel_inode_bitmap_region = RegionSlot {
             start: inode_bitmap_start.into(),
             end: (inode_bitmap_start + inode_bitmap_placeholder.len() as u64 - 1).into(),
         };
 
-        let inode_table_len_bytes = (n_inodes_in_group * INode::serialized_size()) as u64;
+        let inode_table_len_bytes =
+            self.format.param_inode_count_per_group * INode::serialized_size() as u64;
         let inode_table_start = rel_inode_bitmap_region.end.get() + 1;
         let inode_table_placeholder = vec![0u8; inode_table_len_bytes as usize];
-
         let rel_inode_table_region = RegionSlot {
             start: inode_table_start.into(),
             end: (inode_table_start + inode_table_len_bytes - 1).into(),
         };
 
         let data_region_start = rel_inode_table_region.end.get() + 1;
-        let total_group_bytes = self.format.blocks_per_group * self.format.block_size_bytes;
-        // IMPORTANT:
-        // we need to ensure the data region size is a multiple of the block size
-        // if it's bigger or smaller => reduce to closest multiple
-        // The reason is that the allocator speaks in terms of blocks at allocates in that unit not bytes
-        let raw_bytes_available = total_group_bytes - data_region_start;
-        let data_blocks_per_group = raw_bytes_available / self.format.block_size_bytes;
-        let exact_data_payload_bytes = data_blocks_per_group * self.format.block_size_bytes;
+        let exact_data_payload_bytes =
+            self.format.param_data_block_count_per_group * self.format.block_size_bytes;
         let rel_data_region = RegionSlot {
             start: data_region_start.into(),
             end: (data_region_start + exact_data_payload_bytes - 1).into(),
         };
 
+        let total_group_bytes = rel_data_region.end.get() + 1;
         let group_stride = total_group_bytes;
-
-        let data_bytes_available = rel_data_region.end.get() - rel_data_region.start.get() + 1;
-        let data_blocks_per_group = data_bytes_available / self.format.block_size_bytes;
-
         let geometry = GeometryLayout {
             rel_header_region,
             rel_data_bitmap_region,
             rel_inode_bitmap_region,
             rel_inode_table_region,
-            n_inodes_in_group: n_inodes_in_group as u64,
             rel_data_region,
             group_stride,
-            usable_blocks_per_group: data_blocks_per_group,
+            usable_blocks_per_group: self.format.param_data_block_count_per_group,
+            n_inodes_in_group: self.format.param_inode_count_per_group,
         };
+
         let templates = BlockInitialValues {
             serialized_header,
             data_block_bitmap,
@@ -826,56 +843,82 @@ impl Bitmap {
 }
 
 impl Format {
-    pub fn infer_from_free_space(total_capacity: u64) -> Self {
-        let block_size_bytes = if total_capacity <= 512 * 1024 {
+    pub fn infer_from_free_space(
+        total_capacity_bytes: u64,
+        data_block_count: u64,
+        inode_count: u64,
+    ) -> eyre::Result<Self> {
+        let block_size_bytes = if total_capacity_bytes <= 512 * 1024 {
             512
-        } else if total_capacity <= 4 * 1024 * 1024 {
+        } else if total_capacity_bytes <= 4 * 1024 * 1024 {
             1024
         } else {
             4096
         };
 
-        let total_blocks = total_capacity / block_size_bytes;
+        let max_bits_per_block = block_size_bytes * 8;
+        let data_block_count = data_block_count.min(max_bits_per_block).max(1);
+        let inode_count = inode_count.min(max_bits_per_block).max(1);
+        let header_bytes = XHFSHeader::serialized_size() as u64;
+        let data_bitmap_bytes = ((data_block_count + 8 - 1) / 8).max(1);
+        let inode_bitmap_bytes = ((inode_count + 8 - 1) / 8).max(1);
+        let inode_table_bytes = inode_count * INode::serialized_size() as u64;
+        let data_blocks_bytes = data_block_count * block_size_bytes;
 
-        // 4 groups for 1GB scale
-        let target_group_bytes = 256 * 1024 * 1024;
-        let group_count = (total_capacity + target_group_bytes - 1) / target_group_bytes;
-        let group_count = group_count.max(1);
+        let total_bytes_per_group = header_bytes
+            + data_bitmap_bytes
+            + inode_bitmap_bytes
+            + inode_table_bytes
+            + data_blocks_bytes;
+        let group_count = total_capacity_bytes / total_bytes_per_group;
 
-        let target_blocks_per_group = target_group_bytes / block_size_bytes;
-        let blocks_per_group = target_blocks_per_group.min(total_blocks).max(1);
+        eyre::ensure!(
+            total_capacity_bytes >= total_bytes_per_group,
+            "Device capacity ({total_capacity_bytes} B) is too small to host a single block group configuration (requires {total_bytes_per_group} B)",
+        );
 
-        Self {
+        Ok(Self {
+            param_data_block_count_per_group: data_block_count,
+            param_inode_count_per_group: inode_count,
             block_size_bytes,
-            blocks_per_group,
             group_count,
-        }
+        })
     }
 
-    pub fn validate(&self, total_bytes: u64) -> eyre::Result<()> {
-        eyre::ensure!(total_bytes > 0, "Target storage size cannot be 0 bytes");
-        eyre::ensure!(self.group_count > 0, "Group count must be > 0");
+    pub fn validate(&self) -> eyre::Result<()> {
         eyre::ensure!(
             self.block_size_bytes > 0 && self.block_size_bytes.is_power_of_two(),
             "Block size ({}) must be greater than 0 and a power of two",
             self.block_size_bytes
         );
-        eyre::ensure!(self.blocks_per_group > 0, "Blocks per group cannot be 0");
+        eyre::ensure!(self.group_count > 0, "Group count must be > 0");
         eyre::ensure!(
-            total_bytes >= self.block_size_bytes,
-            "Storage size ({} bytes) is too small to hold even a single block of size {} bytes",
-            total_bytes,
+            self.param_data_block_count_per_group > 0,
+            "Data block count per group must be > 0"
+        );
+        eyre::ensure!(
+            self.param_inode_count_per_group > 0,
+            "INode count per group must be > 0"
+        );
+
+        let max_bits_per_block = self
+            .block_size_bytes
+            .checked_mul(8)
+            .ok_or_else(|| eyre::eyre!("Block size multiplication overflowed"))?;
+
+        eyre::ensure!(
+            self.param_data_block_count_per_group <= max_bits_per_block,
+            "Data block count ({}) exceeds the max capacity of a single block bitmap ({} bits) for block size {}",
+            self.param_data_block_count_per_group,
+            max_bits_per_block,
             self.block_size_bytes
         );
 
-        // a single block bitmap must be able to track every block inside its group
-        // Since 1 byte = 8 bits, a block can track (block_size_bytes * 8) blocks
-        let max_blocks_per_bitmap = self.block_size_bytes * 8;
         eyre::ensure!(
-            self.blocks_per_group <= max_blocks_per_bitmap,
-            "Blocks per group ({}) exceeds the max capacity of a single block bitmap ({} blocks) for a block size of {} bytes",
-            self.blocks_per_group,
-            max_blocks_per_bitmap,
+            self.param_inode_count_per_group <= max_bits_per_block,
+            "INode count ({}) exceeds the max capacity of a single block bitmap ({} bits) for block size {}",
+            self.param_inode_count_per_group,
+            max_bits_per_block,
             self.block_size_bytes
         );
 
@@ -936,7 +979,16 @@ impl Display for Format {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "Format Configuration:")?;
         writeln!(f, "  Block Size:       {} B", self.block_size_bytes)?;
-        writeln!(f, "  Blocks per Group: {}", self.blocks_per_group)?;
+        writeln!(
+            f,
+            "  Data Blocks per Group: {}",
+            self.param_data_block_count_per_group
+        )?;
+        writeln!(
+            f,
+            "  INode count per Group: {}",
+            self.param_inode_count_per_group
+        )?;
         write!(f, "  Total Groups:     {}", self.group_count)
     }
 }

@@ -5,9 +5,9 @@ use crate::{
 };
 use async_recursion::async_recursion;
 use eyre::{Context, ContextCompat};
-use std::{fmt::Debug, io::SeekFrom, path::PathBuf};
+use std::{fmt::Debug, path::PathBuf};
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt},
+    io::{AsyncRead, AsyncReadExt, AsyncSeek},
     sync::Mutex,
 };
 
@@ -37,6 +37,12 @@ pub struct WriteOption {
     pub overwrite: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct AllocationSlot {
+    pub absolute_byte_addr: u64,
+    pub block_count: usize,
+}
+
 impl XHFS {
     pub async fn from_formatted(ctrl: Controller, password: Option<String>) -> eyre::Result<Self> {
         let header_size = XHFSHeader::template().serialize()?.len();
@@ -45,23 +51,19 @@ impl XHFS {
             ctrl,
             alloc_guard: Mutex::new(()),
             static_format: Format {
+                param_data_block_count_per_group: 0,
+                param_inode_count_per_group: 0,
                 block_size_bytes: 0,
-                blocks_per_group: 0,
                 group_count: 0,
             },
             geometry: Default::default(),
         };
 
         let header = bfs.get_header().await?;
-        let total_bytes = bfs
-            .ctrl
-            .total_capacity()
-            .ok_or_else(|| eyre::eyre!("Failed calculating total capacity"))?;
 
         bfs.geometry = header.calculate_relative_geometry()?.0;
         bfs.static_format = header.format;
-        bfs.static_format
-            .validate(total_bytes.saturating_sub(header_size) as u64)?;
+        bfs.static_format.validate()?;
 
         if let Some(password) = password {
             bfs.ctrl
@@ -83,7 +85,7 @@ impl XHFS {
             .total_capacity()
             .ok_or_else(|| eyre::eyre!("Failed calculating total capacity"))?
             as u64;
-        header.format = Format::infer_from_free_space(total_capacity);
+        header.format = Format::infer_from_free_space(total_capacity, 20_480, 4096)?;
 
         let (g, b) = header.calculate_relative_geometry()?;
         let mut offset = 0;
@@ -129,6 +131,7 @@ impl XHFS {
                 extent_addr: MaybeU64::default(),
                 mtime: utc_now_u64(),
                 ctime: utc_now_u64(),
+                extra_metadata: [0; 32],
             },
             false,
         )
@@ -185,9 +188,9 @@ impl XHFS {
         Ok(None)
     }
 
+    #[async_recursion(?Send)]
     async fn delete_inode_with_extent(&self, inumber: u64) -> eyre::Result<bool> {
-        tracing::debug!("Resolving INode {inumber} for deletion");
-        let _guard = self.alloc_guard.lock().await;
+        tracing::debug!("Resolving INode {inumber} for deletion loop");
         let group = GroupLayout::derive_from_inode(inumber, &self.geometry)
             .ok_or_else(|| eyre::eyre!("Unable to derive group layout for inumber {inumber}"))?;
 
@@ -206,20 +209,34 @@ impl XHFS {
             return Ok(false);
         }
 
-        if let Some(inode) = self.resolve_inode(inumber).await? {
-            tracing::debug!(
-                "Cascading deletion to extent chain starting at 0x{:x}",
-                inode.extent_addr.get()
-            );
-            self.free_full_extent(inode.extent_addr).await?;
+        let mut worth_deleting = false;
+        if let Some(mut inode) = self.resolve_inode(inumber).await? {
+            if matches!(inode.kind, INodeKind::Hardlink) {
+                let target_inode = self.follow_link_or_noop(inode.clone()).await?;
+                self.delete_inode_with_extent(target_inode.inumber).await?;
+            }
+
+            inode.nlink = inode.nlink.saturating_sub(1);
+
+            if inode.nlink == 0 {
+                worth_deleting = true;
+                tracing::debug!(
+                    "Cascading deletion to extent chain starting at 0x{:x}",
+                    inode.extent_addr.get()
+                );
+                self.free_full_extent(inode.extent_addr).await?;
+            } else {
+                self.register_inode(&inode, true).await?;
+            }
         }
 
-        bitmap.set(inode_index_in_group as usize, false)?;
-
-        // commit
-        self.ctrl
-            .raw_write(bitmap_slot.addr.into(), &bitmap.serialize()?)
-            .await?;
+        if worth_deleting {
+            // commit!
+            bitmap.set(inode_index_in_group as usize, false)?;
+            self.ctrl
+                .raw_write(bitmap_slot.addr.into(), &bitmap.serialize()?)
+                .await?;
+        }
 
         Ok(true)
     }
@@ -279,6 +296,7 @@ impl XHFS {
             extent_addr,
             mtime: utc_now_u64(),
             ctime: utc_now_u64(),
+            extra_metadata: [0; 32],
         };
 
         let inode_slot = self.resolve_inode_addr(inumber).ok_or_else(|| {
@@ -343,6 +361,16 @@ impl XHFS {
             .await?;
 
         Ok(())
+    }
+
+    pub async fn update_inode_mtime_now(&self, mut inode: INode) -> eyre::Result<()> {
+        inode.mtime = utc_now_u64();
+        self.register_inode(&inode, true).await
+    }
+
+    pub async fn increment_inode_nlink(&self, mut inode: INode) -> eyre::Result<()> {
+        inode.nlink += 1;
+        self.register_inode(&inode, true).await
     }
 
     pub async fn format_headers_report(&self) -> eyre::Result<String> {
@@ -449,11 +477,11 @@ impl XHFS {
                         join_absolute(&components[..i])
                     );
                 }
-                INodeKind::Symlink => {
+                INodeKind::Symlink | INodeKind::Hardlink => {
                     // IDEA: impl symlink resolution traversal loop substitution here
                     // resolving a link should resolve into its containing path?
                     eyre::bail!(
-                        "Symbolic links are not yet supported during traversal at '{}'",
+                        "Encountered link at path '{}'",
                         join_absolute(&components[..i])
                     );
                 }
@@ -495,11 +523,14 @@ impl XHFS {
             INodeKind::File => {
                 eyre::bail!("Cannot ls a file");
             }
+            INodeKind::Hardlink => {
+                eyre::bail!("Cannot ls a Hardlink as it only refers to a file");
+            }
             INodeKind::Symlink => {
                 tracing::debug!("Trying to list dir entries from symlink");
                 let symlink = {
                     let raw_path = self.read_full_data_from_extent(inode.extent_addr).await?;
-                    SymLink::deserialize(&raw_path)?
+                    Symlink::deserialize(&raw_path)?
                 };
                 tracing::debug!(
                     " {} *=> {}",
@@ -662,11 +693,20 @@ impl XHFS {
             if !deleted {
                 eyre::bail!("Failed to delete target inode or already unallocated");
             }
-            let new_dir_extent_addr = self
-                .allocate_and_write_extent(directory.serialize()?)
-                .await?;
+            // NOTE+FIX(VERY VERY IMPORTANT DETAIL):
+            // For every remaining INode, a full disk cleanup will leak 1 block (exactly 4096 B)
+            // e.g. write foo.mp4, then rm foo.mp4, the remaining space will be missing 1 block
+            // why? because we got a phantom extent of size 0 hiding in INode the INode directory
+            // directory.len() => 0 => will waste 4KB
+            if !directory.entries.is_empty() {
+                let new_dir_extent_addr = self
+                    .allocate_and_write_extent(directory.serialize()?)
+                    .await?;
+                parent_inode.extent_addr = new_dir_extent_addr;
+            } else {
+                parent_inode.extent_addr = MaybeU64::from(0);
+            }
 
-            parent_inode.extent_addr = new_dir_extent_addr;
             parent_inode.mtime = utc_now_u64();
             self.register_inode(&parent_inode, true).await?;
             self.free_full_extent(old_parent_extent_addr).await?;
@@ -679,15 +719,17 @@ impl XHFS {
         &self,
         path: P,
         data: Vec<u8>,
-        is_symlink: bool,
+        payload_type: INodeKind,
         opt: WriteOption,
     ) -> Result<(), XHFSError> {
         let remaining = self.total_remaining_capacity().await?;
         let inp_len = data.len();
-        if inp_len > remaining {
+        if inp_len >= remaining {
             return Err(XHFSError::from_report(eyre::eyre!(
-                "Insufficient space, operation requires {} B more",
-                inp_len.saturating_sub(remaining)
+                "Insufficient space, input size is {} B, remaining {} B, operation requires {} B more",
+                inp_len,
+                remaining,
+                inp_len.saturating_sub(remaining) + 1
             )));
         }
 
@@ -735,20 +777,19 @@ impl XHFS {
 
         let size = data.len();
         tracing::debug!("Creating new file of size {size} B");
+        // FIXME:
+        // When extent payload is huge and we cut, it remains allocated!
+        // => we should have a marker
+        // fstream doesn't have the issue but it remains nice to have still..
         let extent_addr = self.allocate_and_write_extent(data).await?;
+
+        if matches!(payload_type, INodeKind::Directory) {
+            xhfs_bail!("Expected file like entry, got a folder instead");
+        }
 
         // assume we never run of INodes
         let inode = self
-            .allocate_inode_near(
-                parent_inode.inumber,
-                size as u64,
-                extent_addr,
-                if is_symlink {
-                    INodeKind::Symlink
-                } else {
-                    INodeKind::File
-                },
-            )
+            .allocate_inode_near(parent_inode.inumber, size as u64, extent_addr, payload_type)
             .await?;
 
         directory.entries.push((filename, inode.inumber));
@@ -773,14 +814,14 @@ impl XHFS {
         data: Vec<u8>,
         opt: WriteOption,
     ) -> Result<(), XHFSError> {
-        self.blob_write(path, data, false, opt).await
+        self.blob_write(path, data, INodeKind::File, opt).await
     }
 
     pub async fn fwrite_stream<P, R>(
         &self,
         path: P,
         mut stream: R,
-        mut block_size: usize,
+        block_size: usize,
         opt: WriteOption,
     ) -> eyre::Result<()>
     where
@@ -790,7 +831,6 @@ impl XHFS {
         let path: PathBuf = path.into();
         self.fwrite(&path, vec![], opt).await?;
         let mut buf = vec![0u8; block_size];
-        let mut pos = stream.stream_position().await?;
         loop {
             if buf.len() != block_size {
                 buf.resize(block_size, 0);
@@ -802,29 +842,13 @@ impl XHFS {
             }
 
             let chunk = &buf[..n];
-            match self.fappend(&path, chunk.to_vec()).await {
-                Ok(_) => {
-                    pos += n as u64;
-                }
-                Err(e) => {
-                    if let XHFSError::Insufficient { max_slot_size, .. } = e {
-                        let new_size = max_slot_size.saturating_sub(16);
-                        if new_size == 0 {
-                            return Err(e.into());
-                        }
-                        block_size = new_size;
-                        stream.seek(SeekFrom::Start(pos)).await?;
-                        continue;
-                    }
-                    return Err(e.into());
-                }
-            }
+            self.fappend(&path, chunk.to_vec()).await?
         }
 
         Ok(())
     }
 
-    pub async fn create_link<P: Into<PathBuf> + Clone>(
+    pub async fn create_symlink<P: Into<PathBuf> + Clone>(
         &self,
         path: P,
         content: P,
@@ -833,14 +857,45 @@ impl XHFS {
         let _ = self.resolve_parent(content.clone()).await?;
         self.blob_write(
             path,
-            SymLink {
+            Symlink {
                 path: content.into(),
             }
             .serialize(),
-            true,
+            INodeKind::Symlink,
             opt,
         )
         .await?;
+
+        Ok(())
+    }
+
+    pub async fn create_hardlink<P: Into<PathBuf> + Clone>(
+        &self,
+        path: P,
+        content: P,
+        opt: WriteOption,
+    ) -> eyre::Result<()> {
+        let inode = self.resolve_path(content).await?;
+        if !matches!(inode.kind, INodeKind::File) {
+            eyre::bail!(
+                "Unexpected {:?}, Hardlink only attaches to a file",
+                inode.kind
+            );
+        }
+
+        self.blob_write(
+            path,
+            Hardlink {
+                inumber: inode.inumber,
+            }
+            .serialize(),
+            INodeKind::Hardlink,
+            opt,
+        )
+        .await?;
+
+        tracing::debug!("Hardlink creation succeded, updating target inode nlink");
+        self.increment_inode_nlink(inode).await?;
 
         Ok(())
     }
@@ -909,35 +964,51 @@ impl XHFS {
         Ok(created_new)
     }
 
+    async fn follow_link_or_noop(&self, inode: INode) -> eyre::Result<INode, XHFSError> {
+        match inode.kind {
+            INodeKind::Hardlink => {
+                tracing::debug!("Trying to read file from Hardlink");
+                let inumber = self.read_full_data_from_extent(inode.extent_addr).await?;
+                let hardlink = Hardlink::deserialize(&inumber)?;
+                if hardlink.inumber == inode.inumber {
+                    tracing::warn!("Invalid fs state: Hardlink pointing to itself detected");
+                    return Err(XHFSError::from_report(eyre::eyre!(
+                        "Hardlink pointing to itself detected"
+                    )));
+                }
+                let referenced = self.resolve_inode(hardlink.inumber).await?.ok_or_else(|| {
+                    eyre::eyre!("Referenced entry INode #{} not found", hardlink.inumber)
+                })?;
+
+                Ok(referenced)
+            }
+            INodeKind::Symlink => {
+                tracing::debug!("Trying to read file from Symlink");
+                let raw_path = self.read_full_data_from_extent(inode.extent_addr).await?;
+                let symlink = Symlink::deserialize(&raw_path)?;
+                let referenced = self.resolve_path(symlink.path).await?;
+                Ok(referenced)
+            }
+            _ => Ok(inode),
+        }
+    }
+
     #[async_recursion(?Send)]
     pub async fn fread<P: Into<PathBuf>>(&self, path: P) -> Result<Vec<u8>, XHFSError> {
         let path: PathBuf = path.into();
         let inode = self.resolve_path(&path).await?;
+        tracing::debug!("Trying to read file from path {}", path.display());
         match inode.kind {
+            INodeKind::File => self.read_full_data_from_extent(inode.extent_addr).await,
+            INodeKind::Symlink | INodeKind::Hardlink => {
+                tracing::debug!(" {:?} detected, following the payload", inode.kind);
+                let referenced_inode = self.follow_link_or_noop(inode).await?;
+                self.read_full_data_from_extent(referenced_inode.extent_addr)
+                    .await
+            }
             INodeKind::Directory => Err(XHFSError::from_report(eyre::eyre!(
                 "Cannot fread directory"
             ))),
-            INodeKind::File => {
-                tracing::debug!("Trying to read file from path {}", path.display());
-                self.read_full_data_from_extent(inode.extent_addr).await
-            }
-            INodeKind::Symlink => {
-                tracing::debug!("Trying to read file from symlink");
-                let raw_path = self.read_full_data_from_extent(inode.extent_addr).await?;
-                let symlink = SymLink::deserialize(&raw_path)?;
-                tracing::debug!(
-                    " {} *=> {}",
-                    normalize_path(&path),
-                    normalize_path(&symlink.path)
-                );
-                if symlink.path == path {
-                    tracing::warn!("Invalid fs state: Symlink pointing to itself detected");
-                    return Err(XHFSError::from_report(eyre::eyre!(
-                        "Symlink pointing to itself detected"
-                    )));
-                }
-                self.fread(symlink.path).await
-            }
         }
     }
 
@@ -950,28 +1021,20 @@ impl XHFS {
     ) -> eyre::Result<Vec<u8>> {
         let path: PathBuf = path.into();
         let inode = self.resolve_path(&path).await?;
+        let inode = self.follow_link_or_noop(inode).await?;
         match inode.kind {
             INodeKind::File => {
                 self.seek_full_data_from_extent(inode.extent_addr, start, end)
                     .await
             }
-            INodeKind::Symlink => {
-                tracing::debug!("Trying to read+seek file from symlink");
-                let raw_path = self.read_full_data_from_extent(inode.extent_addr).await?;
-                let symlink = SymLink::deserialize(&raw_path)?;
-                tracing::debug!(
-                    " {} *=> {}",
-                    normalize_path(&path),
-                    normalize_path(&symlink.path)
-                );
-                if symlink.path == path {
-                    tracing::warn!("Invalid fs state: Symlink pointing to itself detected");
-                    eyre::bail!("Symlink pointing to itself detected");
-                }
-                self.fseek(symlink.path, start, end).await
-            }
             INodeKind::Directory => {
                 eyre::bail!("Cannot fread directory");
+            }
+            INodeKind::Symlink | INodeKind::Hardlink => {
+                eyre::bail!(
+                    "Unexpected {:?}, should have been solved upstream",
+                    inode.kind
+                )
             }
         }
     }
@@ -980,44 +1043,44 @@ impl XHFS {
     // fprepend?
 
     #[async_recursion(?Send)]
-    pub async fn fappend<P: Into<PathBuf>>(&self, path: P, data: Vec<u8>) -> Result<(), XHFSError> {
-        let path: PathBuf = path.into();
-        let mut inode = self.resolve_path(&path).await?;
+    pub async fn fappend_inode(&self, mut inode: INode, data: Vec<u8>) -> Result<(), XHFSError> {
         match inode.kind {
             INodeKind::File => {
                 inode.total_file_size += data.len() as u64;
-                self.append_or_allocate_extent(inode.extent_addr, data)
+                inode.extent_addr = self
+                    .append_or_allocate_extent(inode.extent_addr, data)
                     .await?;
                 self.update_inode_mtime_now(inode).await?;
             }
             INodeKind::Symlink => {
-                tracing::debug!("Trying tofappend file from symlink");
-                let symlink = {
-                    let raw_path = self.read_full_data_from_extent(inode.extent_addr).await?;
-                    SymLink::deserialize(&raw_path)?
-                };
+                let referenced = self.follow_link_or_noop(inode.clone()).await?;
+                self.fappend_inode(referenced, data).await?;
+            }
+            INodeKind::Hardlink => {
+                tracing::debug!("Trying to fappend file from Hardlink");
+                let referenced = self.follow_link_or_noop(inode.clone()).await?;
                 tracing::debug!(
-                    " {} *=> {}",
-                    normalize_path(&path),
-                    normalize_path(&symlink.path)
+                    " INode #{} *=> INode #{}",
+                    inode.inumber,
+                    referenced.inumber
                 );
-                if symlink.path == path {
-                    tracing::warn!("Invalid fs state: Symlink pointing to itself detected");
-                    xhfs_bail!("Symlink pointing to itself detected");
+                if referenced.inumber == inode.inumber {
+                    xhfs_bail!("Hardlink pointing to itself detected");
                 }
-                self.fappend(symlink.path, data).await?;
+                self.fappend_inode(referenced, data).await?;
             }
             INodeKind::Directory => {
                 xhfs_bail!("Cannot append data to directory");
             }
         };
-
         Ok(())
     }
 
-    pub async fn update_inode_mtime_now(&self, mut inode: INode) -> eyre::Result<()> {
-        inode.mtime = utc_now_u64();
-        self.register_inode(&inode, true).await
+    pub async fn fappend<P: Into<PathBuf>>(&self, path: P, data: Vec<u8>) -> Result<(), XHFSError> {
+        let path: PathBuf = path.into();
+        let inode = self.resolve_path(&path).await?;
+        self.fappend_inode(inode, data).await?;
+        Ok(())
     }
 
     pub async fn read_extent(&self, addr: u64) -> Result<Extent, XHFSError> {
@@ -1036,7 +1099,10 @@ impl XHFS {
         Ok(out)
     }
 
-    pub async fn read_extent_metadata(&self, addr: u64) -> eyre::Result<(RegionSlot, AddressSlot)> {
+    pub async fn read_extent_metadata(
+        &self,
+        addr: u64,
+    ) -> eyre::Result<(RegionSlot, MaybeU64, u64)> {
         let extent_header = self.ctrl.read(addr as usize, 16).await?;
         let curr_extent_data_size = u64::from_le_bytes(extent_header[0..8].try_into()?);
         eyre::ensure!(Extent::HEADER_NEXT_OFFSET == 8);
@@ -1051,18 +1117,20 @@ impl XHFS {
                 start: MaybeU64::from(addr),
                 end: MaybeU64::from(addr + aligned_capacity),
             },
-            AddressSlot {
-                addr: next_extent,
-                capacity: aligned_capacity as usize,
-            },
+            next_extent,
+            curr_extent_data_size,
         ))
     }
 
     pub async fn exists<P: Into<PathBuf>>(&self, path: P) -> eyre::Result<bool> {
-        Ok(self.stats(path).await?.is_some())
+        Ok(self.stats(path, false).await?.is_some())
     }
 
-    pub async fn stats<P: Into<PathBuf>>(&self, path: P) -> eyre::Result<Option<EntryStat>> {
+    pub async fn stats<P: Into<PathBuf>>(
+        &self,
+        path: P,
+        follow_hardlink: bool,
+    ) -> eyre::Result<Option<EntryStat>> {
         let path: PathBuf = path.into();
         let components = path_to_string_list(path.clone());
 
@@ -1071,13 +1139,20 @@ impl XHFS {
             return Ok(Some(EntryStat {
                 name: "/".to_string(),
                 size: None,
+                nlink: inode.nlink,
                 kind: inode.kind,
                 mtime: inode.mtime,
                 ctime: inode.ctime,
             }));
         }
         let inode = match self.resolve_path(path).await {
-            Ok(v) => v,
+            Ok(inode) => {
+                if follow_hardlink && matches!(inode.kind, INodeKind::Hardlink) {
+                    self.follow_link_or_noop(inode).await?
+                } else {
+                    inode
+                }
+            }
             Err(_) => return Ok(None),
         };
         let name = components.last().unwrap().clone();
@@ -1088,26 +1163,25 @@ impl XHFS {
                 INodeKind::Directory => None,
                 _ => Some(inode.total_file_size as usize),
             },
+            nlink: inode.nlink,
             kind: inode.kind,
             mtime: inode.mtime,
             ctime: inode.ctime,
         }))
     }
 
-    pub async fn allocate(&self, wanted_size: usize) -> Result<u64, XHFSError> {
-        tracing::debug!("Trying to allocate {wanted_size} blocks");
-
+    pub async fn allocate(
+        &self,
+        mut wanted_blocks: usize,
+    ) -> Result<Vec<AllocationSlot>, XHFSError> {
+        tracing::debug!("Planning allocation for {wanted_blocks} blocks");
         let _guard = self.alloc_guard.lock().await;
-        let mut max_slot_size = usize::MIN;
-        let mut min_slot_size = usize::MAX;
-        let mut found = None;
-        let mut free_slot_sizes = vec![];
-        for g_index in 0..self.static_format.group_count {
-            let group =
-                GroupLayout::derive_from_group_index(g_index, &self.geometry).ok_or_else(|| {
-                    eyre::eyre!("Failed calculating group layout for index {g_index}")
-                })?;
+        let mut planned_allocations = vec![];
+        let mut bitmaps_to_commit = vec![];
 
+        // SIMPLE: contiguous block search
+        'outer: for g_index in 0..self.static_format.group_count {
+            let group = GroupLayout::derive_from_group_index(g_index, &self.geometry).unwrap();
             let bitmap_slot = group.data_bitmap_region.to_addr_slot();
             let raw_bitmap = self
                 .ctrl
@@ -1118,45 +1192,87 @@ impl XHFS {
             let zero_runs =
                 bitmap.runs_of(false, Some(self.geometry.usable_blocks_per_group as usize));
             for slot in zero_runs {
-                max_slot_size = max_slot_size.max(slot.size);
-                min_slot_size = min_slot_size.min(slot.size);
-                free_slot_sizes.push(slot.size * self.static_format.block_size_bytes as usize);
-                if slot.size >= wanted_size {
-                    found = Some((slot.start, group, bitmap, bitmap_slot.addr));
-                    break;
+                if slot.size >= wanted_blocks {
+                    let mut mut_bitmap = bitmap.clone();
+                    mut_bitmap.set_range(slot.start, wanted_blocks, true)?;
+
+                    let data_offset = group.data_region.start.get();
+                    let absolute_byte_addr =
+                        data_offset + (slot.start as u64) * self.static_format.block_size_bytes;
+
+                    planned_allocations.push(AllocationSlot {
+                        absolute_byte_addr,
+                        block_count: wanted_blocks,
+                    });
+                    bitmaps_to_commit.push((bitmap_slot.addr, mut_bitmap));
+                    wanted_blocks = 0;
+                    break 'outer;
                 }
             }
+        }
 
-            if found.is_some() {
-                break;
+        // FALLBACK: collect fragments across groups
+        if wanted_blocks > 0 {
+            for g_index in 0..self.static_format.group_count {
+                if wanted_blocks == 0 {
+                    break;
+                }
+                let group = GroupLayout::derive_from_group_index(g_index, &self.geometry).unwrap();
+                let bitmap_slot = group.data_bitmap_region.to_addr_slot();
+                let raw_bitmap = self
+                    .ctrl
+                    .raw_read(bitmap_slot.addr.into(), bitmap_slot.capacity)
+                    .await?;
+                let mut bitmap = Bitmap::deserialize(&raw_bitmap)?;
+
+                let zero_runs =
+                    bitmap.runs_of(false, Some(self.geometry.usable_blocks_per_group as usize));
+                let mut bitmap_changed = false;
+                for slot in zero_runs {
+                    if wanted_blocks == 0 {
+                        break;
+                    }
+                    let blocks_to_take = slot.size.min(wanted_blocks);
+                    bitmap.set_range(slot.start, blocks_to_take, true)?;
+                    bitmap_changed = true;
+
+                    let data_offset = group.data_region.start.get();
+                    let absolute_byte_addr =
+                        data_offset + (slot.start as u64) * self.static_format.block_size_bytes;
+                    tracing::warn!(
+                        "PLANNING ALLOCATED: group index {}, start block {}, count {}",
+                        g_index,
+                        slot.start,
+                        blocks_to_take
+                    );
+                    planned_allocations.push(AllocationSlot {
+                        absolute_byte_addr,
+                        block_count: blocks_to_take,
+                    });
+                    wanted_blocks -= blocks_to_take;
+                }
+
+                if bitmap_changed {
+                    bitmaps_to_commit.push((bitmap_slot.addr, bitmap));
+                }
             }
         }
 
-        if let Some((start_block, group, mut bitmap, bitmap_addr)) = found {
-            let data_offset = group.data_region.start.get();
-            let addr = data_offset + (start_block as u64) * self.static_format.block_size_bytes;
-            bitmap.set_range(start_block, wanted_size, true)?;
-            // commit
-            self.ctrl
-                .raw_write(bitmap_addr.into(), &bitmap.serialize()?)
-                .await?;
-            return Ok(addr);
+        if wanted_blocks > 0 {
+            return Err(XHFSError::Insufficient {
+                operation: "allocate".to_string(),
+                wanted: wanted_blocks,
+            });
         }
 
-        Err(XHFSError::Insufficient {
-            free_slot_sizes,
-            wanted: wanted_size,
-            max_slot_size: if max_slot_size == usize::MIN {
-                0
-            } else {
-                max_slot_size
-            },
-            min_slot_size: if min_slot_size == usize::MAX {
-                0
-            } else {
-                min_slot_size
-            },
-        })
+        // commit!
+        for (bitmap_addr, updated_bitmap) in bitmaps_to_commit {
+            self.ctrl
+                .raw_write(bitmap_addr.into(), &updated_bitmap.serialize()?)
+                .await?;
+        }
+
+        Ok(planned_allocations)
     }
 
     pub async fn mark_as_reusable(&self, addr_slot: AddressSlot) -> eyre::Result<()> {
@@ -1174,151 +1290,103 @@ impl XHFS {
             .await?;
         let mut bitmap = Bitmap::deserialize(&raw_bitmap)?;
 
-        let block_start =
-            (addr - group.data_region.start.get()) / self.static_format.block_size_bytes as u64;
-        let blocks_count = size / self.static_format.block_size_bytes as usize;
-
-        bitmap.set_range(block_start as usize, blocks_count, false)?;
+        let block_size = self.static_format.block_size_bytes as u64;
+        let block_start = (addr - group.data_region.start.get()) / block_size;
+        // make trailing partial block fully freed
+        let calculated_blocks = (size as u64 + block_size - 1) / block_size;
+        let blocks_count = calculated_blocks.max(1);
+        // ensure we don't spil past this group's legal bitmap bounds
+        let max_blocks = self.geometry.usable_blocks_per_group as u64;
+        if block_start + blocks_count > max_blocks {
+            eyre::bail!(
+                "Bitmap boundary violation in group! Trying to free blocks {}..{} but max is {}",
+                block_start,
+                block_start + blocks_count,
+                max_blocks
+            );
+        }
+        bitmap.set_range(block_start as usize, blocks_count as usize, false)?;
 
         // commit
+        tracing::warn!("FREED: start block {block_start}, count {blocks_count}");
         self.ctrl
             .raw_write(bitmap_slot.addr.into(), &bitmap.serialize()?)
             .await
     }
 
     pub async fn allocate_and_write_extent(&self, data: Vec<u8>) -> Result<MaybeU64, XHFSError> {
-        tracing::debug!(
-            "Trying to allocate and write {} B into one or many extents",
-            data.len()
-        );
+        tracing::debug!("Allocating and writing {} B", data.len());
 
-        let single_extent_needed_blocks = (Extent::emulate_serialized_size(data.len())
-            + self.static_format.block_size_bytes as usize
-            - 1)
-            / self.static_format.block_size_bytes as usize;
+        let metadata_overhead = Extent::emulate_serialized_size(0);
+        let block_size = self.static_format.block_size_bytes as usize;
 
-        match self.allocate(single_extent_needed_blocks).await {
-            Ok(addr) => {
-                self.ctrl
-                    .write(
-                        addr as usize,
-                        &Extent {
-                            next: MaybeU64::default(),
-                            data,
-                        }
+        // PREFLIGHT
+        let mut remaining_payload = data.len();
+        let mut exact_blocks_needed = 0;
+        let max_usable_blocks_per_group = self.geometry.usable_blocks_per_group as usize;
+        while remaining_payload > 0 {
+            let max_slot_bytes = max_usable_blocks_per_group * block_size;
+            if max_slot_bytes <= metadata_overhead {
+                return Err(XHFSError::Error {
+                    err: "Group capacity smaller than extent metadata overhead".to_string(),
+                });
+            }
+            let max_payload_per_slot = max_slot_bytes - metadata_overhead;
+            let chunk_size = std::cmp::min(remaining_payload, max_payload_per_slot);
+            let extent_bytes = Extent::emulate_serialized_size(chunk_size);
+            let blocks_for_chunk = (extent_bytes + block_size - 1) / block_size;
+
+            exact_blocks_needed += blocks_for_chunk;
+            remaining_payload -= chunk_size;
+        }
+
+        let allocation_slots = self.allocate(exact_blocks_needed).await?;
+        let mut data_slice = &data[..];
+        let mut serialization_plan = vec![];
+        for slot in allocation_slots {
+            if data_slice.is_empty() {
+                break;
+            }
+            let slot_bytes_capacity = slot.block_count * block_size;
+            if slot_bytes_capacity <= metadata_overhead {
+                continue;
+            }
+            let max_payload_for_slot = slot_bytes_capacity - metadata_overhead;
+            let chunk_size = std::cmp::min(data_slice.len(), max_payload_for_slot);
+            let (current_chunk, remaining) = data_slice.split_at(chunk_size);
+            serialization_plan.push((slot.absolute_byte_addr, current_chunk.to_vec()));
+            data_slice = remaining;
+        }
+
+        if !data_slice.is_empty() {
+            return Err(XHFSError::Error {
+                err: format!(
+                    "Layout mismatch: {} bytes left unallocated",
+                    data_slice.len()
+                ),
+            });
+        }
+
+        // commit! (reverse)
+        let mut next_link = MaybeU64::default();
+        for (absolute_byte_addr, chunk_data) in serialization_plan.into_iter().rev() {
+            let extent = Extent {
+                next: next_link,
+                data: chunk_data,
+            };
+            self.ctrl
+                .write(
+                    absolute_byte_addr as usize,
+                    &extent
                         .serialize()
                         .map_err(|e| XHFSError::Error { err: e.to_string() })?,
-                    )
-                    .await
-                    .map_err(|e| XHFSError::Error { err: e.to_string() })?;
-
-                return Ok(MaybeU64::from(addr));
-            }
-            // fallback to fragmented layout planning
-            Err(XHFSError::Insufficient {
-                free_slot_sizes, ..
-            }) => {
-                if free_slot_sizes.is_empty() {
-                    return Err(XHFSError::Insufficient {
-                        wanted: single_extent_needed_blocks,
-                        max_slot_size: 0,
-                        min_slot_size: 0,
-                        free_slot_sizes,
-                    });
-                }
-
-                let mut available_slots = free_slot_sizes;
-                available_slots.sort_by(|a, b| b.cmp(a));
-
-                let mut data_slice = &data[..];
-                let mut allocation_plan = vec![];
-                for slot_blocks in available_slots {
-                    if data_slice.is_empty() {
-                        break;
-                    }
-                    let slot_bytes_capacity =
-                        slot_blocks * self.static_format.block_size_bytes as usize;
-
-                    let metadata_overhead = Extent::emulate_serialized_size(0);
-                    if slot_bytes_capacity <= metadata_overhead {
-                        continue; // slot too microscopic to even store an extent header
-                    }
-
-                    let max_payload_for_slot = slot_bytes_capacity - metadata_overhead;
-                    let chunk_size = std::cmp::min(data_slice.len(), max_payload_for_slot);
-
-                    let needed_bytes = Extent::emulate_serialized_size(chunk_size);
-                    let needed_blocks =
-                        (needed_bytes + self.static_format.block_size_bytes as usize - 1)
-                            / self.static_format.block_size_bytes as usize;
-                    match self.allocate(needed_blocks).await {
-                        Ok(addr) => {
-                            let (current_chunk, remaining) = data_slice.split_at(chunk_size);
-                            allocation_plan.push((addr, current_chunk.to_vec()));
-                            data_slice = remaining;
-                        }
-                        Err(_) => {
-                            // alloc can fail due to race conditions or bitmap layout variations
-                            continue;
-                        }
-                    }
-                }
-
-                // we might run out of space options before consuming the input data payload
-                if !data_slice.is_empty() {
-                    // Note: inefficient, but alloc are upfront cost so..
-                    // rollback allocated segments to prevent storage leaks
-                    for (addr, chunk) in allocation_plan {
-                        let needed_bytes = Extent::emulate_serialized_size(chunk.len());
-                        let capacity =
-                            ((needed_bytes + self.static_format.block_size_bytes as usize - 1)
-                                / self.static_format.block_size_bytes as usize)
-                                * self.static_format.block_size_bytes as usize;
-
-                        let _ = self
-                            .mark_as_reusable(AddressSlot {
-                                addr: MaybeU64::from(addr),
-                                capacity,
-                            })
-                            .await;
-                    }
-
-                    return Err(XHFSError::Insufficient {
-                        wanted: single_extent_needed_blocks,
-                        max_slot_size: 0,
-                        min_slot_size: 0,
-                        free_slot_sizes: vec![],
-                    });
-                }
-
-                // TODO:
-                // we own a lock but I think best is have in storage lock at this point
-
-                // commmit!
-                let mut next_link = MaybeU64::default();
-                for (addr, chunk_data) in allocation_plan.into_iter().rev() {
-                    let extent = Extent {
-                        next: next_link,
-                        data: chunk_data,
-                    };
-
-                    self.ctrl
-                        .write(
-                            addr as usize,
-                            &extent
-                                .serialize()
-                                .map_err(|e| XHFSError::Error { err: e.to_string() })?,
-                        )
-                        .await
-                        .map_err(|e| XHFSError::Error { err: e.to_string() })?;
-
-                    next_link = MaybeU64::from(addr);
-                }
-
-                Ok(next_link)
-            }
-            Err(e) => Err(e),
+                )
+                .await
+                .map_err(|e| XHFSError::Error { err: e.to_string() })?;
+            next_link = MaybeU64::from(absolute_byte_addr);
         }
+
+        Ok(next_link)
     }
 
     pub async fn free_full_extent(&self, start_extent_addr: MaybeU64) -> eyre::Result<()> {
@@ -1328,16 +1396,13 @@ impl XHFS {
         );
 
         let mut addr = start_extent_addr;
-        let block_size = self.static_format.block_size_bytes as usize;
-        while let Some(current_addr) = addr.to_optional() {
-            let (_, meta) = self.read_extent_metadata(current_addr).await?;
-            let next_hop = meta.addr;
 
-            let exact_bytes = meta.capacity;
-            let physical_capacity = ((exact_bytes + block_size - 1) / block_size) * block_size;
+        while let Some(current_addr) = addr.to_optional() {
+            let (curr_region, next_hop, _) = self.read_extent_metadata(current_addr).await?;
+
             self.mark_as_reusable(AddressSlot {
                 addr: MaybeU64::from(current_addr),
-                capacity: physical_capacity,
+                capacity: curr_region.size_span() as usize,
             })
             .await?;
 
@@ -1376,9 +1441,8 @@ impl XHFS {
         let mut addr = start_extent_addr;
 
         while let Some(current_addr) = addr.to_optional() {
-            let (_, meta) = self.read_extent_metadata(current_addr).await?;
             last_extent = Some(current_addr);
-            let next_addr = meta.addr;
+            let (_, next_addr, _) = self.read_extent_metadata(current_addr).await?;
             addr = next_addr;
         }
 
@@ -1426,8 +1490,8 @@ impl XHFS {
                 break;
             }
             tracing::debug!("Resolving {i}-th extent metadata 0x{next_addr:x}");
-            let (block_slot, addr_slot) = self.read_extent_metadata(next_addr).await?;
-            addr = addr_slot.addr;
+            let (block_slot, next_addr, _) = self.read_extent_metadata(next_addr).await?;
+            addr = next_addr;
             blocks.push(block_slot);
             i += 1;
         }

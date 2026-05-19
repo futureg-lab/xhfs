@@ -19,7 +19,7 @@ configuration:
   logical:
     - name: dev1
       include: [bloc1, bloc2]
-      capacity: "2 MiB"
+      capacity: "90 MiB"
       max_concurrent: 2
     - name: dev2
       include: [bloc3]

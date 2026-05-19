@@ -5,7 +5,7 @@ use crate::device::{
     disk::Controller,
     fs_device::FsDevice,
     kv_device::{KVDevice, MemoryKV},
-    logical::LogicalDevice,
+    logical::{DeviceLike, LogicalDevice},
 };
 use tokio::{fs, sync::RwLock};
 
@@ -136,12 +136,12 @@ async fn test_logical_device() -> eyre::Result<()> {
     let dev1 = LogicalDevice::new(
         2,
         [
-            Arc::from(dev1) as Arc<dyn Device>,
-            Arc::from(dev4) as Arc<dyn Device>,
-            Arc::from(dev2) as Arc<dyn Device>,
+            Arc::from(dev1) as DeviceLike,
+            Arc::from(dev4) as DeviceLike,
+            Arc::from(dev2) as DeviceLike,
         ],
     )?;
-    let dev2 = LogicalDevice::new(2, [Arc::from(dev3) as Arc<dyn Device>])?;
+    let dev2 = LogicalDevice::new(2, [Arc::from(dev3) as DeviceLike])?;
     test_read_write_complex!(&dev1).await?;
     test_read_write_complex!(&dev2).await?;
 

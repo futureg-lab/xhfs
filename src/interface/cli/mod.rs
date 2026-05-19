@@ -105,14 +105,14 @@ impl MainCommand {
         match &self.command {
             Commands::Format(global_options) => {
                 if global_options.force || confirm_destructive_action() {
-                    let bfs = global_options.format_and_get_bfs().await?;
-                    println!("Formatted {} Bytes", bfs.total_capacity()?);
+                    let xhfs = global_options.format_and_get_xhfs().await?;
+                    println!("Formatted {} Bytes", xhfs.total_capacity()?);
                 } else {
                     println!("abort");
                 }
             }
             Commands::Upload(u) => {
-                let bfs = u.global.get_bfs().await?;
+                let xhfs = u.global.get_xhfs().await?;
                 let data = fs::read(&u.src_path).await?;
                 let dest_path = match &u.dest_path {
                     Some(path) => path.to_owned(),
@@ -125,7 +125,7 @@ impl MainCommand {
                 };
 
                 if u.single_block {
-                    bfs.fwrite(
+                    xhfs.fwrite(
                         &dest_path,
                         data,
                         WriteOption {
@@ -135,7 +135,7 @@ impl MainCommand {
                     .await?;
                 } else {
                     let file = File::open(&u.src_path).await?;
-                    bfs.fwrite_stream(
+                    xhfs.fwrite_stream(
                         &dest_path,
                         file,
                         u.block_size,
@@ -147,7 +147,7 @@ impl MainCommand {
                 }
             }
             Commands::Download(d) => {
-                let bfs = d.global.get_bfs().await?;
+                let xhfs = d.global.get_xhfs().await?;
                 let dest_path = match &d.dest_path {
                     Some(path) => path.clone(),
                     None => d.src_path.file_name().expect("Valid filename").into(),
@@ -155,20 +155,24 @@ impl MainCommand {
                 if dest_path.exists() && !d.overwrite {
                     eyre::bail!("File {} already exists", dest_path.display());
                 }
-                let data = bfs.fread(&d.src_path).await?;
+                let data = xhfs.fread(&d.src_path).await?;
                 fs::write(dest_path, data).await?;
             }
             Commands::Read(r) => {
-                let bfs = r.global.get_bfs().await?;
-                let data = bfs.fread(&r.path).await?;
+                let xhfs = r.global.get_xhfs().await?;
+                let data = xhfs.fread(&r.path).await?;
                 let mut out = stdout();
                 out.write_all(&data).await?;
                 out.flush().await?;
             }
             Commands::X(x) => x.run().await?,
             Commands::Info(global_options) => {
-                let bfs = global_options.get_bfs().await?;
-                println!("{}", bfs.format_headers_report().await?);
+                println!(
+                    "Config used: {}",
+                    global_options.resolve_config_path().display()
+                );
+                let xhfs = global_options.get_xhfs().await?;
+                println!("{}", xhfs.format_headers_report().await?);
             }
             Commands::Inspect(i) => i.command.run().await?,
         }
@@ -188,12 +192,12 @@ impl GlobalOptions {
         }
     }
 
-    pub async fn format_and_get_bfs(&self) -> eyre::Result<XHFS> {
+    pub async fn format_and_get_xhfs(&self) -> eyre::Result<XHFS> {
         let config = Config::load(self.resolve_config_path())?;
         config.materialize(true, self.password.clone()).await
     }
 
-    pub async fn get_bfs(&self) -> eyre::Result<XHFS> {
+    pub async fn get_xhfs(&self) -> eyre::Result<XHFS> {
         let config = Config::load(self.resolve_config_path())?;
         config.materialize(false, self.password.clone()).await
     }

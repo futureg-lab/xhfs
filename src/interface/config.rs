@@ -1,7 +1,6 @@
 use crate::{
     device::{
-        Device, disk::Controller, fs_device::FsDevice, http_device::HttpKV, kv_device::*,
-        logical::LogicalDevice,
+        disk::Controller, fs_device::FsDevice, http_device::HttpKV, kv_device::*, logical::*,
     },
     utils::normalize_path,
     xhfs::*,
@@ -228,7 +227,7 @@ configuration:
                         store: Arc::new(MemoryKV(RwLock::new(HashMap::new()))),
                         total_slots: (capacity / *slot_capacity_bytes) as usize,
                         slot_capacity: *slot_capacity_bytes as usize,
-                    }) as Arc<dyn Device>,
+                    }) as DeviceLike,
                     DeviceConfig::KVHttp {
                         slot_capacity_bytes,
                         url,
@@ -242,9 +241,9 @@ configuration:
                         }),
                         total_slots: (capacity / *slot_capacity_bytes) as usize,
                         slot_capacity: *slot_capacity_bytes as usize,
-                    }) as Arc<dyn Device>,
+                    }) as DeviceLike,
                     DeviceConfig::File { path, .. } => {
-                        Arc::new(FsDevice::new(path, capacity as usize).await?) as Arc<dyn Device>
+                        Arc::new(FsDevice::new(path, capacity as usize).await?) as DeviceLike
                     }
                 };
                 group.push(instance);

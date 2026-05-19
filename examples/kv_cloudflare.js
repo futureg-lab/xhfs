@@ -1,5 +1,5 @@
 /**
- * This is 1-1 translation of kv_handler.ts
+ * This is a 1-1 translation of kv_handler.ts
  *
  * Assumes you have `KV` namespace enabled.
  */

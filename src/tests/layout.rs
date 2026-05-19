@@ -1,13 +1,15 @@
 use crate::xhfs::ds::*;
 use bitvec::{bitvec, order::Msb0};
 
-fn create_test_header(block_size: u64, blocks_per_group: u64, groups: u64) -> XHFSHeader {
+fn create_test_header(block_size: u64, groups: u64) -> XHFSHeader {
     XHFSHeader {
         version: 1,
         chacha20_nonce: Default::default(),
+        extra_metadata: [0; 32],
         format: Format {
+            param_data_block_count_per_group: 20480,
+            param_inode_count_per_group: 4096,
             block_size_bytes: block_size,
-            blocks_per_group,
             group_count: groups,
         },
     }
@@ -65,7 +67,7 @@ fn test_geometry_mathematical_invariants() -> eyre::Result<()> {
     // standard 256MB group with 4KB blocks
     let block_size = 4096;
     let blocks_per_group = 65536; // 256 MB / 4 KB
-    let header = create_test_header(block_size, blocks_per_group, 4);
+    let header = create_test_header(block_size, blocks_per_group);
     let (geometry, templates) = header.calculate_relative_geometry()?;
 
     assert_eq!(
@@ -84,9 +86,6 @@ fn test_geometry_mathematical_invariants() -> eyre::Result<()> {
     );
     assert_contiguous!(geometry.rel_inode_table_region, geometry.rel_data_region);
 
-    let expected_total_group_bytes = blocks_per_group * block_size;
-    assert_eq!(geometry.group_stride, expected_total_group_bytes);
-
     // Note: BAD
     // let expected_total_group_bytes = blocks_per_group * block_size;
     // assert_eq!(
@@ -102,13 +101,6 @@ fn test_geometry_mathematical_invariants() -> eyre::Result<()> {
         data_region_size_bytes % block_size,
         0,
         "data payload region size ({data_region_size_bytes}) must be a clean multiple of block size ({block_size})",
-    );
-    assert_eq!(geometry.group_stride, expected_total_group_bytes);
-    assert!(
-        geometry.rel_data_region.end.get() < expected_total_group_bytes,
-        "data region end ({}) exceeded physical group ceiling ({})",
-        geometry.rel_data_region.end.get(),
-        expected_total_group_bytes - 1
     );
 
     // check physical capacity sizes fi they correspond exactly to the serialized payload allocations
@@ -139,7 +131,7 @@ fn test_geometry_mathematical_invariants() -> eyre::Result<()> {
 fn test_usable_blocks_derivation() -> eyre::Result<()> {
     let block_size = 4096;
     let blocks_per_group = 32768; // 128 MB Group
-    let header = create_test_header(block_size, blocks_per_group, 2);
+    let header = create_test_header(block_size, blocks_per_group);
     let (geometry, _) = header.calculate_relative_geometry()?;
 
     let data_region_bytes =
@@ -160,7 +152,7 @@ fn test_micro_embedded_disk_limits() -> eyre::Result<()> {
     // These are all inspired from real ext3, ext4 configurations
     let block_size = 512; // legacy small block layout
     let blocks_per_group = 2048; // 1 MB total size profile
-    let header = create_test_header(block_size, blocks_per_group, 1);
+    let header = create_test_header(block_size, blocks_per_group);
     let (geometry, templates) = header.calculate_relative_geometry()?;
 
     assert_contiguous!(geometry.rel_header_region, geometry.rel_data_bitmap_region);
@@ -186,19 +178,6 @@ fn test_micro_embedded_disk_limits() -> eyre::Result<()> {
         geometry.usable_blocks_per_group > 0,
         "metadata completely exhausted the block group allocation, zero data blocks left for files"
     );
-
-    Ok(())
-}
-
-#[test]
-fn test_inode_count_invariants() -> eyre::Result<()> {
-    let block_size = 2048;
-    let header = create_test_header(block_size, 16384, 1);
-    let (geometry, _) = header.calculate_relative_geometry()?;
-
-    // INodes in group constraint is defined strictly as 8 * block_size
-    let expected_inodes = 8 * block_size;
-    assert_eq!(geometry.n_inodes_in_group, expected_inodes);
 
     Ok(())
 }

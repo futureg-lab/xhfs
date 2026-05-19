@@ -11,6 +11,7 @@ pub fn test_basic_binary_serialization() -> eyre::Result<()> {
             total_file_size: 42,
             mtime: 567845678,
             ctime: 123457523,
+            extra_metadata: [4; 32],
         };
         let data = original.serialize()?;
         let reconstr = INode::deserialize(&data)?;
@@ -57,11 +58,13 @@ pub fn test_basic_binary_serialization() -> eyre::Result<()> {
         let original = XHFSHeader {
             version: 42,
             format: Format {
+                param_data_block_count_per_group: 4413,
+                param_inode_count_per_group: 99999,
                 block_size_bytes: 12348794,
-                blocks_per_group: 234567,
                 group_count: 4,
             },
             chacha20_nonce: Crypto::gen_nonce(),
+            extra_metadata: [6; 32],
         };
         let data = original.serialize()?;
         let reconstr = XHFSHeader::deserialize(&data)?;

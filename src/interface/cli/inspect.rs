@@ -1,4 +1,7 @@
-use crate::{interface::cli::GlobalOptions, xhfs::addr::MaybeU64};
+use crate::{
+    interface::cli::GlobalOptions,
+    xhfs::{addr::MaybeU64, ds::Bitmap},
+};
 use clap::{Args, Subcommand};
 use std::path::PathBuf;
 use tokio::fs;
@@ -19,6 +22,22 @@ pub enum InspectSubcommands {
     Dump(DumpBlock),
     /// Display a view of a block by range
     View(ViewBlock),
+    /// Display layout and used space
+    Map(ViewMap),
+}
+
+#[derive(Args, Debug)]
+pub struct ViewMap {
+    /// Start address
+    #[arg(value_parser = parse_hex_or_decimal, default_value = "1")]
+    pub start_group: u64,
+    /// End address
+    #[arg(value_parser = parse_hex_or_decimal, default_value = "6")]
+    pub end_group: u64,
+    #[arg(short, long, default_value = "64")]
+    pub columns: usize,
+    #[command(flatten)]
+    pub global: GlobalOptions,
 }
 
 #[derive(Args, Debug)]
@@ -82,14 +101,14 @@ impl InspectSubcommands {
     pub async fn run(&self) -> eyre::Result<()> {
         match self {
             InspectSubcommands::Inode(i) => {
-                let bfs = i.global.get_bfs().await?;
-                let inode = bfs.resolve_path(&i.path).await?;
+                let xhfs = i.global.get_xhfs().await?;
+                let inode = xhfs.resolve_path(&i.path).await?;
                 println!("INode #{}\n", inode.inumber);
                 println!("{inode}");
             }
             InspectSubcommands::Extent(e) => {
-                let bfs = e.global.get_bfs().await?;
-                let meta_exts = bfs
+                let xhfs = e.global.get_xhfs().await?;
+                let meta_exts = xhfs
                     .find_full_extent_metadata(MaybeU64::from(e.address), Some(e.max_follow))
                     .await?;
                 for (i, ext) in meta_exts.iter().enumerate() {
@@ -97,35 +116,76 @@ impl InspectSubcommands {
                 }
             }
             InspectSubcommands::Dump(d) => {
-                let bfs = d.global.get_bfs().await?;
+                let xhfs = d.global.get_xhfs().await?;
                 let size = d.end_address.saturating_sub(d.start_address);
                 if d.dest_path.exists() && !d.overwrite {
                     eyre::bail!("File {} already exists", d.dest_path.display());
                 }
                 let blob = if d.decrypt {
-                    bfs.ctrl
+                    xhfs.ctrl
                         .read(d.start_address as usize, size as usize)
                         .await?
                 } else {
-                    bfs.ctrl
+                    xhfs.ctrl
                         .raw_read(d.start_address as usize, size as usize)
                         .await?
                 };
                 fs::write(&d.dest_path, blob).await?;
             }
             InspectSubcommands::View(v) => {
-                let bfs = v.global.get_bfs().await?;
+                let xhfs = v.global.get_xhfs().await?;
                 let size = v.end_address.saturating_sub(v.start_address);
                 let blob = if v.decrypt {
-                    bfs.ctrl
+                    xhfs.ctrl
                         .read(v.start_address as usize, size as usize)
                         .await?
                 } else {
-                    bfs.ctrl
+                    xhfs.ctrl
                         .raw_read(v.start_address as usize, size as usize)
                         .await?
                 };
                 hex_view(&blob, v.columns)?;
+            }
+            InspectSubcommands::Map(v) => {
+                let xhfs = v.global.get_xhfs().await?;
+                let header = xhfs.get_header().await?;
+                let (g, _) = header.calculate_relative_geometry()?;
+                let start_idx = v.start_group.saturating_sub(1).max(0);
+                let end_idx = v
+                    .end_group
+                    .saturating_sub(1)
+                    .min(header.format.group_count - 1);
+                let mut offset = 0;
+                for gc in start_idx..=end_idx {
+                    println!("Group #{} (idx {}) at 0x{:08x}", gc + 1, gc, offset);
+                    let region = g.rel_data_bitmap_region.add_offset(offset);
+
+                    println!("Data Region:  {region}");
+                    let data_bitmap = {
+                        let slot = region.to_addr_slot();
+                        let data = xhfs
+                            .ctrl
+                            .raw_read(slot.addr.into(), slot.capacity as usize)
+                            .await?;
+                        Bitmap::deserialize(&data)?
+                    };
+                    print_bitmap(&data_bitmap, v.columns, v.global.verbose);
+
+                    let region = g.rel_inode_bitmap_region.add_offset(offset);
+                    println!("INode Region: {region}");
+                    let inode_bitmap = {
+                        let slot = region.to_addr_slot();
+                        let data = xhfs
+                            .ctrl
+                            .raw_read(slot.addr.into(), slot.capacity as usize)
+                            .await?;
+                        Bitmap::deserialize(&data)?
+                    };
+                    print_bitmap(&inode_bitmap, v.columns, v.global.verbose);
+
+                    offset += g.group_stride;
+                    println!();
+                }
             }
         }
         Ok(())
@@ -169,4 +229,40 @@ pub fn hex_view(data: &[u8], cols: usize) -> eyre::Result<()> {
     }
 
     Ok(())
+}
+
+pub fn print_bitmap(bitmap: &Bitmap, columns: usize, verbose: bool) {
+    let total = bitmap.map.len() as f64;
+    let used = bitmap.runs_of(true, None).iter().fold(0, |a, x| a + x.size) as f64;
+    let perc = 100.0 * used / total.max(0.0001);
+    println!(" Used {perc:.2} %, {used}/{total}");
+
+    if verbose {
+        let cols = columns.max(1);
+        let bits_per_slot = (total / cols as f64).max(1.0);
+        print!(" ");
+        for slot in 0..cols {
+            let start_idx = (slot as f64 * bits_per_slot).round() as usize;
+            let end_idx =
+                (((slot + 1) as f64 * bits_per_slot).round() as usize).min(bitmap.map.len());
+
+            if start_idx >= end_idx {
+                print!(" ");
+                continue;
+            }
+            let slice = &bitmap.map[start_idx..end_idx];
+            let active_count = slice.iter().filter(|b| **b).count();
+            let density = active_count as f64 / slice.len() as f64;
+            if density <= 0.1 {
+                print!("░");
+            } else if density <= 0.4 {
+                print!("▒");
+            } else if density < 7.0 {
+                print!("▓");
+            } else {
+                print!("█");
+            }
+        }
+        println!()
+    }
 }
