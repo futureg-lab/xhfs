@@ -51,7 +51,7 @@ Deno.serve(async (req) => {
     return new Response("OK");
   }
 
-  if (req.method == "GET") {
+  if (req.method === "GET") {
     const value = kvStore.get(key) ?? new Uint8Array(0);
     stats.read += 1;
     return new Response(value, {

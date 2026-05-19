@@ -11,7 +11,7 @@ devices:
   - type: kvhttp
     name: bloc2
     url: http://localhost:8000
-    slot_capacity_bytes: 123456 # this is an example, but ideally make it a power of 2
+    slot_capacity_bytes: 123456
     headers:
       foo: bar
   - type: kvhttp

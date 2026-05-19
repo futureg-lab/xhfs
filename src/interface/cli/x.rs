@@ -38,6 +38,9 @@ pub struct LinkCommand {
     pub src_path: PathBuf,
     /// Link destination path inside XHFS
     pub dest_path: PathBuf,
+    /// As Symlink
+    #[arg(short, long, default_value = "false")]
+    pub symlink: bool,
     #[arg(short, long, default_value = "false")]
     pub overwrite: bool,
     #[command(flatten)]
@@ -80,6 +83,8 @@ pub struct LsCommand {
     pub path: PathBuf,
     #[arg(long, default_value = "false")]
     pub tree: bool,
+    #[arg(long, default_value = "false")]
+    pub recursive: bool,
     #[command(flatten)]
     pub global: GlobalOptions,
 }
@@ -115,7 +120,7 @@ impl LsCommand {
             let full_path = ls.path.join(&entry);
             if ls.global.verbose {
                 let stat = xhfs
-                    .stats(&full_path)
+                    .stats(&full_path, self.recursive)
                     .await?
                     .ok_or_eyre(format!("Missing stat for {entry}"))?;
 
@@ -131,10 +136,14 @@ impl LsCommand {
                         let size = stat.size.unwrap_or(0);
                         ("LINK", bytesize::ByteSize(size as u64).to_string())
                     }
+                    INodeKind::Hardlink => {
+                        let size = stat.size.unwrap_or(0);
+                        ("HARDLINK", bytesize::ByteSize(size as u64).to_string())
+                    }
                 };
 
                 println!(
-                    "{:<4} {:<20} {:>10} {}",
+                    "{:<8} {:<20} {:>10} {}",
                     kind,
                     ctime.format("%Y-%m-%d %H:%M:%S"),
                     size_str,
@@ -163,7 +172,7 @@ impl LsCommand {
             let is_last = i == count - 1;
             let connector = if is_last { "└── " } else { "├── " };
             let full_path = path.join(&entry);
-            let stat = xhfs.stats(&full_path).await?;
+            let stat = xhfs.stats(&full_path, self.recursive).await?;
 
             let mut info = String::new();
             if self.global.verbose {
@@ -237,7 +246,7 @@ impl PathCommand {
 
     pub async fn stats(&self) -> eyre::Result<()> {
         let xhfs = self.global.get_xhfs().await?;
-        let stat = xhfs.stats(&self.path).await?;
+        let stat = xhfs.stats(&self.path, self.recursive).await?;
         if let Some(stat) = stat {
             let (kind, size_str) = match stat.kind {
                 INodeKind::File => {
@@ -248,6 +257,10 @@ impl PathCommand {
                 INodeKind::Symlink => {
                     let size = stat.size.unwrap_or(0);
                     ("LINK", bytesize::ByteSize(size as u64).to_string())
+                }
+                INodeKind::Hardlink => {
+                    let size = stat.size.unwrap_or(0);
+                    ("HARDLINK", bytesize::ByteSize(size as u64).to_string())
                 }
             };
             println!("Path: {}", normalize_path(&self.path));
@@ -271,14 +284,25 @@ impl PathCommand {
 impl LinkCommand {
     pub async fn run(&self) -> eyre::Result<()> {
         let xhfs = self.global.get_xhfs().await?;
-        xhfs.create_link(
-            &self.dest_path,
-            &self.src_path,
-            WriteOption {
-                overwrite: self.overwrite,
-            },
-        )
-        .await?;
+        if self.symlink {
+            xhfs.create_symlink(
+                &self.dest_path,
+                &self.src_path,
+                WriteOption {
+                    overwrite: self.overwrite,
+                },
+            )
+            .await?;
+        } else {
+            xhfs.create_hardlink(
+                &self.dest_path,
+                &self.src_path,
+                WriteOption {
+                    overwrite: self.overwrite,
+                },
+            )
+            .await?;
+        }
         Ok(())
     }
 }

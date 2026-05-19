@@ -11,9 +11,7 @@ pub enum INodeKind {
     File,
     Directory,
     Symlink,
-    // TODO: hardlinks are easy doable!
-    // payload is inumber instead of path + increase nlink
-    // Hardlink,
+    Hardlink,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,6 +41,7 @@ pub struct BitRunSlot {
 pub struct EntryStat {
     pub name: String,
     pub kind: INodeKind,
+    pub nlink: u64,
     pub size: Option<usize>,
     pub mtime: u64,
     pub ctime: u64,
@@ -61,8 +60,13 @@ pub struct Directory {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SymLink {
+pub struct Symlink {
     pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hardlink {
+    pub inumber: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -240,6 +244,7 @@ impl INodeKind {
             INodeKind::File => 0,
             INodeKind::Directory => 1,
             INodeKind::Symlink => 2,
+            INodeKind::Hardlink => 3,
         }
     }
 
@@ -248,6 +253,7 @@ impl INodeKind {
             0 => Self::File,
             1 => Self::Directory,
             2 => Self::Symlink,
+            3 => Self::Hardlink,
             _ => eyre::bail!("INodeKind of type {value} not understood"),
         })
     }
@@ -473,16 +479,28 @@ impl Directory {
     }
 }
 
-impl SymLink {
+impl Symlink {
     pub fn serialize(&self) -> Vec<u8> {
         normalize_path(self.path.clone()).as_bytes().to_vec()
     }
 
     pub fn deserialize(data: &[u8]) -> eyre::Result<Self> {
-        let path = String::from_utf8(data.try_into()?).wrap_err_with(|| eyre::eyre!("dsads"))?;
+        let path = String::from_utf8(data.try_into()?)
+            .wrap_err_with(|| eyre::eyre!("Parsing Symlink path"))?;
         Ok(Self {
             path: PathBuf::from(path),
         })
+    }
+}
+
+impl Hardlink {
+    pub fn serialize(&self) -> Vec<u8> {
+        self.inumber.to_le_bytes().into_iter().collect()
+    }
+
+    pub fn deserialize(data: &[u8]) -> eyre::Result<Self> {
+        let inumber = u64::from_le_bytes(data.try_into()?);
+        Ok(Self { inumber })
     }
 }
 

@@ -1,5 +1,9 @@
 use crate::{
-    device::{Device, disk::Controller, kv_device::*, logical::LogicalDevice},
+    device::{
+        disk::Controller,
+        kv_device::*,
+        logical::{DeviceLike, LogicalDevice},
+    },
     xhfs::{WriteOption, XHFS, ds::*},
 };
 use std::{collections::HashMap, io::Cursor, sync::Arc};
@@ -14,7 +18,7 @@ async fn create_simple_memory_xhfs(capacity: usize) -> eyre::Result<XHFS> {
         total_slots: capacity / 8,
         slot_capacity: 8,
     };
-    let dev1 = LogicalDevice::new(2, [Arc::from(dev1) as Arc<dyn Device>])?;
+    let dev1 = LogicalDevice::new(2, [Arc::from(dev1) as DeviceLike])?;
     let ctrl = Controller::from([dev1]).await?;
     XHFS::format_new(ctrl, Some("helloworld".to_string())).await
 }
@@ -171,47 +175,141 @@ async fn test_xhfs_ref_manips_and_stats() -> eyre::Result<()> {
         )
         .await?;
         xhfs.fmove("/many/entries", "/many/entries2").await?;
-        xhfs.create_link(
+        xhfs.create_symlink(
             "/file.link",
             "/many/entries2/d.txt",
             WriteOption { overwrite: false },
         )
         .await?;
-        xhfs.create_link(
+        xhfs.create_hardlink(
+            "/file.hardlink",
+            "/many/entries2/d.txt",
+            WriteOption { overwrite: false },
+        )
+        .await?;
+        xhfs.create_symlink(
             "/folder.link",
             "/many/entries2",
             WriteOption { overwrite: false },
         )
         .await?;
     }
-
     assert_eq!(
         xhfs.ls("/many/entries2").await?,
-        xhfs.ls("/folder.link").await?
+        xhfs.ls("/folder.link").await?,
+        "folder symlink"
     );
     assert_eq!(
         xhfs.fread("/many/entries2/d.txt").await?,
-        xhfs.fread("/file.link").await?
+        xhfs.fread("/file.link").await?,
+        "file symlink"
     );
+    assert_eq!(
+        xhfs.fread("/many/entries2/d.txt").await?,
+        xhfs.fread("/file.hardlink").await?,
+        "file hardlink"
+    );
+
     assert_eq!(
         xhfs.fread("/many/entries2/d.txt").await?,
         xhfs.fread("/many/entries2/other.txt").await?,
     );
 
-    let dtxt_stats = xhfs.stats("/many/entries2/d.txt").await?.unwrap();
-    let filelink_stats = xhfs.stats("/file.link").await?.unwrap();
-    let folder_stats = xhfs.stats("/many/entries2").await?.unwrap();
+    let dtxt_stats = xhfs.stats("/many/entries2/d.txt", false).await?.unwrap();
+    let filelink_stats = xhfs.stats("/file.link", false).await?.unwrap();
+    let folder_stats = xhfs.stats("/many/entries2", false).await?.unwrap();
+    // basic stats
+    {
+        assert_eq!(
+            folder_stats.size, None,
+            "size not immediately calculated for folders"
+        );
+        assert_eq!(dtxt_stats.kind, INodeKind::File, "stats should work");
+        assert_eq!(dtxt_stats.size, Some(8), "should give correct data size");
+        assert_eq!(
+            filelink_stats.kind,
+            INodeKind::Symlink,
+            "stats should not resolve symlink"
+        );
+    }
+    // nlink
+    {
+        assert_eq!(folder_stats.nlink, 1, "basic nlink count should be 1");
+        assert_eq!(dtxt_stats.nlink, 2, "hardlink should bump nlink");
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_fremove_and_hardlinks() -> eyre::Result<()> {
+    let xhfs = create_simple_memory_xhfs(128 * 1000 * 1000).await?;
+    xhfs.mkdir("/deeply/nested/folder/here", true).await?;
+
+    let homework = vec![7; 160000];
+    let og_path = "/deeply/nested/folder/here/original.bin";
+
+    let space_before_any_writes = xhfs.total_remaining_capacity().await?;
+    assert_eq!(space_before_any_writes, 83869696);
+
+    xhfs.fwrite(og_path, homework.clone(), WriteOption { overwrite: false })
+        .await?;
+    let after_write_remaining = xhfs.total_remaining_capacity().await?;
+    assert_eq!(after_write_remaining, 83701760);
+
+    let stats = xhfs.stats(og_path, false).await?.unwrap();
+    assert_eq!(stats.nlink, 1);
+
+    xhfs.create_hardlink(
+        "/deeply/nested/001.hardlink",
+        og_path,
+        WriteOption { overwrite: false },
+    )
+    .await?;
+    assert_eq!(
+        xhfs.total_remaining_capacity().await?,
+        after_write_remaining - 4096,
+        "Hardlink should spend only INode space + 1 block for storing refered inumber"
+    );
+    let stats = xhfs.stats(og_path, false).await?.unwrap();
+    assert_eq!(stats.nlink, 2);
+
+    xhfs.create_hardlink(
+        "/deeply/nested/002.hardlink",
+        og_path,
+        WriteOption { overwrite: false },
+    )
+    .await?;
+    assert_eq!(
+        xhfs.total_remaining_capacity().await?,
+        (after_write_remaining - 4096) - 4096,
+        "Hardlink should spend only INode space + 1 block for storing refered inumber"
+    );
+    let stats = xhfs.stats(og_path, false).await?.unwrap();
+    assert_eq!(stats.nlink, 3);
+
+    xhfs.unlink("/deeply/nested/002.hardlink").await?;
+    let stats = xhfs.stats(og_path, false).await?.unwrap();
+    assert_eq!(stats.nlink, 2);
+
+    xhfs.unlink(og_path).await?;
+    // At this point, the original file is no more, but we still own a link to it
+    let stats = xhfs
+        .stats("/deeply/nested/001.hardlink", true /*/!\*/)
+        .await?
+        .unwrap();
+    assert_eq!(stats.nlink, 1, "should still hold the physical file");
+
+    // we can even read its content
+    let content = xhfs.fread("/deeply/nested/001.hardlink").await?;
+    assert_eq!(homework, content, "same as original");
+
+    xhfs.unlink("/deeply/nested/001.hardlink").await?;
+    let now_remaining = xhfs.total_remaining_capacity().await?;
 
     assert_eq!(
-        folder_stats.size, None,
-        "size not immediately calculated for folders"
-    );
-    assert_eq!(dtxt_stats.kind, INodeKind::File, "stats should work");
-    assert_eq!(dtxt_stats.size, Some(8), "should give correct data size");
-    assert_eq!(
-        filelink_stats.kind,
-        INodeKind::Symlink,
-        "stats should not resolve symlink"
+        space_before_any_writes, now_remaining,
+        "nlink = 0 frees everything"
     );
 
     Ok(())

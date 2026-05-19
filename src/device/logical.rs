@@ -5,16 +5,18 @@ use futures::{
 };
 use std::sync::Arc;
 
+pub type DeviceLike = Arc<dyn Device + Send + Sync>;
+
 #[derive(Clone)]
 pub struct LogicalDevice {
     max_concurrent: usize,
-    replica: Vec<Arc<dyn Device>>,
+    replica: Vec<DeviceLike>,
 }
 
 impl LogicalDevice {
     pub fn new<D>(max_concurrent: usize, devices: D) -> eyre::Result<Self>
     where
-        D: IntoIterator<Item = Arc<dyn Device>>,
+        D: IntoIterator<Item = DeviceLike>,
         D::IntoIter: ExactSizeIterator,
     {
         if max_concurrent < 1 {

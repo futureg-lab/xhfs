@@ -188,9 +188,9 @@ impl XHFS {
         Ok(None)
     }
 
+    #[async_recursion(?Send)]
     async fn delete_inode_with_extent(&self, inumber: u64) -> eyre::Result<bool> {
-        tracing::debug!("Resolving INode {inumber} for deletion");
-        let _guard = self.alloc_guard.lock().await;
+        tracing::debug!("Resolving INode {inumber} for deletion loop");
         let group = GroupLayout::derive_from_inode(inumber, &self.geometry)
             .ok_or_else(|| eyre::eyre!("Unable to derive group layout for inumber {inumber}"))?;
 
@@ -209,20 +209,34 @@ impl XHFS {
             return Ok(false);
         }
 
-        if let Some(inode) = self.resolve_inode(inumber).await? {
-            tracing::debug!(
-                "Cascading deletion to extent chain starting at 0x{:x}",
-                inode.extent_addr.get()
-            );
-            self.free_full_extent(inode.extent_addr).await?;
+        let mut worth_deleting = false;
+        if let Some(mut inode) = self.resolve_inode(inumber).await? {
+            if matches!(inode.kind, INodeKind::Hardlink) {
+                let target_inode = self.deref_hard_or_sym_links(inode.clone()).await?;
+                self.delete_inode_with_extent(target_inode.inumber).await?;
+            }
+
+            inode.nlink = inode.nlink.saturating_sub(1);
+
+            if inode.nlink == 0 {
+                worth_deleting = true;
+                tracing::debug!(
+                    "Cascading deletion to extent chain starting at 0x{:x}",
+                    inode.extent_addr.get()
+                );
+                self.free_full_extent(inode.extent_addr).await?;
+            } else {
+                self.register_inode(&inode, true).await?;
+            }
         }
 
-        bitmap.set(inode_index_in_group as usize, false)?;
-
-        // commit
-        self.ctrl
-            .raw_write(bitmap_slot.addr.into(), &bitmap.serialize()?)
-            .await?;
+        if worth_deleting {
+            // commit!
+            bitmap.set(inode_index_in_group as usize, false)?;
+            self.ctrl
+                .raw_write(bitmap_slot.addr.into(), &bitmap.serialize()?)
+                .await?;
+        }
 
         Ok(true)
     }
@@ -453,11 +467,11 @@ impl XHFS {
                         join_absolute(&components[..i])
                     );
                 }
-                INodeKind::Symlink => {
+                INodeKind::Symlink | INodeKind::Hardlink => {
                     // IDEA: impl symlink resolution traversal loop substitution here
                     // resolving a link should resolve into its containing path?
                     eyre::bail!(
-                        "Symbolic links are not yet supported during traversal at '{}'",
+                        "Encountered link at path '{}'",
                         join_absolute(&components[..i])
                     );
                 }
@@ -499,11 +513,14 @@ impl XHFS {
             INodeKind::File => {
                 eyre::bail!("Cannot ls a file");
             }
+            INodeKind::Hardlink => {
+                eyre::bail!("Cannot ls a Hardlink as it only refers to a file");
+            }
             INodeKind::Symlink => {
                 tracing::debug!("Trying to list dir entries from symlink");
                 let symlink = {
                     let raw_path = self.read_full_data_from_extent(inode.extent_addr).await?;
-                    SymLink::deserialize(&raw_path)?
+                    Symlink::deserialize(&raw_path)?
                 };
                 tracing::debug!(
                     " {} *=> {}",
@@ -692,17 +709,17 @@ impl XHFS {
         &self,
         path: P,
         data: Vec<u8>,
-        is_symlink: bool,
+        payload_type: INodeKind,
         opt: WriteOption,
     ) -> Result<(), XHFSError> {
         let remaining = self.total_remaining_capacity().await?;
         let inp_len = data.len();
         if inp_len >= remaining {
             return Err(XHFSError::from_report(eyre::eyre!(
-                "Insufficient space, input size is {}, remaining {}, operation requires {} B more",
+                "Insufficient space, input size is {} B, remaining {} B, operation requires {} B more",
                 inp_len,
                 remaining,
-                inp_len.saturating_sub(remaining)
+                inp_len.saturating_sub(remaining) + 1
             )));
         }
 
@@ -756,18 +773,13 @@ impl XHFS {
         // fstream doesn't have the issue but it remains nice to have still..
         let extent_addr = self.allocate_and_write_extent(data).await?;
 
+        if matches!(payload_type, INodeKind::Directory) {
+            xhfs_bail!("Expected file like entry, got a folder instead");
+        }
+
         // assume we never run of INodes
         let inode = self
-            .allocate_inode_near(
-                parent_inode.inumber,
-                size as u64,
-                extent_addr,
-                if is_symlink {
-                    INodeKind::Symlink
-                } else {
-                    INodeKind::File
-                },
-            )
+            .allocate_inode_near(parent_inode.inumber, size as u64, extent_addr, payload_type)
             .await?;
 
         directory.entries.push((filename, inode.inumber));
@@ -792,7 +804,7 @@ impl XHFS {
         data: Vec<u8>,
         opt: WriteOption,
     ) -> Result<(), XHFSError> {
-        self.blob_write(path, data, false, opt).await
+        self.blob_write(path, data, INodeKind::File, opt).await
     }
 
     pub async fn fwrite_stream<P, R>(
@@ -826,7 +838,7 @@ impl XHFS {
         Ok(())
     }
 
-    pub async fn create_link<P: Into<PathBuf> + Clone>(
+    pub async fn create_symlink<P: Into<PathBuf> + Clone>(
         &self,
         path: P,
         content: P,
@@ -835,14 +847,45 @@ impl XHFS {
         let _ = self.resolve_parent(content.clone()).await?;
         self.blob_write(
             path,
-            SymLink {
+            Symlink {
                 path: content.into(),
             }
             .serialize(),
-            true,
+            INodeKind::Symlink,
             opt,
         )
         .await?;
+
+        Ok(())
+    }
+
+    pub async fn create_hardlink<P: Into<PathBuf> + Clone>(
+        &self,
+        path: P,
+        content: P,
+        opt: WriteOption,
+    ) -> eyre::Result<()> {
+        let inode = self.resolve_path(content).await?;
+        if !matches!(inode.kind, INodeKind::File) {
+            eyre::bail!(
+                "Unexpected {:?}, Hardlink only attaches to a file",
+                inode.kind
+            );
+        }
+
+        self.blob_write(
+            path,
+            Hardlink {
+                inumber: inode.inumber,
+            }
+            .serialize(),
+            INodeKind::Hardlink,
+            opt,
+        )
+        .await?;
+
+        tracing::debug!("Hardlink creation succeded, updating target inode nlink");
+        self.increment_inode_nlink(inode).await?;
 
         Ok(())
     }
@@ -911,35 +954,53 @@ impl XHFS {
         Ok(created_new)
     }
 
+    async fn deref_hard_or_sym_links(&self, inode: INode) -> eyre::Result<INode, XHFSError> {
+        match inode.kind {
+            INodeKind::Hardlink => {
+                tracing::debug!("Trying to read file from Hardlink");
+                let inumber = self.read_full_data_from_extent(inode.extent_addr).await?;
+                let hardlink = Hardlink::deserialize(&inumber)?;
+                if hardlink.inumber == inode.inumber {
+                    tracing::warn!("Invalid fs state: Hardlink pointing to itself detected");
+                    return Err(XHFSError::from_report(eyre::eyre!(
+                        "Hardlink pointing to itself detected"
+                    )));
+                }
+                let referenced = self.resolve_inode(hardlink.inumber).await?.ok_or_else(|| {
+                    eyre::eyre!("Referenced entry INode #{} not found", hardlink.inumber)
+                })?;
+
+                Ok(referenced)
+            }
+            INodeKind::Symlink => {
+                tracing::debug!("Trying to read file from Symlink");
+                let raw_path = self.read_full_data_from_extent(inode.extent_addr).await?;
+                let symlink = Symlink::deserialize(&raw_path)?;
+                let referenced = self.resolve_path(symlink.path).await?;
+                Ok(referenced)
+            }
+            _ => {
+                xhfs_bail!("Cannot dereference INode of type {:?}", inode.kind)
+            }
+        }
+    }
+
     #[async_recursion(?Send)]
     pub async fn fread<P: Into<PathBuf>>(&self, path: P) -> Result<Vec<u8>, XHFSError> {
         let path: PathBuf = path.into();
         let inode = self.resolve_path(&path).await?;
+        tracing::debug!("Trying to read file from path {}", path.display());
         match inode.kind {
+            INodeKind::File => self.read_full_data_from_extent(inode.extent_addr).await,
+            INodeKind::Symlink | INodeKind::Hardlink => {
+                tracing::debug!(" {:?} detected, following the payload", inode.kind);
+                let referenced_inode = self.deref_hard_or_sym_links(inode).await?;
+                self.read_full_data_from_extent(referenced_inode.extent_addr)
+                    .await
+            }
             INodeKind::Directory => Err(XHFSError::from_report(eyre::eyre!(
                 "Cannot fread directory"
             ))),
-            INodeKind::File => {
-                tracing::debug!("Trying to read file from path {}", path.display());
-                self.read_full_data_from_extent(inode.extent_addr).await
-            }
-            INodeKind::Symlink => {
-                tracing::debug!("Trying to read file from symlink");
-                let raw_path = self.read_full_data_from_extent(inode.extent_addr).await?;
-                let symlink = SymLink::deserialize(&raw_path)?;
-                tracing::debug!(
-                    " {} *=> {}",
-                    normalize_path(&path),
-                    normalize_path(&symlink.path)
-                );
-                if symlink.path == path {
-                    tracing::warn!("Invalid fs state: Symlink pointing to itself detected");
-                    return Err(XHFSError::from_report(eyre::eyre!(
-                        "Symlink pointing to itself detected"
-                    )));
-                }
-                self.fread(symlink.path).await
-            }
         }
     }
 
@@ -960,7 +1021,7 @@ impl XHFS {
             INodeKind::Symlink => {
                 tracing::debug!("Trying to read+seek file from symlink");
                 let raw_path = self.read_full_data_from_extent(inode.extent_addr).await?;
-                let symlink = SymLink::deserialize(&raw_path)?;
+                let symlink = Symlink::deserialize(&raw_path)?;
                 tracing::debug!(
                     " {} *=> {}",
                     normalize_path(&path),
@@ -972,6 +1033,7 @@ impl XHFS {
                 }
                 self.fseek(symlink.path, start, end).await
             }
+            INodeKind::Hardlink => todo!(),
             INodeKind::Directory => {
                 eyre::bail!("Cannot fread directory");
             }
@@ -982,9 +1044,7 @@ impl XHFS {
     // fprepend?
 
     #[async_recursion(?Send)]
-    pub async fn fappend<P: Into<PathBuf>>(&self, path: P, data: Vec<u8>) -> Result<(), XHFSError> {
-        let path: PathBuf = path.into();
-        let mut inode = self.resolve_path(&path).await?;
+    pub async fn fappend_inode(&self, mut inode: INode, data: Vec<u8>) -> Result<(), XHFSError> {
         match inode.kind {
             INodeKind::File => {
                 inode.total_file_size += data.len() as u64;
@@ -994,32 +1054,43 @@ impl XHFS {
                 self.update_inode_mtime_now(inode).await?;
             }
             INodeKind::Symlink => {
-                tracing::debug!("Trying tofappend file from symlink");
-                let symlink = {
-                    let raw_path = self.read_full_data_from_extent(inode.extent_addr).await?;
-                    SymLink::deserialize(&raw_path)?
-                };
+                let referenced = self.deref_hard_or_sym_links(inode.clone()).await?;
+                self.fappend_inode(referenced, data).await?;
+            }
+            INodeKind::Hardlink => {
+                tracing::debug!("Trying to fappend file from Hardlink");
+                let referenced = self.deref_hard_or_sym_links(inode.clone()).await?;
                 tracing::debug!(
-                    " {} *=> {}",
-                    normalize_path(&path),
-                    normalize_path(&symlink.path)
+                    " INode #{} *=> INode #{}",
+                    inode.inumber,
+                    referenced.inumber
                 );
-                if symlink.path == path {
-                    tracing::warn!("Invalid fs state: Symlink pointing to itself detected");
-                    xhfs_bail!("Symlink pointing to itself detected");
+                if referenced.inumber == inode.inumber {
+                    xhfs_bail!("Hardlink pointing to itself detected");
                 }
-                self.fappend(symlink.path, data).await?;
+                self.fappend_inode(referenced, data).await?;
             }
             INodeKind::Directory => {
                 xhfs_bail!("Cannot append data to directory");
             }
         };
+        Ok(())
+    }
 
+    pub async fn fappend<P: Into<PathBuf>>(&self, path: P, data: Vec<u8>) -> Result<(), XHFSError> {
+        let path: PathBuf = path.into();
+        let inode = self.resolve_path(&path).await?;
+        self.fappend_inode(inode, data).await?;
         Ok(())
     }
 
     pub async fn update_inode_mtime_now(&self, mut inode: INode) -> eyre::Result<()> {
         inode.mtime = utc_now_u64();
+        self.register_inode(&inode, true).await
+    }
+
+    pub async fn increment_inode_nlink(&self, mut inode: INode) -> eyre::Result<()> {
+        inode.nlink += 1;
         self.register_inode(&inode, true).await
     }
 
@@ -1063,10 +1134,14 @@ impl XHFS {
     }
 
     pub async fn exists<P: Into<PathBuf>>(&self, path: P) -> eyre::Result<bool> {
-        Ok(self.stats(path).await?.is_some())
+        Ok(self.stats(path, false).await?.is_some())
     }
 
-    pub async fn stats<P: Into<PathBuf>>(&self, path: P) -> eyre::Result<Option<EntryStat>> {
+    pub async fn stats<P: Into<PathBuf>>(
+        &self,
+        path: P,
+        follow_hardlink: bool,
+    ) -> eyre::Result<Option<EntryStat>> {
         let path: PathBuf = path.into();
         let components = path_to_string_list(path.clone());
 
@@ -1075,13 +1150,20 @@ impl XHFS {
             return Ok(Some(EntryStat {
                 name: "/".to_string(),
                 size: None,
+                nlink: inode.nlink,
                 kind: inode.kind,
                 mtime: inode.mtime,
                 ctime: inode.ctime,
             }));
         }
         let inode = match self.resolve_path(path).await {
-            Ok(v) => v,
+            Ok(inode) => {
+                if follow_hardlink && matches!(inode.kind, INodeKind::Hardlink) {
+                    self.deref_hard_or_sym_links(inode).await?
+                } else {
+                    inode
+                }
+            }
             Err(_) => return Ok(None),
         };
         let name = components.last().unwrap().clone();
@@ -1092,6 +1174,7 @@ impl XHFS {
                 INodeKind::Directory => None,
                 _ => Some(inode.total_file_size as usize),
             },
+            nlink: inode.nlink,
             kind: inode.kind,
             mtime: inode.mtime,
             ctime: inode.ctime,
