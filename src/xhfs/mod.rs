@@ -27,8 +27,8 @@ macro_rules! xhfs_bail {
 pub struct XHFS {
     header_size: usize,
     alloc_guard: Mutex<()>,
-    static_format: Format,
-    geometry: GeometryLayout,
+    pub static_format: Format,
+    pub geometry: GeometryLayout,
     pub ctrl: Controller,
 }
 
@@ -831,6 +831,19 @@ impl XHFS {
         let path: PathBuf = path.into();
         self.fwrite(&path, vec![], opt).await?;
         let mut buf = vec![0u8; block_size];
+
+        {
+            // Handle first chunk so that we have an extent to append to
+            // in the next loop, the reason is that fappend is doing an extra resolve_path
+            // producing more reads than necessary
+            let n = stream.read(&mut buf).await?;
+            if n == 0 {
+                return Ok(());
+            }
+            self.fappend(&path, buf[..n].to_vec()).await?;
+        }
+
+        let inode_with_extent = self.resolve_path(&path).await?;
         loop {
             if buf.len() != block_size {
                 buf.resize(block_size, 0);
@@ -841,8 +854,8 @@ impl XHFS {
                 break;
             }
 
-            let chunk = &buf[..n];
-            self.fappend(&path, chunk.to_vec()).await?
+            self.fappend_inode(inode_with_extent.clone(), buf[..n].to_vec())
+                .await?;
         }
 
         Ok(())

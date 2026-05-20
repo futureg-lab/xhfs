@@ -1,8 +1,12 @@
 use crate::{
     interface::cli::GlobalOptions,
-    xhfs::{addr::MaybeU64, ds::Bitmap},
+    xhfs::{
+        addr::MaybeU64,
+        ds::{Bitmap, GroupLayout},
+    },
 };
 use clap::{Args, Subcommand};
+use eyre::OptionExt;
 use std::path::PathBuf;
 use tokio::fs;
 
@@ -103,7 +107,13 @@ impl InspectSubcommands {
             InspectSubcommands::Inode(i) => {
                 let xhfs = i.global.get_xhfs().await?;
                 let inode = xhfs.resolve_path(&i.path).await?;
-                println!("INode #{}\n", inode.inumber);
+                let group = GroupLayout::derive_from_inode(inode.inumber, &xhfs.geometry)
+                    .ok_or_eyre("Failed calculating group layout for INode")?;
+                println!(
+                    "Member of group #{} (idx {})",
+                    group.g_index + 1,
+                    group.g_index
+                );
                 println!("{inode}");
             }
             InspectSubcommands::Extent(e) => {

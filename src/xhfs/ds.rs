@@ -383,6 +383,7 @@ impl INode {
 
 impl Display for INode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "- INode #{}", self.inumber)?;
         writeln!(f, "- Number of Links: {}", self.nlink)?;
         writeln!(f, "- Kind: {:?}", self.kind)?;
         if !matches!(self.kind, INodeKind::Directory) {
