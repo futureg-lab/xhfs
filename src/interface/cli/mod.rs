@@ -1,14 +1,15 @@
 use crate::{
     interface::{
-        cli::{inspect::InspectCommands, x::FsCommands},
+        cli::{inspect::InspectCommands, x::*},
         config::Config,
     },
     xhfs::{WriteOption, XHFS},
 };
 use clap::{Args, Parser, Subcommand};
+use futures::StreamExt;
 use std::{io::Write, path::PathBuf};
 use tokio::{
-    fs::{self, File},
+    fs::{self, File, OpenOptions},
     io::{AsyncWriteExt, stdout},
 };
 
@@ -33,7 +34,7 @@ pub enum Commands {
     /// Download file from XHFS into local filesystem
     Download(DownloadCommand),
     /// Read the file immediately and print to stdout
-    Read(PathCommand),
+    Read(ReadCommand),
     /// Format a new XHFS
     Format(GlobalOptions),
     /// Show XHFS/device information
@@ -55,16 +56,6 @@ pub struct GlobalOptions {
     pub verbose: bool,
     #[arg(short, long)]
     pub force: bool,
-}
-
-#[derive(Args, Debug)]
-pub struct PathCommand {
-    /// Target path inside XHFS
-    pub path: PathBuf,
-    #[arg(long, short)]
-    pub recursive: bool,
-    #[command(flatten)]
-    pub global: GlobalOptions,
 }
 
 #[derive(Args, Debug)]
@@ -93,6 +84,26 @@ pub struct DownloadCommand {
     pub dest_path: Option<PathBuf>,
     #[arg(short, long, default_value = "false")]
     pub overwrite: bool,
+    /// Maximum chunk of data to read at a time
+    #[arg(short, long, default_value = "1048576")]
+    pub block_size: usize,
+    #[arg(short, long, default_value = "false")]
+    pub single_block: bool,
+    #[command(flatten)]
+    pub global: GlobalOptions,
+}
+
+#[derive(Args, Debug)]
+pub struct ReadCommand {
+    /// Source path inside XHFS
+    pub src_path: PathBuf,
+    #[arg(short, long, default_value = "false")]
+    pub overwrite: bool,
+    /// Maximum chunk of data to read at a time
+    #[arg(short, long, default_value = "1048576")]
+    pub block_size: usize,
+    #[arg(short, long, default_value = "false")]
+    pub single_block: bool,
     #[command(flatten)]
     pub global: GlobalOptions,
 }
@@ -152,14 +163,40 @@ impl MainCommand {
                 if dest_path.exists() && !d.overwrite {
                     eyre::bail!("File {} already exists", dest_path.display());
                 }
-                let data = xhfs.fread(&d.src_path).await?;
-                fs::write(dest_path, data).await?;
+                if d.single_block {
+                    let data = xhfs.fread(&d.src_path).await?;
+                    tokio::fs::write(&dest_path, data).await?;
+                } else {
+                    let mut data = xhfs.fread_stream(&d.src_path, d.block_size).await?;
+                    let mut file = OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(d.overwrite)
+                        .create_new(!d.overwrite)
+                        .open(&dest_path)
+                        .await?;
+                    while let Some(chunk) = data.next().await {
+                        let chunk = chunk?;
+                        file.write_all(&chunk).await?;
+                    }
+                    file.flush().await?;
+                }
             }
             Commands::Read(r) => {
                 let xhfs = r.global.get_xhfs().await?;
-                let data = xhfs.fread(&r.path).await?;
                 let mut out = stdout();
-                out.write_all(&data).await?;
+                if r.single_block {
+                    let data = xhfs.fread(&r.src_path).await?;
+                    out.write_all(&data).await?;
+                    out.flush().await?;
+                } else {
+                    let mut data = xhfs.fread_stream(&r.src_path, r.block_size).await?;
+                    let mut out = stdout();
+                    while let Some(chunk) = data.next().await {
+                        let chunk = chunk?;
+                        out.write_all(&chunk).await?;
+                    }
+                }
                 out.flush().await?;
             }
             Commands::X(x) => x.run().await?,
