@@ -9,7 +9,7 @@ use eyre::{Context, ContextCompat};
 use futures::{Stream, StreamExt};
 use std::{fmt::Debug, path::PathBuf};
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncSeek},
+    io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt},
     sync::Mutex,
 };
 pub mod addr;
@@ -824,20 +824,39 @@ impl XHFS {
         mut stream: R,
         block_size: usize,
         opt: WriteOption,
-    ) -> eyre::Result<()>
+    ) -> Result<(), XHFSError>
     where
         P: Into<PathBuf>,
         R: AsyncRead + AsyncSeek + Unpin,
     {
         let path: PathBuf = path.into();
+        let inp_len = stream
+            .seek(std::io::SeekFrom::End(0))
+            .await
+            .map_err(XHFSError::from_error)? as usize;
+        stream
+            .seek(std::io::SeekFrom::Start(0))
+            .await
+            .map_err(XHFSError::from_error)?;
+
+        tracing::debug!("Incoming stream total size: {inp_len} bytes");
+        let remaining = self.total_remaining_capacity().await?;
+        if inp_len >= remaining {
+            return Err(XHFSError::from_report(eyre::eyre!(
+                "Insufficient space, input size is {} B, remaining {} B, operation requires {} B more",
+                inp_len,
+                remaining,
+                inp_len.saturating_sub(remaining) + 1
+            )));
+        }
+
         self.fwrite(&path, vec![], opt).await?;
         let mut buf = vec![0u8; block_size];
-
         {
             // Handle first chunk so that we have an extent to append to
             // in the next loop, the reason is that fappend is doing an extra resolve_path
             // producing more reads than necessary
-            let n = stream.read(&mut buf).await?;
+            let n = stream.read(&mut buf).await.map_err(XHFSError::from_error)?;
             if n == 0 {
                 return Ok(());
             }
@@ -850,7 +869,7 @@ impl XHFS {
                 buf.resize(block_size, 0);
             }
 
-            let n = stream.read(&mut buf).await?;
+            let n = stream.read(&mut buf).await.map_err(XHFSError::from_error)?;
             if n == 0 {
                 break;
             }
