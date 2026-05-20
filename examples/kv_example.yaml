@@ -2,34 +2,34 @@
 password: helloworld
 devices:
   - type: kvhttp
-    name: bloc1
+    name: blob1
     url: http://localhost:8000
     # If too small => many requests, useful if storage is expected to store small files
     # If too large => slower requests as this block will be downloaded EVERY READ
     # Ideally, you may cap this to your internet speed + your KV value constraint
     slot_capacity_bytes: 2000000 # how much a key can hold
   - type: kvhttp
-    name: bloc2
+    name: blob2
     url: http://localhost:8000
     slot_capacity_bytes: 123456
     headers:
       foo: bar
   - type: kvhttp
-    name: bloc3
+    name: blob3
     url: http://localhost:8000
     slot_capacity_bytes: 1234
 configuration:
   logical:
     - name: dev1
-      include: [bloc1]
+      include: [blob1]
       capacity: "100 MiB"
       max_concurrent: 1
     - name: dev2
-      include: [bloc2]
+      include: [blob2]
       capacity: "100 MiB"
       max_concurrent: 1
     - name: dev3
-      include: [bloc3]
+      include: [blob3]
       capacity: "300 MiB"
       max_concurrent: 1
   layout: [dev1, dev2, dev3]

@@ -51,9 +51,6 @@ pub struct GlobalOptions {
     pub config: Option<PathBuf>,
     #[arg(long)]
     pub password: Option<String>,
-    /// Enable debug logs
-    #[arg(long)]
-    pub debug: bool,
     #[arg(short, long)]
     pub verbose: bool,
     #[arg(short, long)]

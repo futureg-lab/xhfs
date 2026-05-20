@@ -120,7 +120,7 @@ async fn test_xhfs_core_ops() -> eyre::Result<()> {
         )
         .await?;
 
-        // also prove dir entry remap works fine
+        // also proves dir entry remap works fine
         assert_eq!(
             data1,
             String::from_utf8(xhfs.fread("/hello/baz/bbb/content1.txt").await?).unwrap(),
@@ -311,7 +311,7 @@ async fn test_fremove_and_hardlinks() -> eyre::Result<()> {
         .unwrap();
     assert_eq!(stats.nlink, 1, "should still hold the physical file");
 
-    // we can even read its content
+    // We can even read its content
     let content = xhfs.fread("/deeply/nested/001.hardlink").await?;
     assert_eq!(homework, content, "same as original");
 
@@ -320,7 +320,7 @@ async fn test_fremove_and_hardlinks() -> eyre::Result<()> {
 
     assert_eq!(
         space_before_any_writes, now_remaining,
-        "nlink = 0 frees everything"
+        "nlink = 0 should free up everything"
     );
 
     Ok(())

@@ -1,4 +1,4 @@
-# XHFS (Extented Headless File System)
+# XHFS (Extended Headless File System)
 
 XHFS is a small, full-fledged file system that enables you to store files
 anywhere, on anything, across an arbitrary combination of arbitrary devices.
@@ -38,38 +38,31 @@ Consider the following configuration:
 
 ```yaml
 # xhfs.yaml
-# encrypt the drive
+# Encrypt the drive
 # or use the cli with --password helloworld if the config and bins are made public
 password: helloworld
 devices:
   - type: file
-    name: bloc1
+    name: blob1
     path: ./part1.bin
   - type: file
-    name: bloc2
+    name: blob2
     path: ./part1-replica.bin
   - type: file
-    name: bloc3
-    path: ./part3.bin
-  # Memory blocs can even be as exotic as a Key-Value store
-  # - type: kvhttp
-  #   name: bloc4
-  #   # see examples/kv_cloudflare.js, examples/kv_handler.ts
-  #   url: http://exmaple.com
-  #   # keys are about 100KB each
-  #   slot_capacity_bytes: 100000
+    name: blob3
+    path: ./part2.bin
 configuration:
   logical:
     - name: dev1
-      include: [bloc1, bloc2]
-      capacity: "80 MiB"
+      include: [blob1, blob2]
+      capacity: "50 MiB"
       max_concurrent: 2
     - name: dev2
-      include: [bloc3]
-      capacity: "80 MiB"
+      include: [blob3]
+      capacity: "50 MiB"
       max_concurrent: 1
   # Final storage layout
-  # [dev1: 0 - 80 MB] [dev2: 80 MiB - 160 MiB]
+  # [dev1: 0 - 50MB] [dev2: 50MiB - 100MiB]
   layout: [dev1, dev2]
 ```
 
@@ -77,13 +70,13 @@ All that is left to do is format the drive (if you haven't done so yet) and then
 start playing with it.
 
 ```bash
-# setup the File System if not formatted yet
+# Setup the File System if not formatted yet
 xhfs format
 
 echo "Hello World" > thething.txt
 xhfs upload thething.txt /test.txt
 
-xhfs x ls . -v
+xhfs x ls -v
 # FILE 2026-05-14 16:49:49        28 B test.txt
 
 xhfs x read test.txt | echo
@@ -118,16 +111,17 @@ cargo install xhfs
   - [x] Encryption (ChaCha20 stream cipher)
   - [x] No journaling, CoW based
   - [x] xhfs core: fopen, fwrite, fseek, mkdir, fmove, fcopy, unlink
-  - [x] native symlink support: create_link
-  - [ ] native hardlink support: wip
-  - [x] extra: fappend
-- [x] RAID-like configuration
-  - [x] logical grouping
-  - [x] replication
+  - [x] Native Symlink support: create_symlink
+  - [x] Native Hardlink support: create_hardlink
+  - [x] Extra: fappend
+- [ ] RAID-like configuration
+  - [x] Logical grouping
+  - [x] Replication
+  - [ ] Error correction
 - [ ] No device assumption
   - [x] File device
   - [x] In memory device
-  - [x] custom KV http endpoint
+  - [x] Custom KV http endpoint
   - [x] Cloudflare KV example
   - [ ] s3 device
 - [ ] Explorer
@@ -203,4 +197,6 @@ xhfs inspect view 0x00062a39 0x00062a50 -c 16 --decrypt
 
 # or even dump
 xhfs inspect dump 0x00062a39 0x00062a50 stuff.bin --decrypt
+
+# and many other things too...
 ```

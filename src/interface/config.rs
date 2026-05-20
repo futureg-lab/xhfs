@@ -102,28 +102,28 @@ impl Config {
         let text = r#"
 password: helloworld
 devices:
-    - type: file
-      name: bloc1
-      path: ./part1.bin
-    - type: file
-      name: bloc2
-      path: ./part1-replica.bin
-    - type: file
-      name: bloc3
-      path: ./part3.bin
+  - type: file
+    name: blob1
+    path: ./part1.bin
+  - type: file
+    name: blob2
+    path: ./part1-replica.bin
+  - type: file
+    name: blob3
+    path: ./part2.bin
 configuration:
-    logical:
-        - name: dev1
-          include: [bloc1, bloc2]
-          capacity: "2 MiB"
-          max_concurrent: 2
-        - name: dev2
-          include: [bloc3]
-          capacity: "2 MiB"
-          max_concurrent: 1
-    # Final storage layout
-    # [dev1: 0 - 2MB] [dev2: 2MiB - 4MiB]
-    layout: [dev1, dev2]    
+  logical:
+    - name: dev1
+      include: [blob1, blob2]
+      capacity: "50 MiB"
+      max_concurrent: 2
+    - name: dev2
+      include: [blob3]
+      capacity: "50 MiB"
+      max_concurrent: 1
+  # Final storage layout
+  # [dev1: 0 - 50MB] [dev2: 50MiB - 100MiB]
+  layout: [dev1, dev2]
 "#;
         serde_yaml::from_str(text).map_err(|e| e.into())
     }

@@ -13,7 +13,7 @@ mod tests;
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
     let env_filter = EnvFilter::try_from_default_env()
-        .or_else(|_| EnvFilter::try_new("brutefs=ERROR"))
+        .or_else(|_| EnvFilter::try_new("xhfs=ERROR"))
         .unwrap();
 
     tracing_subscriber::fmt()

@@ -1083,45 +1083,6 @@ impl XHFS {
         Ok(())
     }
 
-    pub async fn read_extent(&self, addr: u64) -> Result<Extent, XHFSError> {
-        let extent_header = self.ctrl.read(addr as usize, 8).await?;
-        let curr_extent_data_size = u64::from_le_bytes(
-            extent_header[0..8]
-                .try_into()
-                .map_err(XHFSError::from_error)?,
-        );
-        let out = Extent::deserialize(
-            &self
-                .ctrl
-                .read(addr as usize, 8 + 8 + curr_extent_data_size as usize)
-                .await?,
-        )?;
-        Ok(out)
-    }
-
-    pub async fn read_extent_metadata(
-        &self,
-        addr: u64,
-    ) -> eyre::Result<(RegionSlot, MaybeU64, u64)> {
-        let extent_header = self.ctrl.read(addr as usize, 16).await?;
-        let curr_extent_data_size = u64::from_le_bytes(extent_header[0..8].try_into()?);
-        eyre::ensure!(Extent::HEADER_NEXT_OFFSET == 8);
-
-        let next_extent = MaybeU64::from(u64::from_le_bytes(extent_header[8..16].try_into()?));
-        let raw_footprint = 16 + curr_extent_data_size as u64;
-        let block_size = self.static_format.block_size_bytes as u64;
-        let aligned_capacity = ((raw_footprint + block_size - 1) / block_size) * block_size;
-
-        Ok((
-            RegionSlot {
-                start: MaybeU64::from(addr),
-                end: MaybeU64::from(addr + aligned_capacity),
-            },
-            next_extent,
-            curr_extent_data_size,
-        ))
-    }
-
     pub async fn exists<P: Into<PathBuf>>(&self, path: P) -> eyre::Result<bool> {
         Ok(self.stats(path, false).await?.is_some())
     }
@@ -1390,13 +1351,13 @@ impl XHFS {
     }
 
     pub async fn free_full_extent(&self, start_extent_addr: MaybeU64) -> eyre::Result<()> {
+        let _guard = self.alloc_guard.lock().await;
         tracing::debug!(
             "Freeing extent chain starting at 0x{:x}",
             start_extent_addr.get()
         );
 
         let mut addr = start_extent_addr;
-
         while let Some(current_addr) = addr.to_optional() {
             let (curr_region, next_hop, _) = self.read_extent_metadata(current_addr).await?;
 
@@ -1421,15 +1382,6 @@ impl XHFS {
             self.free_full_extent(addr).await?;
         }
         Ok(())
-    }
-
-    async fn update_extent_next(&self, start_extent_addr: u64, next: MaybeU64) -> eyre::Result<()> {
-        self.ctrl
-            .write(
-                (start_extent_addr + Extent::HEADER_NEXT_OFFSET) as usize,
-                &next.get().to_le_bytes(),
-            )
-            .await
     }
 
     async fn append_or_allocate_extent(
@@ -1474,7 +1426,47 @@ impl XHFS {
             addr = extent.next;
             data.extend(extent.data);
         }
+
         Ok(data)
+    }
+
+    pub async fn read_extent(&self, addr: u64) -> Result<Extent, XHFSError> {
+        let extent_header = self.ctrl.read(addr as usize, 8).await?;
+        let curr_extent_data_size = u64::from_le_bytes(
+            extent_header[0..8]
+                .try_into()
+                .map_err(XHFSError::from_error)?,
+        );
+        let out = Extent::deserialize(
+            &self
+                .ctrl
+                .read(addr as usize, 8 + 8 + curr_extent_data_size as usize)
+                .await?,
+        )?;
+        Ok(out)
+    }
+
+    pub async fn read_extent_metadata(
+        &self,
+        addr: u64,
+    ) -> eyre::Result<(RegionSlot, MaybeU64, u64)> {
+        let extent_header = self.ctrl.read(addr as usize, 16).await?;
+        let curr_extent_data_size = u64::from_le_bytes(extent_header[0..8].try_into()?);
+        eyre::ensure!(Extent::HEADER_NEXT_OFFSET == 8);
+
+        let next_extent = MaybeU64::from(u64::from_le_bytes(extent_header[8..16].try_into()?));
+        let raw_footprint = 16 + curr_extent_data_size as u64;
+        let block_size = self.static_format.block_size_bytes as u64;
+        let aligned_capacity = ((raw_footprint + block_size - 1) / block_size) * block_size;
+
+        Ok((
+            RegionSlot {
+                start: MaybeU64::from(addr),
+                end: MaybeU64::from(addr + aligned_capacity),
+            },
+            next_extent,
+            curr_extent_data_size,
+        ))
     }
 
     pub async fn find_full_extent_metadata(
@@ -1498,6 +1490,15 @@ impl XHFS {
         Ok(blocks)
     }
 
+    async fn update_extent_next(&self, start_extent_addr: u64, next: MaybeU64) -> eyre::Result<()> {
+        self.ctrl
+            .write(
+                (start_extent_addr + Extent::HEADER_NEXT_OFFSET) as usize,
+                &next.get().to_le_bytes(),
+            )
+            .await
+    }
+
     async fn seek_full_data_from_extent(
         &self,
         addr: MaybeU64,
@@ -1507,7 +1508,6 @@ impl XHFS {
         let mut buf = vec![];
         let mut cursor = 0;
         let mut addr = addr;
-
         while let Some(next_addr) = addr.to_optional() {
             let extent = self.read_extent(next_addr).await?;
             addr = extent.next;
