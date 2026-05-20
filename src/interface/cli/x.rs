@@ -1,5 +1,5 @@
 use crate::{
-    interface::cli::{GlobalOptions, PathCommand},
+    interface::cli::GlobalOptions,
     utils::{normalize_path, u64_to_utc_datetime},
     xhfs::{WriteOption, XHFS, ds::INodeKind},
 };
@@ -30,6 +30,16 @@ pub enum FsSubcommands {
 pub struct FsCommands {
     #[command(subcommand)]
     pub command: FsSubcommands,
+}
+
+#[derive(Args, Debug)]
+pub struct PathCommand {
+    /// Target path inside XHFS
+    pub path: PathBuf,
+    #[arg(long, short)]
+    pub recursive: bool,
+    #[command(flatten)]
+    pub global: GlobalOptions,
 }
 
 #[derive(Args, Debug)]

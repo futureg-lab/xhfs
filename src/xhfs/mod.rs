@@ -4,13 +4,14 @@ use crate::{
     xhfs::{addr::MaybeU64, crypto::Crypto, ds::*},
 };
 use async_recursion::async_recursion;
+use async_stream::try_stream;
 use eyre::{Context, ContextCompat};
+use futures::{Stream, StreamExt};
 use std::{fmt::Debug, path::PathBuf};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncSeek},
     sync::Mutex,
 };
-
 pub mod addr;
 pub mod crypto;
 pub mod ds;
@@ -1006,7 +1007,6 @@ impl XHFS {
         }
     }
 
-    #[async_recursion(?Send)]
     pub async fn fread<P: Into<PathBuf>>(&self, path: P) -> Result<Vec<u8>, XHFSError> {
         let path: PathBuf = path.into();
         let inode = self.resolve_path(&path).await?;
@@ -1018,6 +1018,34 @@ impl XHFS {
                 let referenced_inode = self.follow_link_or_noop(inode).await?;
                 self.read_full_data_from_extent(referenced_inode.extent_addr)
                     .await
+            }
+            INodeKind::Directory => Err(XHFSError::from_report(eyre::eyre!(
+                "Cannot fread directory"
+            ))),
+        }
+    }
+
+    // IDEA:
+    // impl Seekable trait
+    pub async fn fread_stream<P: Into<PathBuf>>(
+        &self,
+        path: P,
+        chunk_size: usize,
+    ) -> Result<impl Stream<Item = Result<Vec<u8>, XHFSError>>, XHFSError> {
+        let path: PathBuf = path.into();
+        let inode = self.resolve_path(&path).await?;
+        tracing::debug!("Trying to stream read a file from path {}", path.display());
+        match inode.kind {
+            INodeKind::File => Ok(Box::pin(
+                self.read_stream_from_extent_stream(inode.extent_addr, chunk_size),
+            )),
+            INodeKind::Symlink | INodeKind::Hardlink => {
+                tracing::debug!(" {:?} detected, following the payload", inode.kind);
+                let referenced_inode = self.follow_link_or_noop(inode).await?;
+                Ok(Box::pin(self.read_stream_from_extent_stream(
+                    referenced_inode.extent_addr,
+                    chunk_size,
+                )))
             }
             INodeKind::Directory => Err(XHFSError::from_report(eyre::eyre!(
                 "Cannot fread directory"
@@ -1424,20 +1452,40 @@ impl XHFS {
         Ok(all_extent_start)
     }
 
-    // TODO:
-    // can be streamed
-    async fn read_full_data_from_extent(&self, mut addr: MaybeU64) -> Result<Vec<u8>, XHFSError> {
+    pub fn read_stream_from_extent_stream(
+        &self,
+        mut addr: MaybeU64,
+        chunk_size: usize,
+    ) -> impl Stream<Item = Result<Vec<u8>, XHFSError>> {
+        try_stream! {
+            let mut buffer = vec![];
+            while let Some(next_addr) = addr.to_optional() {
+                tracing::debug!("Resolving extent 0x{next_addr:x}");
+                let extent = self.read_extent(next_addr).await?;
+                tracing::debug!("  Extent at 0x{:x} is of size {} B", next_addr, extent.data.len());
+                addr = extent.next;
+                buffer.extend(extent.data);
+
+                while buffer.len() >= chunk_size {
+                    let chunk = buffer.drain(..chunk_size).collect::<Vec<u8>>();
+                    yield chunk;
+                }
+            }
+
+            if !buffer.is_empty() {
+                yield buffer;
+            }
+        }
+    }
+
+    async fn read_full_data_from_extent(&self, addr: MaybeU64) -> Result<Vec<u8>, XHFSError> {
+        let mut stream = Box::pin(
+            self.read_stream_from_extent_stream(addr, self.static_format.block_size_bytes as usize),
+        );
         let mut data = vec![];
-        while let Some(next_addr) = addr.to_optional() {
-            tracing::debug!("Resolving extent 0x{next_addr:x}");
-            let extent = self.read_extent(next_addr).await?;
-            tracing::debug!(
-                "  Extent at 0x{:x} is of size {} B",
-                next_addr,
-                extent.data.len()
-            );
-            addr = extent.next;
-            data.extend(extent.data);
+        while let Some(chunk_result) = stream.next().await {
+            let chunk = chunk_result?;
+            data.extend(chunk);
         }
 
         Ok(data)

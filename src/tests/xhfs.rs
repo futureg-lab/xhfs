@@ -6,6 +6,7 @@ use crate::{
     },
     xhfs::{WriteOption, XHFS, ds::*},
 };
+use futures::StreamExt;
 use std::{collections::HashMap, io::Cursor, sync::Arc};
 use tokio::sync::RwLock;
 
@@ -353,6 +354,50 @@ async fn test_fstream_from_no_file() -> eyre::Result<()> {
     assert_eq!(meta_exts[0].size_span(), header.format.block_size_bytes);
     assert_eq!(meta_exts[1].size_span(), header.format.block_size_bytes);
     assert_eq!(meta_exts[2].size_span(), header.format.block_size_bytes);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_xhfs_fread_stream() -> eyre::Result<()> {
+    let xhfs = create_simple_memory_xhfs(128 * 1000 * 1000).await?;
+    let part1 = vec![1; 72];
+    let part2 = vec![2; 111];
+    let part3 = vec![3; 1];
+
+    xhfs.fwrite("/file.bin", vec![], WriteOption { overwrite: false })
+        .await?;
+    xhfs.fappend("/file.bin", part1.clone()).await?;
+    xhfs.fappend("/file.bin", part2.clone()).await?;
+    xhfs.fappend("/file.bin", part3.clone()).await?;
+
+    let examples = [13, 17, 22, 100000];
+    for chunk_size in examples {
+        let mut stream = xhfs.fread_stream("/file.bin", chunk_size).await.unwrap();
+        let mut result = vec![];
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.unwrap();
+            result.extend(chunk);
+        }
+        let mut c = 0;
+        assert_eq!(
+            part1,
+            result[c..c + 72],
+            "chunk size {chunk_size} for part 1"
+        );
+        c += 72;
+        assert_eq!(
+            part2,
+            result[c..c + 111],
+            "chunk size {chunk_size} for part 2"
+        );
+        c += 111;
+        assert_eq!(
+            part3,
+            result[c..c + 1],
+            "chunk size {chunk_size} for part 3"
+        );
+    }
 
     Ok(())
 }
