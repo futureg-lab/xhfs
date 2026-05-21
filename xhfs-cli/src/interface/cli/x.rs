@@ -1,12 +1,12 @@
-use crate::{
-    interface::cli::GlobalOptions,
-    utils::{normalize_path, u64_to_utc_datetime},
-    xhfs::{WriteOption, XHFS, ds::INodeKind},
-};
+use crate::interface::cli::GlobalOptions;
 use async_recursion::async_recursion;
 use clap::{Args, Subcommand};
 use eyre::OptionExt;
 use std::path::{Path, PathBuf};
+use xhfs_core::{
+    utils::{normalize_path, u64_to_utc_datetime},
+    xhfs::{WriteOption, XHFS, ds::INodeKind},
+};
 
 #[derive(Subcommand, Debug)]
 pub enum FsSubcommands {

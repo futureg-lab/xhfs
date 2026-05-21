@@ -2,10 +2,7 @@ use crate::interface::cli::MainCommand;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
-pub mod device;
-pub mod interface;
-pub mod utils;
-pub mod xhfs;
+mod interface;
 
 #[cfg(test)]
 mod tests;

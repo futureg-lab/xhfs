@@ -1,9 +1,6 @@
-use crate::{
-    interface::{
-        cli::{inspect::InspectCommands, x::*},
-        config::Config,
-    },
-    xhfs::{WriteOption, XHFS},
+use crate::interface::{
+    cli::{inspect::InspectCommands, x::*},
+    config::Config,
 };
 use clap::{Args, Parser, Subcommand};
 use futures::StreamExt;
@@ -12,6 +9,7 @@ use tokio::{
     fs::{self, File, OpenOptions},
     io::{AsyncWriteExt, stdout},
 };
+use xhfs_core::xhfs::{WriteOption, XHFS};
 
 mod inspect;
 mod x;

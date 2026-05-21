@@ -1,14 +1,21 @@
-[package]
-edition = "2024"
-name = "xhfs"
-version = "0.3.3"
+[workspace]
+resolver = "3"
+
+members = [
+    "xhfs-core",
+    "xhfs-cli"
+]
+
+[workspace.package]
+version = "0.3.4"
 license = "MPL-2.0"
+edition = "2024"
 description = "Bruteforce your way into storing files anywhere across an arbitrary combination of arbitrary devices."
 authors = ["michael-0acf4 <root@afmichael.dev>"]
 repository = "https://github.com/futureg-lab/xhfs"
 readme = "README.md"
 keywords = ["fs", "storage", "io"]
-categories = ["command-line-utilities", "filesystem", "database-implementations"]
+categories = ["filesystem", "database-implementations"]
 include = [
     "src/**/*.rs",
     "Cargo.toml",
@@ -16,25 +23,26 @@ include = [
     "README.md"
 ]
 
-[dependencies]
-async-recursion = "1.1.1"
-async-stream = "0.3.6"
+[workspace.dependencies]
 async-trait = "0.1.89"
 bitvec = "1.0.1"
 bytesize = "2.3.1"
 chacha20 = "0.10.0"
 chrono = "0.4.44"
-clap = {version = "4.6.1", features = ["derive"]}
 eyre = "0.6.12"
-futures = "0.3.32"
 rand = "0.10.1"
 reqwest = "0.13.3"
+
 serde = {version = "1.0.228", features = ["derive"]}
 serde_json = "1.0.149"
 serde_yaml = "0.9.34"
-sha2 = "0.11.0"
+
+async-recursion = "1.1.1"
+async-stream = "0.3.6"
+futures = "0.3.32"
 tokio = {version = "1.52.3", features = ["full"]}
 tokio-util = {version = "0.7.18", features = ["io"]}
+
 tracing = {version = "0.1.44", features = ["std"]}
 tracing-error = "0.2.1"
 tracing-subscriber = {version = "0.3.23", features = ["fmt", "std", "env-filter"]}

@@ -1,14 +1,12 @@
-use crate::{
-    interface::cli::GlobalOptions,
-    xhfs::{
-        addr::MaybeU64,
-        ds::{Bitmap, GroupLayout},
-    },
-};
+use crate::interface::cli::GlobalOptions;
 use clap::{Args, Subcommand};
 use eyre::OptionExt;
 use std::path::PathBuf;
 use tokio::fs;
+use xhfs_core::xhfs::{
+    addr::MaybeU64,
+    ds::{Bitmap, GroupLayout},
+};
 
 #[derive(Args, Debug)]
 pub struct InspectCommands {

@@ -20,7 +20,6 @@ pub fn normalize_path<P: Into<PathBuf>>(path: P) -> String {
 
 pub fn path_to_string_list<P: Into<PathBuf>>(path: P) -> Vec<String> {
     let path: PathBuf = path.into();
-
     path.components()
         .filter_map(|c| match c {
             std::path::Component::RootDir => None,
@@ -40,7 +39,7 @@ pub fn path_to_string_list<P: Into<PathBuf>>(path: P) -> Vec<String> {
 }
 
 pub fn normalize_components(parts: &[String]) -> Vec<String> {
-    let mut stack = Vec::new();
+    let mut stack = vec![];
     for part in parts {
         match part.as_str() {
             "." => {}

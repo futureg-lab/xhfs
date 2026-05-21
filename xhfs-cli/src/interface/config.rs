@@ -1,10 +1,3 @@
-use crate::{
-    device::{
-        disk::Controller, fs_device::FsDevice, http_device::HttpKV, kv_device::*, logical::*,
-    },
-    utils::normalize_path,
-    xhfs::*,
-};
 use bytesize::ByteSize;
 use eyre::Context;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -17,6 +10,13 @@ use std::{
 };
 use tokio::sync::RwLock;
 use url::Url;
+use xhfs_core::{
+    device::{
+        disk::Controller, fs_device::FsDevice, http_device::HttpKV, kv_device::*, logical::*,
+    },
+    utils::normalize_path,
+    xhfs::*,
+};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Config {
@@ -42,13 +42,6 @@ pub enum DeviceConfig {
     },
     #[serde(rename = "file")]
     File { name: String, path: String },
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(rename_all = "lowercase")]
-pub enum DeviceType {
-    Memory,
-    Fs,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
