@@ -1,5 +1,5 @@
 [package]
-name = "xhfs-cli"
+name = "xhfs"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,10 +10,6 @@ readme.workspace = true
 keywords.workspace = true
 include.workspace = true
 categories = ["command-line-utilities", "filesystem", "database-implementations"]
-
-[[bin]]
-name = "xhfs"
-path = "src/main.rs"
 
 [dependencies]
 xhfs-core = { workspace = true }

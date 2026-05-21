@@ -2556,7 +2556,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "xhfs-cli"
+name = "xhfs"
 version = "0.3.4"
 dependencies = [
  "async-recursion",
