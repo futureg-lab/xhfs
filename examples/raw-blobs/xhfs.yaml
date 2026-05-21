@@ -21,6 +21,4 @@ configuration:
       include: [blob3]
       capacity: "2 MiB"
       max_concurrent: 1
-    # Final storage layout
-    # [dev1: 0MiB - 2MiB] [dev2: 2MiB - 4MiB]
   layout: [dev1, dev2]

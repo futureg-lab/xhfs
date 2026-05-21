@@ -102,7 +102,7 @@ Download the binary from the
 
 # Features
 
-- [ ] File System
+- [x] File System
   - [x] Encryption (ChaCha20 stream cipher)
   - [x] No journaling, CoW based
   - [x] xhfs core: fopen, fwrite, fseek, mkdir, fmove, fcopy, unlink
