@@ -16,7 +16,7 @@ name = "xhfs"
 path = "src/main.rs"
 
 [dependencies]
-xhfs-core = { path = "../xhfs-core" }
+xhfs-core = { workspace = true }
 clap = { version = "4.6.1", features = ["derive"] }
 
 async-trait = { workspace = true }
@@ -37,3 +37,4 @@ serde_yaml = { workspace = true }
 url = { workspace = true }
 bytesize = { workspace = true }
 rand = { workspace = true }
+

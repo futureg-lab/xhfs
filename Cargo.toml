@@ -24,6 +24,8 @@ include = [
 ]
 
 [workspace.dependencies]
+xhfs-core = { version = "0.3.4", path = "xhfs-core"}
+
 async-trait = "0.1.89"
 bitvec = "1.0.1"
 bytesize = "2.3.1"
