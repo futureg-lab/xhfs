@@ -5,7 +5,7 @@ use futures::{
 };
 use std::sync::Arc;
 
-pub type DeviceLike = Arc<dyn Device + Send + Sync>;
+pub type DeviceLike = Arc<dyn Device + Send + Sync + 'static>;
 
 #[derive(Clone)]
 pub struct LogicalDevice {
@@ -66,6 +66,7 @@ impl LogicalDevice {
         stream::iter(
             self.replica
                 .iter()
+                .cloned()
                 .map(|device| async move { device.write(addr, data).await }),
         )
         .buffer_unordered(self.max_concurrent)
@@ -74,10 +75,12 @@ impl LogicalDevice {
     }
 
     pub async fn read(&self, addr: usize, size: usize) -> eyre::Result<Vec<u8>> {
-        let mut stream = stream::iter(self.replica.iter().map(|replica| replica.read(addr, size)))
-            .buffer_unordered(self.max_concurrent);
+        let mut tasks = futures::stream::FuturesUnordered::new();
+        for replica in self.replica.clone() {
+            tasks.push(async move { replica.read(addr, size).await });
+        }
         let mut errors = vec![];
-        while let Some(result) = stream.next().await {
+        while let Some(result) = tasks.next().await {
             match result {
                 Ok(data) => return Ok(data),
                 Err(err) => errors.push(err),
