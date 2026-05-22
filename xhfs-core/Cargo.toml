@@ -19,7 +19,6 @@ chacha20 = { workspace = true }
 chrono = { workspace = true }
 eyre = { workspace = true }
 
-async-recursion = { workspace = true }
 async-stream = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }

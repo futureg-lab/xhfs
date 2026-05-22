@@ -3,7 +3,6 @@ use crate::{
     utils::*,
     xhfs::{addr::MaybeU64, crypto::Crypto, ds::*},
 };
-use async_recursion::async_recursion;
 use async_stream::try_stream;
 use eyre::{Context, ContextCompat};
 use futures::{Stream, StreamExt};
@@ -189,54 +188,64 @@ impl XHFS {
         Ok(None)
     }
 
-    #[async_recursion(?Send)]
     async fn delete_inode_with_extent(&self, inumber: u64) -> eyre::Result<bool> {
-        tracing::debug!("Resolving INode {inumber} for deletion loop");
-        let group = GroupLayout::derive_from_inode(inumber, &self.geometry)
-            .ok_or_else(|| eyre::eyre!("Unable to derive group layout for inumber {inumber}"))?;
-
-        let bitmap_slot = group.inode_bitmap_region.to_addr_slot();
-        let raw_bitmap = self
-            .ctrl
-            .raw_read(bitmap_slot.addr.into(), bitmap_slot.capacity)
-            .await?;
-
-        let mut bitmap = Bitmap::deserialize(&raw_bitmap)?;
-        let inode_index_in_group = (inumber - 1) % self.geometry.n_inodes_in_group;
-        if !bitmap
-            .get(inode_index_in_group as usize)
-            .wrap_err("Resolving INode within bitmap for deletion")?
-        {
-            return Ok(false);
-        }
-
-        let mut worth_deleting = false;
-        if let Some(mut inode) = self.resolve_inode(inumber).await? {
+        let mut deletion_stack = vec![inumber];
+        let mut current_inumber = inumber;
+        while let Some(inode) = self.resolve_inode(current_inumber).await? {
             if matches!(inode.kind, INodeKind::Hardlink) {
-                let target_inode = self.follow_link_or_noop(inode.clone()).await?;
-                self.delete_inode_with_extent(target_inode.inumber).await?;
-            }
-
-            inode.nlink = inode.nlink.saturating_sub(1);
-
-            if inode.nlink == 0 {
-                worth_deleting = true;
-                tracing::debug!(
-                    "Cascading deletion to extent chain starting at 0x{:x}",
-                    inode.extent_addr.get()
-                );
-                self.free_full_extent(inode.extent_addr).await?;
+                let target_inode = self.follow_link_or_noop(inode).await?;
+                if deletion_stack.contains(&target_inode.inumber) {
+                    eyre::bail!("Hardlink loop detected during deletion pass");
+                }
+                deletion_stack.push(target_inode.inumber);
+                current_inumber = target_inode.inumber;
             } else {
-                self.register_inode(&inode, true).await?;
+                break;
             }
         }
 
-        if worth_deleting {
-            // commit!
-            bitmap.set(inode_index_in_group as usize, false)?;
-            self.ctrl
-                .raw_write(bitmap_slot.addr.into(), &bitmap.serialize()?)
+        while let Some(target_inumber) = deletion_stack.pop() {
+            tracing::debug!("Processing deletion/link-decrement for INode {target_inumber}");
+            let group = GroupLayout::derive_from_inode(target_inumber, &self.geometry).ok_or_else(
+                || eyre::eyre!("Unable to derive group layout for inumber {target_inumber}"),
+            )?;
+            let bitmap_slot = group.inode_bitmap_region.to_addr_slot();
+            let raw_bitmap = self
+                .ctrl
+                .raw_read(bitmap_slot.addr.into(), bitmap_slot.capacity)
                 .await?;
+            let mut bitmap = Bitmap::deserialize(&raw_bitmap)?;
+
+            let inode_index_in_group = (target_inumber - 1) % self.geometry.n_inodes_in_group;
+            if !bitmap
+                .get(inode_index_in_group as usize)
+                .wrap_err("Resolving INode within bitmap for deletion")?
+            {
+                continue; // already processed or invalid
+            }
+
+            let mut worth_deleting = false;
+            if let Some(mut inode) = self.resolve_inode(target_inumber).await? {
+                inode.nlink = inode.nlink.saturating_sub(1);
+
+                if inode.nlink == 0 {
+                    worth_deleting = true;
+                    tracing::debug!(
+                        "Cascading deletion to extent chain starting at 0x{:x}",
+                        inode.extent_addr.get()
+                    );
+                    self.free_full_extent(inode.extent_addr).await?;
+                } else {
+                    self.register_inode(&inode, true).await?;
+                }
+            }
+
+            if worth_deleting {
+                bitmap.set(inode_index_in_group as usize, false)?;
+                self.ctrl
+                    .raw_write(bitmap_slot.addr.into(), &bitmap.serialize()?)
+                    .await?;
+            }
         }
 
         Ok(true)
@@ -505,44 +514,42 @@ impl XHFS {
         Ok((inode, filename))
     }
 
-    #[async_recursion(?Send)]
     pub async fn ls<P: Into<PathBuf>>(&self, path: P) -> eyre::Result<Vec<String>> {
-        let path: PathBuf = path.into();
-        let inode = self.resolve_path(&path).await?;
-        match inode.kind {
-            INodeKind::Directory => {
-                let directory = {
+        let mut current_path: PathBuf = path.into();
+        loop {
+            let inode = self.resolve_path(&current_path).await?;
+
+            match inode.kind {
+                INodeKind::Directory => {
                     let payload = self.read_full_data_from_extent(inode.extent_addr).await?;
-                    Directory::deserialize(&payload)?
-                };
-                Ok(directory
-                    .entries
-                    .into_iter()
-                    .map(|(name, _)| name)
-                    .collect())
-            }
-            INodeKind::File => {
-                eyre::bail!("Cannot ls a file");
-            }
-            INodeKind::Hardlink => {
-                eyre::bail!("Cannot ls a Hardlink as it only refers to a file");
-            }
-            INodeKind::Symlink => {
-                tracing::debug!("Trying to list dir entries from symlink");
-                let symlink = {
-                    let raw_path = self.read_full_data_from_extent(inode.extent_addr).await?;
-                    Symlink::deserialize(&raw_path)?
-                };
-                tracing::debug!(
-                    " {} *=> {}",
-                    normalize_path(&path),
-                    normalize_path(&symlink.path)
-                );
-                if symlink.path == path {
-                    tracing::warn!("Invalid fs state: Symlink pointing to itself detected");
-                    eyre::bail!("Symlink pointing to itself detected");
+                    let directory = Directory::deserialize(&payload)?;
+                    return Ok(directory
+                        .entries
+                        .into_iter()
+                        .map(|(name, _)| name)
+                        .collect());
                 }
-                self.ls(symlink.path).await
+                INodeKind::Symlink => {
+                    tracing::debug!("Trying to list dir entries from symlink");
+                    let raw_path = self.read_full_data_from_extent(inode.extent_addr).await?;
+                    let symlink = Symlink::deserialize(&raw_path)?;
+                    tracing::debug!(
+                        " {} *=> {}",
+                        normalize_path(&current_path),
+                        normalize_path(&symlink.path)
+                    );
+                    if symlink.path == current_path {
+                        tracing::warn!("Invalid fs state: Symlink pointing to itself detected");
+                        eyre::bail!("Symlink pointing to itself detected");
+                    }
+                    current_path = symlink.path;
+                }
+                INodeKind::File => {
+                    eyre::bail!("Cannot ls a file");
+                }
+                INodeKind::Hardlink => {
+                    eyre::bail!("Cannot ls a Hardlink as it only refers to a file");
+                }
             }
         }
     }
@@ -1072,7 +1079,6 @@ impl XHFS {
         }
     }
 
-    #[async_recursion(?Send)]
     pub async fn fseek<P: Into<PathBuf>>(
         &self,
         path: P,
@@ -1102,38 +1108,38 @@ impl XHFS {
     // TODO:
     // fprepend?
 
-    #[async_recursion(?Send)]
     pub async fn fappend_inode(&self, mut inode: INode, data: Vec<u8>) -> Result<(), XHFSError> {
-        match inode.kind {
-            INodeKind::File => {
-                inode.total_file_size += data.len() as u64;
-                inode.extent_addr = self
-                    .append_or_allocate_extent(inode.extent_addr, data)
-                    .await?;
-                self.update_inode_mtime_now(inode).await?;
-            }
-            INodeKind::Symlink => {
-                let referenced = self.follow_link_or_noop(inode.clone()).await?;
-                self.fappend_inode(referenced, data).await?;
-            }
-            INodeKind::Hardlink => {
-                tracing::debug!("Trying to fappend file from Hardlink");
-                let referenced = self.follow_link_or_noop(inode.clone()).await?;
-                tracing::debug!(
-                    " INode #{} *=> INode #{}",
-                    inode.inumber,
-                    referenced.inumber
-                );
-                if referenced.inumber == inode.inumber {
-                    xhfs_bail!("Hardlink pointing to itself detected");
+        loop {
+            match inode.kind {
+                INodeKind::File => {
+                    inode.total_file_size += data.len() as u64;
+                    inode.extent_addr = self
+                        .append_or_allocate_extent(inode.extent_addr, data)
+                        .await?;
+                    self.update_inode_mtime_now(inode).await?;
+                    return Ok(());
                 }
-                self.fappend_inode(referenced, data).await?;
+                INodeKind::Symlink => {
+                    inode = self.follow_link_or_noop(inode).await?;
+                }
+                INodeKind::Hardlink => {
+                    tracing::debug!("Trying to fappend file from Hardlink");
+                    let referenced = self.follow_link_or_noop(inode.clone()).await?;
+                    tracing::debug!(
+                        " INode #{} *=> INode #{}",
+                        inode.inumber,
+                        referenced.inumber
+                    );
+                    if referenced.inumber == inode.inumber {
+                        xhfs_bail!("Hardlink pointing to itself detected");
+                    }
+                    inode = referenced;
+                }
+                INodeKind::Directory => {
+                    xhfs_bail!("Cannot append data to directory");
+                }
             }
-            INodeKind::Directory => {
-                xhfs_bail!("Cannot append data to directory");
-            }
-        };
-        Ok(())
+        }
     }
 
     pub async fn fappend<P: Into<PathBuf>>(&self, path: P, data: Vec<u8>) -> Result<(), XHFSError> {
