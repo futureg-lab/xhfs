@@ -7,7 +7,7 @@ pub mod kv_device;
 pub mod logical;
 
 #[async_trait]
-pub trait Device: Send {
+pub trait Device: Send + Sync {
     fn name(&self) -> String;
     async fn capacity(&self) -> eyre::Result<usize>;
     async fn write(&self, addr: usize, data: &[u8]) -> eyre::Result<()>;
