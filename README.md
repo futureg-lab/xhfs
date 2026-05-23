@@ -123,7 +123,7 @@ Download the binary from the
   - [x] CLI
   - [x] Inspection utilities: `xhfs inspect`
   - [x] Servers
-    - [x] WebDAV server: `xhfs server webdav -p 1144`
+    - [x] Webdav server: `xhfs server webdav -p 1144`
 
 # Inspection tools
 
