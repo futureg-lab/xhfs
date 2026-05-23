@@ -1,9 +1,5 @@
 use crate::{
-    device::{
-        disk::Controller,
-        kv_device::*,
-        logical::{DeviceLike, LogicalDevice},
-    },
+    device::{ConcreteDevice, disk::Controller, kv_device::*, logical::LogicalDevice},
     xhfs::{WriteOption, XHFS, ds::*},
 };
 use futures::StreamExt;
@@ -14,12 +10,12 @@ async fn create_simple_memory_xhfs(capacity: usize) -> eyre::Result<XHFS> {
     if capacity % 8 != 0 {
         eyre::bail!("Test fs expects % 8");
     }
-    let dev1 = KVDevice {
+    let dev1 = ConcreteDevice::KVDevice(KVDevice {
         store: Arc::new(MemoryKV(RwLock::new(HashMap::new()))),
         total_slots: capacity / 8,
         slot_capacity: 8,
-    };
-    let dev1 = LogicalDevice::new(2, [Arc::from(dev1) as DeviceLike])?;
+    });
+    let dev1 = LogicalDevice::new(2, [dev1])?;
     let ctrl = Controller::from([dev1]).await?;
     XHFS::format_new(ctrl, Some("helloworld".to_string())).await
 }

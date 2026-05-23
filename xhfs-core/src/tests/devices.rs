@@ -1,11 +1,11 @@
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use crate::device::{
-    Device,
+    ConcreteDevice, Device,
     disk::Controller,
     fs_device::FsDevice,
     kv_device::{KVDevice, MemoryKV},
-    logical::{DeviceLike, LogicalDevice},
+    logical::LogicalDevice,
 };
 use tokio::{fs, sync::RwLock};
 
@@ -120,28 +120,21 @@ async fn test_logical_device() -> eyre::Result<()> {
         }
     }
 
-    let dev1 = FsDevice::new(test_files[0].clone(), 20).await?;
-    let dev2 = FsDevice::new(test_files[1].clone(), 20).await?;
-    let dev3 = KVDevice {
+    let dev1 = ConcreteDevice::FsDevice(FsDevice::new(test_files[0].clone(), 20).await?);
+    let dev2 = ConcreteDevice::FsDevice(FsDevice::new(test_files[1].clone(), 20).await?);
+    let dev3 = ConcreteDevice::KVDevice(KVDevice {
         store: Arc::new(MemoryKV(RwLock::new(HashMap::new()))),
         total_slots: 6,
         slot_capacity: 7,
-    };
-    let dev4 = KVDevice {
+    });
+    let dev4 = ConcreteDevice::KVDevice(KVDevice {
         store: Arc::new(MemoryKV(RwLock::new(HashMap::new()))),
         total_slots: 4,
         slot_capacity: 5,
-    };
+    });
 
-    let dev1 = LogicalDevice::new(
-        2,
-        [
-            Arc::from(dev1) as DeviceLike,
-            Arc::from(dev4) as DeviceLike,
-            Arc::from(dev2) as DeviceLike,
-        ],
-    )?;
-    let dev2 = LogicalDevice::new(2, [Arc::from(dev3) as DeviceLike])?;
+    let dev1 = LogicalDevice::new(2, [dev1, dev4, dev2])?;
+    let dev2 = LogicalDevice::new(2, [dev3])?;
     test_read_write_complex!(&dev1).await?;
     test_read_write_complex!(&dev2).await?;
 

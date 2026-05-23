@@ -1,22 +1,19 @@
-use crate::device::Device;
+use crate::device::{ConcreteDevice, Device};
 use futures::{
     StreamExt, TryStreamExt,
     stream::{self},
 };
-use std::sync::Arc;
-
-pub type DeviceLike = Arc<dyn Device + Send + Sync + 'static>;
 
 #[derive(Clone)]
 pub struct LogicalDevice {
     max_concurrent: usize,
-    replica: Vec<DeviceLike>,
+    replica: Vec<ConcreteDevice>,
 }
 
 impl LogicalDevice {
     pub fn new<D>(max_concurrent: usize, devices: D) -> eyre::Result<Self>
     where
-        D: IntoIterator<Item = DeviceLike>,
+        D: IntoIterator<Item = ConcreteDevice>,
         D::IntoIter: ExactSizeIterator,
     {
         if max_concurrent < 1 {

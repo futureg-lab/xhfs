@@ -12,7 +12,8 @@ use tokio::sync::RwLock;
 use url::Url;
 use xhfs_core::{
     device::{
-        disk::Controller, fs_device::FsDevice, http_device::HttpKV, kv_device::*, logical::*,
+        ConcreteDevice, disk::Controller, fs_device::FsDevice, http_device::HttpKV, kv_device::*,
+        logical::*,
     },
     utils::normalize_path,
     xhfs::*,
@@ -216,17 +217,17 @@ configuration:
                     DeviceConfig::KVMemory {
                         slot_capacity_bytes,
                         ..
-                    } => Arc::new(KVDevice {
+                    } => ConcreteDevice::KVDevice(KVDevice {
                         store: Arc::new(MemoryKV(RwLock::new(HashMap::new()))),
                         total_slots: (capacity / *slot_capacity_bytes) as usize,
                         slot_capacity: *slot_capacity_bytes as usize,
-                    }) as DeviceLike,
+                    }),
                     DeviceConfig::KVHttp {
                         slot_capacity_bytes,
                         url,
                         headers,
                         name,
-                    } => Arc::new(KVDevice {
+                    } => ConcreteDevice::KVDevice(KVDevice {
                         store: Arc::new(HttpKV {
                             url: url.clone(),
                             key_prefix: name.clone(),
@@ -234,9 +235,9 @@ configuration:
                         }),
                         total_slots: (capacity / *slot_capacity_bytes) as usize,
                         slot_capacity: *slot_capacity_bytes as usize,
-                    }) as DeviceLike,
+                    }),
                     DeviceConfig::File { path, .. } => {
-                        Arc::new(FsDevice::new(path, capacity as usize).await?) as DeviceLike
+                        ConcreteDevice::FsDevice(FsDevice::new(path, capacity as usize).await?)
                     }
                 };
                 group.push(instance);

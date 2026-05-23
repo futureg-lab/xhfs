@@ -1,12 +1,14 @@
 use crate::device::Device;
 use async_trait::async_trait;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::fs::{self, File, OpenOptions};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
+#[derive(Clone)]
 pub struct FsDevice {
-    file: Mutex<File>,
+    file: Arc<Mutex<File>>,
     size: usize,
 }
 
@@ -45,7 +47,7 @@ impl FsDevice {
         };
 
         Ok(Self {
-            file: Mutex::new(tokio_file),
+            file: Arc::new(Mutex::new(tokio_file)),
             size,
         })
     }
