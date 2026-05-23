@@ -405,7 +405,7 @@ impl GuardedFileSystem<()> for XHFSAdapter {
         let path_buf = path.as_pathbuf();
         async move {
             // TODO: native recursive
-            // right now, I believe it is using a combination of ls and unlink
+            // The default implementation is using a combination of ls and unlink
             xhfs.unlink(path_buf).await.map_err(|e| {
                 tracing::error!("unlink folder failed: {e:?}");
                 FsError::GeneralFailure
@@ -516,7 +516,7 @@ impl GuardedFileSystem<()> for XHFSAdapter {
                 FsError::NotFound
             })?;
             let remaining = xhfs.total_remaining_capacity().await.map_err(|e| {
-                tracing::error!("Failed listing path collection targets: {e:?}");
+                tracing::error!("Failed calculating capacity: {e:?}");
                 FsError::NotFound
             })?;
             Ok((total_capacity as u64, Some(remaining as u64)))

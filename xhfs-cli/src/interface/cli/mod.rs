@@ -42,7 +42,7 @@ pub enum Commands {
     X(FsCommands),
     /// Inspect current filesystem
     Inspect(InspectCommands),
-    /// Inspect current filesystem
+    /// Server commands
     Server(ServerCommands),
 }
 

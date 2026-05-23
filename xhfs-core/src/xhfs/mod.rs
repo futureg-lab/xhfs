@@ -4,17 +4,19 @@ use crate::{
     xhfs::{addr::MaybeU64, crypto::Crypto, ds::*},
 };
 use async_stream::try_stream;
+use bytes::Bytes;
 use eyre::{Context, ContextCompat};
 use futures::{Stream, StreamExt};
 use std::{
     fmt::Debug,
-    io::{self, Cursor},
+    io::{self},
     path::PathBuf,
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt},
     sync::Mutex,
 };
+use tokio_util::io::StreamReader;
 pub mod addr;
 pub mod crypto;
 pub mod ds;
@@ -584,7 +586,7 @@ impl XHFS {
         opt: WriteOption,
     ) -> Result<(), XHFSError> {
         let stream = self.fread_stream(src, chunk_size).await?;
-        let stream = into_reader(stream).await.map_err(XHFSError::from_error)?;
+        let stream = into_reader(stream);
         self.fwrite_stream_unbounded(dest, stream, chunk_size, opt)
             .await
     }
@@ -1665,14 +1667,13 @@ impl XHFS {
     }
 }
 
-pub async fn into_reader<S>(mut stream: S) -> io::Result<impl AsyncRead + AsyncSeek + Unpin>
+pub fn into_reader<S>(stream: S) -> impl AsyncRead + Unpin
 where
     S: Stream<Item = Result<Vec<u8>, XHFSError>> + Unpin,
 {
-    let mut data = vec![];
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        data.extend_from_slice(&chunk);
-    }
-    Ok(Cursor::new(data))
+    StreamReader::new(stream.map(|chunk| {
+        chunk
+            .map(Bytes::from)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+    }))
 }
