@@ -41,6 +41,14 @@ pub struct WriteOption {
     pub overwrite: bool,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ExtentMetadata {
+    pub full_aligned_region: RegionSlot,
+    pub full_canon_region: RegionSlot,
+    pub full_canon_data_slot: AddressSlot,
+    pub next_extent: MaybeU64,
+}
+
 #[derive(Debug, Clone)]
 pub struct AllocationSlot {
     pub absolute_byte_addr: u64,
@@ -1456,15 +1464,13 @@ impl XHFS {
 
         let mut addr = start_extent_addr;
         while let Some(current_addr) = addr.to_optional() {
-            let (curr_region, next_hop, _) = self.read_extent_metadata(current_addr).await?;
-
+            let meta = self.read_extent_metadata(current_addr).await?;
             self.mark_as_reusable(AddressSlot {
                 addr: MaybeU64::from(current_addr),
-                capacity: curr_region.size_span() as usize,
+                capacity: meta.full_aligned_region.size_span() as usize,
             })
             .await?;
-
-            addr = next_hop;
+            addr = meta.next_extent;
         }
 
         Ok(())
@@ -1491,8 +1497,8 @@ impl XHFS {
 
         while let Some(current_addr) = addr.to_optional() {
             last_extent = Some(current_addr);
-            let (_, next_addr, _) = self.read_extent_metadata(current_addr).await?;
-            addr = next_addr;
+            let meta = self.read_extent_metadata(current_addr).await?;
+            addr = meta.next_extent;
         }
 
         let mut all_extent_start = start_extent_addr;
@@ -1563,34 +1569,38 @@ impl XHFS {
         Ok(out)
     }
 
-    pub async fn read_extent_metadata(
-        &self,
-        addr: u64,
-    ) -> eyre::Result<(RegionSlot, MaybeU64, u64)> {
-        let extent_header = self.ctrl.read(addr as usize, 16).await?;
+    pub async fn read_extent_metadata(&self, addr: u64) -> eyre::Result<ExtentMetadata> {
+        let full_offset = (Extent::HEADER_CAP_OFFSET + Extent::HEADER_CAP_OFFSET) as usize;
+        eyre::ensure!(full_offset == 16);
+        let extent_header = self.ctrl.read(addr as usize, full_offset).await?;
         let curr_extent_data_size = u64::from_le_bytes(extent_header[0..8].try_into()?);
-        eyre::ensure!(Extent::HEADER_NEXT_OFFSET == 8);
-
         let next_extent = MaybeU64::from(u64::from_le_bytes(extent_header[8..16].try_into()?));
         let raw_footprint = 16 + curr_extent_data_size as u64;
         let block_size = self.static_format.block_size_bytes as u64;
         let aligned_capacity = ((raw_footprint + block_size - 1) / block_size) * block_size;
 
-        Ok((
-            RegionSlot {
+        Ok(ExtentMetadata {
+            full_aligned_region: RegionSlot {
                 start: MaybeU64::from(addr),
                 end: MaybeU64::from(addr + aligned_capacity),
             },
+            full_canon_region: RegionSlot {
+                start: MaybeU64::from(addr),
+                end: MaybeU64::from(addr + raw_footprint),
+            },
+            full_canon_data_slot: AddressSlot {
+                addr: MaybeU64::from(addr + 16),
+                capacity: curr_extent_data_size as usize,
+            },
             next_extent,
-            curr_extent_data_size,
-        ))
+        })
     }
 
     pub async fn find_full_extent_metadata(
         &self,
         mut addr: MaybeU64,
         stop: Option<u32>,
-    ) -> eyre::Result<Vec<RegionSlot>> {
+    ) -> eyre::Result<Vec<ExtentMetadata>> {
         let mut blocks = vec![];
         let max = stop.unwrap_or(u32::MAX);
         let mut i = 1;
@@ -1599,9 +1609,9 @@ impl XHFS {
                 break;
             }
             tracing::debug!("Resolving {i}-th extent metadata 0x{next_addr:x}");
-            let (block_slot, next_addr, _) = self.read_extent_metadata(next_addr).await?;
-            addr = next_addr;
-            blocks.push(block_slot);
+            let meta = self.read_extent_metadata(next_addr).await?;
+            addr = meta.next_extent;
+            blocks.push(meta);
             i += 1;
         }
         Ok(blocks)

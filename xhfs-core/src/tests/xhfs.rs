@@ -360,9 +360,25 @@ async fn test_fstream_from_no_file() -> eyre::Result<()> {
 
     assert_eq!(meta_exts.len(), 3, "each write shot should use 1 extent");
     // each burst of 4 bytes wastes 4096 B (1 block) - 4 B - 16 B extent header space
-    assert_eq!(meta_exts[0].size_span(), header.format.block_size_bytes);
-    assert_eq!(meta_exts[1].size_span(), header.format.block_size_bytes);
-    assert_eq!(meta_exts[2].size_span(), header.format.block_size_bytes);
+    assert_eq!(
+        meta_exts[0].full_aligned_region.size_span(),
+        header.format.block_size_bytes
+    );
+    assert_eq!(
+        meta_exts[1].full_aligned_region.size_span(),
+        header.format.block_size_bytes
+    );
+    assert_eq!(
+        meta_exts[2].full_aligned_region.size_span(),
+        header.format.block_size_bytes
+    );
+
+    assert_eq!(meta_exts[0].full_canon_region.size_span(), 20); // (8 + 8) + 4
+    assert_eq!(meta_exts[0].full_canon_data_slot.capacity, 4);
+    assert_eq!(meta_exts[1].full_canon_region.size_span(), 20); // (8 + 8) + 4
+    assert_eq!(meta_exts[1].full_canon_data_slot.capacity, 4);
+    assert_eq!(meta_exts[2].full_canon_region.size_span(), 17); // (8 + 8) + 1
+    assert_eq!(meta_exts[2].full_canon_data_slot.capacity, 1);
 
     Ok(())
 }

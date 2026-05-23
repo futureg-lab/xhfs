@@ -8,7 +8,6 @@ use std::{
     str::FromStr,
     sync::Arc,
 };
-use tokio::sync::RwLock;
 use url::Url;
 use xhfs_core::{
     device::{
@@ -29,11 +28,6 @@ pub struct Config {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type")]
 pub enum DeviceConfig {
-    #[serde(rename = "kvmemory")]
-    KVMemory {
-        name: String,
-        slot_capacity_bytes: u64,
-    },
     #[serde(rename = "kvhttp")]
     KVHttp {
         name: String,
@@ -65,7 +59,6 @@ pub struct LogicalDeviceConfig {
 impl DeviceConfig {
     pub fn name(&self) -> String {
         match self {
-            DeviceConfig::KVMemory { name, .. } => name,
             DeviceConfig::File { name, .. } => name,
             DeviceConfig::KVHttp { name, .. } => name,
         }
@@ -78,9 +71,6 @@ impl DeviceConfig {
             DeviceConfig::File { path, .. } => {
                 let path = normalize_path(path);
                 path.hash(&mut hasher);
-            }
-            DeviceConfig::KVMemory { .. } => {
-                rand::random::<u64>().hash(&mut hasher);
             }
             DeviceConfig::KVHttp { name, url, .. } => {
                 name.hash(&mut hasher);
@@ -214,14 +204,6 @@ configuration:
 
                 let capacity = logdev.capacity.0.as_u64();
                 let instance = match dev {
-                    DeviceConfig::KVMemory {
-                        slot_capacity_bytes,
-                        ..
-                    } => ConcreteDevice::KVDevice(KVDevice {
-                        store: Arc::new(MemoryKV(RwLock::new(HashMap::new()))),
-                        total_slots: (capacity / *slot_capacity_bytes) as usize,
-                        slot_capacity: *slot_capacity_bytes as usize,
-                    }),
                     DeviceConfig::KVHttp {
                         slot_capacity_bytes,
                         url,
@@ -236,9 +218,9 @@ configuration:
                         total_slots: (capacity / *slot_capacity_bytes) as usize,
                         slot_capacity: *slot_capacity_bytes as usize,
                     }),
-                    DeviceConfig::File { path, .. } => {
-                        ConcreteDevice::FsDevice(FsDevice::new(path, capacity as usize).await?)
-                    }
+                    DeviceConfig::File { path, .. } => ConcreteDevice::FsDevice(
+                        FsDevice::new(path, capacity as usize, format_new).await?,
+                    ),
                 };
                 group.push(instance);
             }

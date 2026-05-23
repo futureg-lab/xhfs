@@ -13,8 +13,15 @@ pub struct FsDevice {
 }
 
 impl FsDevice {
-    pub async fn new<P: Into<PathBuf>>(file: P, size: usize) -> eyre::Result<Self> {
+    pub async fn new<P: Into<PathBuf>>(
+        file: P,
+        size: usize,
+        overwrite: bool,
+    ) -> eyre::Result<Self> {
         let path: PathBuf = file.into();
+        if overwrite && path.exists() {
+            fs::remove_file(&path).await?;
+        }
         let tokio_file = match fs::metadata(&path).await {
             Ok(meta) => {
                 let existing_size = meta.len() as usize;

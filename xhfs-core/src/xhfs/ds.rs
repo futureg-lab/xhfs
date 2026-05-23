@@ -265,6 +265,7 @@ impl INodeKind {
 
 impl Extent {
     pub const HEADER_NEXT_OFFSET: u64 = 8;
+    pub const HEADER_CAP_OFFSET: u64 = 8;
 
     pub fn serialize(&self) -> eyre::Result<Vec<u8>> {
         let mut buf = Vec::with_capacity(self.serialized_size());
@@ -308,7 +309,7 @@ impl Extent {
     }
 
     pub fn emulate_serialized_size(data_len: usize) -> usize {
-        8 + 8 + data_len
+        (Self::HEADER_NEXT_OFFSET + Self::HEADER_CAP_OFFSET) as usize + data_len
     }
 
     pub fn serialized_size(&self) -> usize {

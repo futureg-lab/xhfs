@@ -101,7 +101,7 @@ async fn test_fs_device() -> eyre::Result<()> {
         fs::remove_file(&test_file).await?;
     }
 
-    let device = FsDevice::new(test_file, 20).await?;
+    let device = FsDevice::new(test_file, 20, false).await?;
     test_read_write_simple!(&device).await?;
     test_read_write_complex!(&device).await?;
 
@@ -120,8 +120,8 @@ async fn test_logical_device() -> eyre::Result<()> {
         }
     }
 
-    let dev1 = ConcreteDevice::FsDevice(FsDevice::new(test_files[0].clone(), 20).await?);
-    let dev2 = ConcreteDevice::FsDevice(FsDevice::new(test_files[1].clone(), 20).await?);
+    let dev1 = ConcreteDevice::FsDevice(FsDevice::new(test_files[0].clone(), 20, false).await?);
+    let dev2 = ConcreteDevice::FsDevice(FsDevice::new(test_files[1].clone(), 20, false).await?);
     let dev3 = ConcreteDevice::KVDevice(KVDevice {
         store: Arc::new(MemoryKV(RwLock::new(HashMap::new()))),
         total_slots: 6,
