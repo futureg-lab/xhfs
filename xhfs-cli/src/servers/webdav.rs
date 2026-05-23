@@ -1,4 +1,4 @@
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use dav_server::{
     DavHandler,
     davpath::DavPath,
@@ -21,7 +21,7 @@ use std::{
 };
 use tokio::{net::TcpListener, sync::Mutex};
 use xhfs_core::xhfs::{
-    XHFS,
+    WriteOption, XHFS,
     ds::{EntryStat, INodeKind},
 };
 
@@ -191,16 +191,41 @@ impl DavFile for XHFSFile {
         .boxed()
     }
 
+    fn write_bytes(&'_ mut self, buf: Bytes) -> FsFuture<'_, ()> {
+        let xhfs = self.xhfs.clone();
+        let path = self.path.clone();
+        async move {
+            let len = buf.len();
+            xhfs.fappend(&path, buf.to_vec()).await.map_err(|e| {
+                tracing::error!("Failed writting {len} bytes into {path:?}: {e:?}");
+                FsError::GeneralFailure
+            })?;
+            Ok(())
+        }
+        .boxed()
+    }
+
+    fn write_buf(&'_ mut self, mut buf: Box<dyn Buf + Send>) -> FsFuture<'_, ()> {
+        tracing::debug!("Writting buf");
+        let xhfs = self.xhfs.clone();
+        let path = self.path.clone();
+        async move {
+            while buf.has_remaining() {
+                let b = buf.chunk();
+                let len = b.len();
+                xhfs.fappend(&path, b.to_vec()).await.map_err(|e| {
+                    tracing::error!("Failed writting {len} bytes into {path:?}: {e:?}");
+                    FsError::GeneralFailure
+                })?;
+                buf.advance(len);
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+
     fn flush(&mut self) -> FsFuture<'_, ()> {
         async move { Ok(()) }.boxed()
-    }
-
-    fn write_buf(&'_ mut self, _buf: Box<dyn bytes::Buf + Send>) -> FsFuture<'_, ()> {
-        async move { Err(FsError::Forbidden) }.boxed()
-    }
-
-    fn write_bytes(&'_ mut self, _buf: bytes::Bytes) -> FsFuture<'_, ()> {
-        async move { Err(FsError::Forbidden) }.boxed()
     }
 
     fn redirect_url(&'_ mut self) -> FsFuture<'_, Option<String>> {
@@ -218,45 +243,50 @@ impl GuardedFileSystem<()> for XHFSAdapter {
     fn open<'a>(
         &'a self,
         path: &'a DavPath,
-        _options: OpenOptions,
+        options: OpenOptions,
         _creds: &'a (),
     ) -> FsFuture<'a, Box<dyn DavFile>> {
+        tracing::warn!("open: {path:?}, options = {options:?}");
         let xhfs = self.xhfs.clone();
         let path_buf = path.as_pathbuf();
-        // if path_buf.is_absolute() {
-        //     path_buf = path_buf
-        //         .strip_prefix("/")
-        //         .unwrap_or(&path_buf)
-        //         .to_path_buf();
-        // }
-
         let chunk_size = self.chunk_size;
         async move {
             tracing::info!("WebDAV open {path_buf:?}");
+            if options.write && options.truncate {
+                xhfs.fwrite(
+                    &path_buf,
+                    vec![],
+                    WriteOption {
+                        overwrite: options.truncate,
+                    },
+                )
+                .await
+                .map_err(|e| {
+                    tracing::error!("Failed truncated/overwrite with path {path_buf:?}: {e:?}");
+                    FsError::GeneralFailure
+                })?;
+            }
+
             match xhfs.stats(path_buf.clone(), true).await {
                 Ok(Some(stat)) => {
                     if matches!(stat.kind, INodeKind::Directory) {
-                        tracing::warn!("Attempted to open directory {:?}", path_buf);
+                        tracing::warn!("Attempted to open directory {path_buf:?}");
                         return Err(FsError::Forbidden);
                     }
-
                     let file_handle = XHFSFile {
                         xhfs,
                         path: path_buf,
                         offset: tokio::sync::Mutex::new(0),
                         chunk_size,
                     };
-
                     Ok(Box::new(file_handle) as Box<dyn DavFile>)
                 }
-
                 Ok(None) => {
-                    tracing::warn!("File not found {:?}", path_buf);
+                    tracing::warn!("File not found {path_buf:?}");
                     Err(FsError::NotFound)
                 }
-
                 Err(err) => {
-                    tracing::error!("Metadata lookup failed {:?}: {:?}", path_buf, err);
+                    tracing::error!("Metadata lookup failed {path_buf:?}: {err:?}");
                     Err(FsError::GeneralFailure)
                 }
             }
@@ -269,6 +299,7 @@ impl GuardedFileSystem<()> for XHFSAdapter {
         path: &'a DavPath,
         _creds: &'a (),
     ) -> FsFuture<'a, Box<dyn DavMetaData>> {
+        tracing::warn!("metadata: {path:?}");
         let xhfs = self.xhfs.clone();
         let path_buf = path.as_pathbuf();
         async move {
@@ -293,6 +324,7 @@ impl GuardedFileSystem<()> for XHFSAdapter {
         _meta: ReadDirMeta,
         _creds: &'a (),
     ) -> FsFuture<'a, FsStream<Box<dyn DavDirEntry>>> {
+        tracing::warn!("ls: {path:?}");
         // TODO:
         // stream dir listing later in core
         let xhfs = self.xhfs.clone();
@@ -306,7 +338,7 @@ impl GuardedFileSystem<()> for XHFSAdapter {
                 FsError::NotFound
             })?;
 
-            let mut entries: Vec<Box<dyn DavDirEntry>> = vec![];
+            let mut entries = vec![];
             for name in item_names {
                 let mut entry_path = path_buf.clone();
                 entry_path.push(&name);
@@ -324,46 +356,53 @@ impl GuardedFileSystem<()> for XHFSAdapter {
     fn symlink_metadata<'a>(
         &'a self,
         path: &'a DavPath,
-        _creds: &'a (),
+        creds: &'a (),
     ) -> FsFuture<'a, Box<dyn DavMetaData>> {
-        // self.metadata(path, credentials)
-        todo!("symlink")
+        tracing::warn!("symlink metadata: {path:?}");
+        self.metadata(path, creds)
     }
 
     fn create_dir<'a>(&'a self, path: &'a DavPath, _creds: &'a ()) -> FsFuture<'a, ()> {
+        tracing::warn!("create dir: {path:?}");
         let xhfs = self.xhfs.clone();
         let path_buf = path.as_pathbuf();
-
-        // FIXME:
-        // https://doc.rust-lang.org/nomicon/hrtb.html
-
-        // let handle = tokio::spawn(async move {
-        //     xhfs.mkdir(path_buf, true).await.map_err(|err| {
-        //         tracing::error!("mkdir failed: {:?}", err);
-        //         FsError::GeneralFailure
-        //     });
-        // });
-
-        // async move {
-        //     // xhfs.mkdir(path_buf, true).await.map_err(|err| {
-        //     //     tracing::error!("mkdir failed: {:?}", err);
-        //     //     FsError::GeneralFailure
-        //     // })?;
-
-        //     Ok(())
-        // }
-        // .boxed()
-        todo!("create_dir")
+        async move {
+            xhfs.mkdir(path_buf, true).await.map_err(|err| {
+                tracing::error!("mkdir failed: {err:?}");
+                FsError::GeneralFailure
+            })?;
+            Ok(())
+        }
+        .boxed()
     }
 
     fn remove_dir<'a>(&'a self, path: &'a DavPath, _creds: &'a ()) -> FsFuture<'a, ()> {
-        // FIXME:
-        // https://doc.rust-lang.org/nomicon/hrtb.html
-        todo!("remove_dir")
+        tracing::warn!("remove dir: {path:?}");
+        let xhfs = self.xhfs.clone();
+        let path_buf = path.as_pathbuf();
+        async move {
+            // TODO: native recursive
+            // right now, I believe it is using a combination of ls and unlink
+            xhfs.unlink(path_buf).await.map_err(|err| {
+                tracing::error!("unlink folder failed: {err:?}");
+                FsError::GeneralFailure
+            })?;
+            Ok(())
+        }
+        .boxed()
     }
 
     fn remove_file<'a>(&'a self, path: &'a DavPath, _creds: &'a ()) -> FsFuture<'a, ()> {
-        todo!("remove_file")
+        let xhfs = self.xhfs.clone();
+        let path_buf = path.as_pathbuf();
+        async move {
+            xhfs.unlink(path_buf).await.map_err(|err| {
+                tracing::error!("unlink file failed: {err:?}");
+                FsError::GeneralFailure
+            })?;
+            Ok(())
+        }
+        .boxed()
     }
 
     fn rename<'a>(
@@ -372,11 +411,36 @@ impl GuardedFileSystem<()> for XHFSAdapter {
         to: &'a DavPath,
         _creds: &'a (),
     ) -> FsFuture<'a, ()> {
-        todo!("rename_file")
+        let xhfs = self.xhfs.clone();
+        let from_path_buf = from.as_pathbuf();
+        let to_path_buf = to.as_pathbuf();
+        async move {
+            xhfs.fmove(from_path_buf, to_path_buf)
+                .await
+                .map_err(|err| {
+                    tracing::error!("fmove failed: {err:?}");
+                    FsError::GeneralFailure
+                })?;
+            Ok(())
+        }
+        .boxed()
     }
 
     fn copy<'a>(&'a self, from: &'a DavPath, to: &'a DavPath, _creds: &'a ()) -> FsFuture<'a, ()> {
-        todo!("copy")
+        tracing::warn!("fcopy {from:?} => {to:?}");
+        let xhfs = self.xhfs.clone();
+        let from_path_buf = from.as_pathbuf();
+        let to_path_buf = to.as_pathbuf();
+        async move {
+            xhfs.fcopy(from_path_buf, to_path_buf, WriteOption { overwrite: true })
+                .await
+                .map_err(|err| {
+                    tracing::error!("fcopy failed: {err:?}");
+                    FsError::GeneralFailure
+                })?;
+            Ok(())
+        }
+        .boxed()
     }
 
     fn have_props<'a>(
@@ -384,6 +448,7 @@ impl GuardedFileSystem<()> for XHFSAdapter {
         path: &'a DavPath,
         _creds: &'a (),
     ) -> std::pin::Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
+        tracing::warn!("Have props? {path}");
         Box::pin(std::future::ready(false))
     }
 
@@ -435,14 +500,13 @@ impl GuardedFileSystem<()> for XHFSAdapter {
 }
 
 pub async fn webdav_main(addr: String, port: u16, xhfs_instance: Arc<XHFS>) -> eyre::Result<()> {
-    let addr: SocketAddr = format!("{addr}:{port}").parse()?;
-    let adapter = XHFSAdapter {
+    let addr = format!("{addr}:{port}").parse::<SocketAddr>()?;
+    let xhfs_adapter = Box::new(XHFSAdapter {
         xhfs: xhfs_instance,
         chunk_size: 64 * 1024, // standard 64KB disk read windows
-    };
-
+    });
     let dav_server = DavHandler::builder()
-        .filesystem(Box::new(adapter))
+        .filesystem(xhfs_adapter)
         .locksystem(FakeLs::new())
         .build_handler();
 

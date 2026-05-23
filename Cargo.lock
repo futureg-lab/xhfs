@@ -2884,6 +2884,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "bitvec",
+ "bytes",
  "chacha20",
  "chrono",
  "eyre",

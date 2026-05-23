@@ -48,3 +48,4 @@ tracing = {version = "0.1.44", features = ["std"]}
 tracing-error = "0.2.1"
 tracing-subscriber = {version = "0.3.23", features = ["fmt", "std", "env-filter"]}
 url = { version = "2.5.8", features = ["serde"] }
+bytes = "1.11.1"

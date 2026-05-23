@@ -6,7 +6,11 @@ use crate::{
 use async_stream::try_stream;
 use eyre::{Context, ContextCompat};
 use futures::{Stream, StreamExt};
-use std::{fmt::Debug, path::PathBuf};
+use std::{
+    fmt::Debug,
+    io::{self, Cursor},
+    path::PathBuf,
+};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt},
     sync::Mutex,
@@ -561,9 +565,21 @@ impl XHFS {
         opt: WriteOption,
     ) -> Result<(), XHFSError> {
         let data = self.fread(src).await?;
-        let (_dst_parent_inode, _) = self.resolve_parent(dest.clone()).await?;
         self.fwrite(dest, data, opt).await
     }
+
+    // pub async fn fcopy_stream<P: Into<PathBuf> + Clone>(
+    //     &self,
+    //     src: P,
+    //     dest: P,
+    //     chunk_size: usize,
+    //     opt: WriteOption,
+    // ) -> Result<(), XHFSError> {
+    //     // TODO:
+    //     // make fread_stream Seekable
+    //     // implement proper seek for extent reads
+    //     todo!()
+    // }
 
     pub async fn fmove<P: Into<PathBuf>>(&self, src: P, dest: P) -> eyre::Result<()> {
         let src: PathBuf = src.into();
@@ -1620,3 +1636,15 @@ impl XHFS {
         Ok(buf)
     }
 }
+
+// pub async fn into_reader<S>(mut stream: S) -> io::Result<impl AsyncRead + AsyncSeek + Unpin>
+// where
+//     S: Stream<Item = Result<Vec<u8>, XHFSError>> + Unpin,
+// {
+//     let mut data = vec![];
+//     while let Some(chunk) = stream.next().await {
+//         let chunk = chunk.map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+//         data.extend_from_slice(&chunk);
+//     }
+//     Ok(Cursor::new(data))
+// }
