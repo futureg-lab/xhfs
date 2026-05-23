@@ -119,10 +119,11 @@ Download the binary from the
   - [x] Custom KV http endpoint
   - [x] Cloudflare KV example
   - [ ] s3 device
-- [ ] Explorer
+- [x] Explorer
   - [x] CLI
-  - [x] Inspection utilities
-  - [ ] WebDAV server
+  - [x] Inspection utilities: `xhfs inspect`
+  - [x] Servers
+    - [x] WebDAV server: `xhfs server webdav -p 1144`
 
 # Inspection tools
 

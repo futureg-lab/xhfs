@@ -1144,9 +1144,6 @@ impl XHFS {
         }
     }
 
-    // TODO:
-    // fprepend?
-
     pub async fn fappend_inode(&self, mut inode: INode, data: Vec<u8>) -> Result<(), XHFSError> {
         loop {
             match inode.kind {
@@ -1554,16 +1551,14 @@ impl XHFS {
     }
 
     pub async fn read_extent(&self, addr: u64) -> Result<Extent, XHFSError> {
-        let extent_header = self.ctrl.read(addr as usize, 8).await?;
-        let curr_extent_data_size = u64::from_le_bytes(
-            extent_header[0..8]
-                .try_into()
-                .map_err(XHFSError::from_error)?,
-        );
+        let meta = self.read_extent_metadata(addr).await?;
         let out = Extent::deserialize(
             &self
                 .ctrl
-                .read(addr as usize, 8 + 8 + curr_extent_data_size as usize)
+                .read(
+                    meta.full_canon_region.start.into(),
+                    meta.full_canon_region.size_span() as usize,
+                )
                 .await?,
         )?;
         Ok(out)
@@ -1636,12 +1631,10 @@ impl XHFS {
         let mut cursor = 0;
         let mut addr = addr;
         while let Some(next_addr) = addr.to_optional() {
-            let extent = self.read_extent(next_addr).await?;
-            addr = extent.next;
-            let data = extent.data;
+            let meta = self.read_extent_metadata(next_addr).await?;
+            addr = meta.next_extent;
             let extent_start = cursor;
-            let extent_end = cursor + data.len() as u64;
-
+            let extent_end = cursor + meta.full_canon_data_slot.capacity as u64;
             if extent_end <= addr_start {
                 cursor = extent_end;
                 continue;
@@ -1651,8 +1644,18 @@ impl XHFS {
             }
 
             let start_in_ext = addr_start.saturating_sub(extent_start) as usize;
-            let end_in_ext = (addr_end.saturating_sub(extent_start) as usize).min(data.len());
-            if start_in_ext < data.len() && start_in_ext < end_in_ext {
+            let end_in_ext = (addr_end.saturating_sub(extent_start) as usize)
+                .min(meta.full_canon_data_slot.capacity);
+            if start_in_ext < meta.full_canon_data_slot.capacity && start_in_ext < end_in_ext {
+                // TODO:
+                // streamable
+                let data = self
+                    .ctrl
+                    .read(
+                        meta.full_canon_data_slot.addr.into(),
+                        meta.full_canon_data_slot.capacity,
+                    )
+                    .await?;
                 buf.extend_from_slice(&data[start_in_ext..end_in_ext]);
             }
             cursor = extent_end;

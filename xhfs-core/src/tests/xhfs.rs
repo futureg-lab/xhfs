@@ -215,6 +215,16 @@ async fn test_xhfs_ref_manips_and_stats() -> eyre::Result<()> {
     );
 
     assert_eq!(
+        xhfs.fseek("/file.link", 0, 1).await?,
+        b"H",
+        "Symlink + Basic fseek 0-indexing"
+    );
+    assert_eq!(
+        xhfs.fseek("/file.link", 1, 1).await?,
+        b"",
+        "Symlink + Basic fseek empty"
+    );
+    assert_eq!(
         xhfs.fseek("/file.link", 4, 7).await?,
         b"OAB",
         "Symlink + extent boundaries are contiguous from user POV"
