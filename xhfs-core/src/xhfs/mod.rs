@@ -6,7 +6,11 @@ use crate::{
 use async_stream::try_stream;
 use eyre::{Context, ContextCompat};
 use futures::{Stream, StreamExt};
-use std::{fmt::Debug, path::PathBuf};
+use std::{
+    fmt::Debug,
+    io::{self, Cursor},
+    path::PathBuf,
+};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt},
     sync::Mutex,
@@ -564,18 +568,18 @@ impl XHFS {
         self.fwrite(dest, data, opt).await
     }
 
-    // pub async fn fcopy_stream<P: Into<PathBuf> + Clone>(
-    //     &self,
-    //     src: P,
-    //     dest: P,
-    //     chunk_size: usize,
-    //     opt: WriteOption,
-    // ) -> Result<(), XHFSError> {
-    //     // TODO:
-    //     // make fread_stream Seekable
-    //     // implement proper seek for extent reads
-    //     todo!()
-    // }
+    pub async fn fcopy_stream<P: Into<PathBuf> + Clone>(
+        &self,
+        src: P,
+        dest: P,
+        chunk_size: usize,
+        opt: WriteOption,
+    ) -> Result<(), XHFSError> {
+        let stream = self.fread_stream(src, chunk_size).await?;
+        let stream = into_reader(stream).await.map_err(XHFSError::from_error)?;
+        self.fwrite_stream_unbounded(dest, stream, chunk_size, opt)
+            .await
+    }
 
     pub async fn fmove<P: Into<PathBuf>>(&self, src: P, dest: P) -> eyre::Result<()> {
         let src: PathBuf = src.into();
@@ -837,6 +841,48 @@ impl XHFS {
         self.blob_write(path, data, INodeKind::File, opt).await
     }
 
+    pub async fn fwrite_stream_unbounded<P, R>(
+        &self,
+        path: P,
+        mut stream: R,
+        chunk_size: usize,
+        opt: WriteOption,
+    ) -> Result<(), XHFSError>
+    where
+        P: Into<PathBuf>,
+        R: AsyncRead + Unpin,
+    {
+        let path: PathBuf = path.into();
+        self.fwrite(&path, vec![], opt).await?;
+        let mut buf = vec![0u8; chunk_size];
+        {
+            // Handle first chunk so that we have an extent to append to
+            // in the next loop, the reason is that fappend is doing an extra resolve_path
+            // producing more reads than necessary
+            let n = stream.read(&mut buf).await.map_err(XHFSError::from_error)?;
+            if n == 0 {
+                return Ok(());
+            }
+            self.fappend(&path, buf[..n].to_vec()).await?;
+        }
+
+        let inode_with_extent = self.resolve_path(&path).await?;
+        loop {
+            if buf.len() != chunk_size {
+                buf.resize(chunk_size, 0);
+            }
+
+            let n = stream.read(&mut buf).await.map_err(XHFSError::from_error)?;
+            if n == 0 {
+                break;
+            }
+
+            self.fappend_inode(inode_with_extent.clone(), buf[..n].to_vec())
+                .await?;
+        }
+        Ok(())
+    }
+
     pub async fn fwrite_stream<P, R>(
         &self,
         path: P,
@@ -869,35 +915,8 @@ impl XHFS {
             )));
         }
 
-        self.fwrite(&path, vec![], opt).await?;
-        let mut buf = vec![0u8; block_size];
-        {
-            // Handle first chunk so that we have an extent to append to
-            // in the next loop, the reason is that fappend is doing an extra resolve_path
-            // producing more reads than necessary
-            let n = stream.read(&mut buf).await.map_err(XHFSError::from_error)?;
-            if n == 0 {
-                return Ok(());
-            }
-            self.fappend(&path, buf[..n].to_vec()).await?;
-        }
-
-        let inode_with_extent = self.resolve_path(&path).await?;
-        loop {
-            if buf.len() != block_size {
-                buf.resize(block_size, 0);
-            }
-
-            let n = stream.read(&mut buf).await.map_err(XHFSError::from_error)?;
-            if n == 0 {
-                break;
-            }
-
-            self.fappend_inode(inode_with_extent.clone(), buf[..n].to_vec())
-                .await?;
-        }
-
-        Ok(())
+        self.fwrite_stream_unbounded(path, stream, block_size, opt)
+            .await
     }
 
     pub async fn create_symlink<P: Into<PathBuf> + Clone>(
@@ -1633,14 +1652,14 @@ impl XHFS {
     }
 }
 
-// pub async fn into_reader<S>(mut stream: S) -> io::Result<impl AsyncRead + AsyncSeek + Unpin>
-// where
-//     S: Stream<Item = Result<Vec<u8>, XHFSError>> + Unpin,
-// {
-//     let mut data = vec![];
-//     while let Some(chunk) = stream.next().await {
-//         let chunk = chunk.map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-//         data.extend_from_slice(&chunk);
-//     }
-//     Ok(Cursor::new(data))
-// }
+pub async fn into_reader<S>(mut stream: S) -> io::Result<impl AsyncRead + AsyncSeek + Unpin>
+where
+    S: Stream<Item = Result<Vec<u8>, XHFSError>> + Unpin,
+{
+    let mut data = vec![];
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        data.extend_from_slice(&chunk);
+    }
+    Ok(Cursor::new(data))
+}

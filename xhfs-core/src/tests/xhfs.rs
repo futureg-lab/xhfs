@@ -171,6 +171,13 @@ async fn test_xhfs_ref_manips_and_stats() -> eyre::Result<()> {
             WriteOption { overwrite: false },
         )
         .await?;
+        xhfs.fcopy_stream(
+            "/many/entries/d.txt",
+            "/many/entries/other-but-streamed.txt",
+            3,
+            WriteOption { overwrite: false },
+        )
+        .await?;
         xhfs.fmove("/many/entries", "/many/entries2").await?;
         xhfs.create_symlink(
             "/file.link",
@@ -221,6 +228,12 @@ async fn test_xhfs_ref_manips_and_stats() -> eyre::Result<()> {
     assert_eq!(
         xhfs.fread("/many/entries2/d.txt").await?,
         xhfs.fread("/many/entries2/other.txt").await?,
+        "basic fcopy output"
+    );
+    assert_eq!(
+        xhfs.fread("/many/entries2/other.txt").await?,
+        xhfs.fread("/many/entries2/other-but-streamed.txt").await?,
+        "chunked fcopy stream"
     );
 
     let dtxt_stats = xhfs.stats("/many/entries2/d.txt", false).await?.unwrap();

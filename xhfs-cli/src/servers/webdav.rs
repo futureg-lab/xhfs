@@ -456,9 +456,14 @@ impl GuardedFileSystem<()> for XHFSAdapter {
         let from_path_buf = from.as_pathbuf();
         let to_path_buf = to.as_pathbuf();
         async move {
-            xhfs.fcopy(from_path_buf, to_path_buf, WriteOption { overwrite: true })
-                .await
-                .map_err(EConv)?;
+            xhfs.fcopy_stream(
+                from_path_buf,
+                to_path_buf,
+                self.chunk_size,
+                WriteOption { overwrite: true },
+            )
+            .await
+            .map_err(EConv)?;
             Ok(())
         }
         .boxed()
