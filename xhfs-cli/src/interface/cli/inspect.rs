@@ -120,7 +120,7 @@ impl InspectSubcommands {
                     .find_full_extent_metadata(MaybeU64::from(e.address), Some(e.max_follow))
                     .await?;
                 for (i, ext) in meta_exts.iter().enumerate() {
-                    println!("#{} :: {}", i + 1, ext);
+                    println!("#{} :: (unaligned) {} ", i + 1, ext.full_canon_region);
                 }
             }
             InspectSubcommands::Dump(d) => {

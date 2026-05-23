@@ -3,6 +3,7 @@ use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
 mod interface;
+mod servers;
 
 #[cfg(test)]
 mod tests;

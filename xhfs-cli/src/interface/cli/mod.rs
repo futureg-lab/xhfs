@@ -1,5 +1,5 @@
 use crate::interface::{
-    cli::{inspect::InspectCommands, x::*},
+    cli::{inspect::InspectCommands, server::ServerCommands, x::*},
     config::Config,
 };
 use clap::{Args, Parser, Subcommand};
@@ -9,9 +9,10 @@ use tokio::{
     fs::{self, File, OpenOptions},
     io::{AsyncWriteExt, stdout},
 };
-use xhfs_core::xhfs::{WriteOption, XHFS};
+use xhfs_core::xhfs::*;
 
 mod inspect;
+mod server;
 mod x;
 
 #[derive(Parser, Debug)]
@@ -41,6 +42,8 @@ pub enum Commands {
     X(FsCommands),
     /// Inspect current filesystem
     Inspect(InspectCommands),
+    /// Server commands
+    Server(ServerCommands),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -207,6 +210,7 @@ impl MainCommand {
                 println!("{}", xhfs.format_headers_report().await?);
             }
             Commands::Inspect(i) => i.command.run().await?,
+            Commands::Server(s) => s.run().await?,
         }
 
         Ok(())

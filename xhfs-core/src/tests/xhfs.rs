@@ -1,9 +1,5 @@
 use crate::{
-    device::{
-        disk::Controller,
-        kv_device::*,
-        logical::{DeviceLike, LogicalDevice},
-    },
+    device::{ConcreteDevice, disk::Controller, kv_device::*, logical::LogicalDevice},
     xhfs::{WriteOption, XHFS, ds::*},
 };
 use futures::StreamExt;
@@ -14,12 +10,12 @@ async fn create_simple_memory_xhfs(capacity: usize) -> eyre::Result<XHFS> {
     if capacity % 8 != 0 {
         eyre::bail!("Test fs expects % 8");
     }
-    let dev1 = KVDevice {
+    let dev1 = ConcreteDevice::KVDevice(KVDevice {
         store: Arc::new(MemoryKV(RwLock::new(HashMap::new()))),
         total_slots: capacity / 8,
         slot_capacity: 8,
-    };
-    let dev1 = LogicalDevice::new(2, [Arc::from(dev1) as DeviceLike])?;
+    });
+    let dev1 = LogicalDevice::new(2, [dev1])?;
     let ctrl = Controller::from([dev1]).await?;
     XHFS::format_new(ctrl, Some("helloworld".to_string())).await
 }
@@ -175,6 +171,13 @@ async fn test_xhfs_ref_manips_and_stats() -> eyre::Result<()> {
             WriteOption { overwrite: false },
         )
         .await?;
+        xhfs.fcopy_stream(
+            "/many/entries/d.txt",
+            "/many/entries/other-but-streamed.txt",
+            3,
+            WriteOption { overwrite: false },
+        )
+        .await?;
         xhfs.fmove("/many/entries", "/many/entries2").await?;
         xhfs.create_symlink(
             "/file.link",
@@ -212,6 +215,16 @@ async fn test_xhfs_ref_manips_and_stats() -> eyre::Result<()> {
     );
 
     assert_eq!(
+        xhfs.fseek("/file.link", 0, 1).await?,
+        b"H",
+        "Symlink + Basic fseek 0-indexing"
+    );
+    assert_eq!(
+        xhfs.fseek("/file.link", 1, 1).await?,
+        b"",
+        "Symlink + Basic fseek empty"
+    );
+    assert_eq!(
         xhfs.fseek("/file.link", 4, 7).await?,
         b"OAB",
         "Symlink + extent boundaries are contiguous from user POV"
@@ -225,6 +238,12 @@ async fn test_xhfs_ref_manips_and_stats() -> eyre::Result<()> {
     assert_eq!(
         xhfs.fread("/many/entries2/d.txt").await?,
         xhfs.fread("/many/entries2/other.txt").await?,
+        "basic fcopy output"
+    );
+    assert_eq!(
+        xhfs.fread("/many/entries2/other.txt").await?,
+        xhfs.fread("/many/entries2/other-but-streamed.txt").await?,
+        "chunked fcopy stream"
     );
 
     let dtxt_stats = xhfs.stats("/many/entries2/d.txt", false).await?.unwrap();
@@ -351,9 +370,25 @@ async fn test_fstream_from_no_file() -> eyre::Result<()> {
 
     assert_eq!(meta_exts.len(), 3, "each write shot should use 1 extent");
     // each burst of 4 bytes wastes 4096 B (1 block) - 4 B - 16 B extent header space
-    assert_eq!(meta_exts[0].size_span(), header.format.block_size_bytes);
-    assert_eq!(meta_exts[1].size_span(), header.format.block_size_bytes);
-    assert_eq!(meta_exts[2].size_span(), header.format.block_size_bytes);
+    assert_eq!(
+        meta_exts[0].full_aligned_region.size_span(),
+        header.format.block_size_bytes
+    );
+    assert_eq!(
+        meta_exts[1].full_aligned_region.size_span(),
+        header.format.block_size_bytes
+    );
+    assert_eq!(
+        meta_exts[2].full_aligned_region.size_span(),
+        header.format.block_size_bytes
+    );
+
+    assert_eq!(meta_exts[0].full_canon_region.size_span(), 20); // (8 + 8) + 4
+    assert_eq!(meta_exts[0].full_canon_data_slot.capacity, 4);
+    assert_eq!(meta_exts[1].full_canon_region.size_span(), 20); // (8 + 8) + 4
+    assert_eq!(meta_exts[1].full_canon_data_slot.capacity, 4);
+    assert_eq!(meta_exts[2].full_canon_region.size_span(), 17); // (8 + 8) + 1
+    assert_eq!(meta_exts[2].full_canon_data_slot.capacity, 1);
 
     Ok(())
 }

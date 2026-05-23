@@ -8,11 +8,11 @@ use std::{
     str::FromStr,
     sync::Arc,
 };
-use tokio::sync::RwLock;
 use url::Url;
 use xhfs_core::{
     device::{
-        disk::Controller, fs_device::FsDevice, http_device::HttpKV, kv_device::*, logical::*,
+        ConcreteDevice, disk::Controller, fs_device::FsDevice, http_device::HttpKV, kv_device::*,
+        logical::*,
     },
     utils::normalize_path,
     xhfs::*,
@@ -28,11 +28,6 @@ pub struct Config {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type")]
 pub enum DeviceConfig {
-    #[serde(rename = "kvmemory")]
-    KVMemory {
-        name: String,
-        slot_capacity_bytes: u64,
-    },
     #[serde(rename = "kvhttp")]
     KVHttp {
         name: String,
@@ -64,7 +59,6 @@ pub struct LogicalDeviceConfig {
 impl DeviceConfig {
     pub fn name(&self) -> String {
         match self {
-            DeviceConfig::KVMemory { name, .. } => name,
             DeviceConfig::File { name, .. } => name,
             DeviceConfig::KVHttp { name, .. } => name,
         }
@@ -77,9 +71,6 @@ impl DeviceConfig {
             DeviceConfig::File { path, .. } => {
                 let path = normalize_path(path);
                 path.hash(&mut hasher);
-            }
-            DeviceConfig::KVMemory { .. } => {
-                rand::random::<u64>().hash(&mut hasher);
             }
             DeviceConfig::KVHttp { name, url, .. } => {
                 name.hash(&mut hasher);
@@ -213,20 +204,12 @@ configuration:
 
                 let capacity = logdev.capacity.0.as_u64();
                 let instance = match dev {
-                    DeviceConfig::KVMemory {
-                        slot_capacity_bytes,
-                        ..
-                    } => Arc::new(KVDevice {
-                        store: Arc::new(MemoryKV(RwLock::new(HashMap::new()))),
-                        total_slots: (capacity / *slot_capacity_bytes) as usize,
-                        slot_capacity: *slot_capacity_bytes as usize,
-                    }) as DeviceLike,
                     DeviceConfig::KVHttp {
                         slot_capacity_bytes,
                         url,
                         headers,
                         name,
-                    } => Arc::new(KVDevice {
+                    } => ConcreteDevice::KVDevice(KVDevice {
                         store: Arc::new(HttpKV {
                             url: url.clone(),
                             key_prefix: name.clone(),
@@ -234,10 +217,10 @@ configuration:
                         }),
                         total_slots: (capacity / *slot_capacity_bytes) as usize,
                         slot_capacity: *slot_capacity_bytes as usize,
-                    }) as DeviceLike,
-                    DeviceConfig::File { path, .. } => {
-                        Arc::new(FsDevice::new(path, capacity as usize).await?) as DeviceLike
-                    }
+                    }),
+                    DeviceConfig::File { path, .. } => ConcreteDevice::FsDevice(
+                        FsDevice::new(path, capacity as usize, format_new).await?,
+                    ),
                 };
                 group.push(instance);
             }

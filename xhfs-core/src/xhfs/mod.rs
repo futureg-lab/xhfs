@@ -4,13 +4,19 @@ use crate::{
     xhfs::{addr::MaybeU64, crypto::Crypto, ds::*},
 };
 use async_stream::try_stream;
+use bytes::Bytes;
 use eyre::{Context, ContextCompat};
 use futures::{Stream, StreamExt};
-use std::{fmt::Debug, path::PathBuf};
+use std::{
+    fmt::Debug,
+    io::{self},
+    path::PathBuf,
+};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt},
     sync::Mutex,
 };
+use tokio_util::io::StreamReader;
 pub mod addr;
 pub mod crypto;
 pub mod ds;
@@ -35,6 +41,14 @@ pub struct XHFS {
 #[derive(Debug, Clone, Default)]
 pub struct WriteOption {
     pub overwrite: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ExtentMetadata {
+    pub full_aligned_region: RegionSlot,
+    pub full_canon_region: RegionSlot,
+    pub full_canon_data_slot: AddressSlot,
+    pub next_extent: MaybeU64,
 }
 
 #[derive(Debug, Clone)]
@@ -561,8 +575,20 @@ impl XHFS {
         opt: WriteOption,
     ) -> Result<(), XHFSError> {
         let data = self.fread(src).await?;
-        let (_dst_parent_inode, _) = self.resolve_parent(dest.clone()).await?;
         self.fwrite(dest, data, opt).await
+    }
+
+    pub async fn fcopy_stream<P: Into<PathBuf> + Clone>(
+        &self,
+        src: P,
+        dest: P,
+        chunk_size: usize,
+        opt: WriteOption,
+    ) -> Result<(), XHFSError> {
+        let stream = self.fread_stream(src, chunk_size).await?;
+        let stream = into_reader(stream);
+        self.fwrite_stream_unbounded(dest, stream, chunk_size, opt)
+            .await
     }
 
     pub async fn fmove<P: Into<PathBuf>>(&self, src: P, dest: P) -> eyre::Result<()> {
@@ -825,6 +851,48 @@ impl XHFS {
         self.blob_write(path, data, INodeKind::File, opt).await
     }
 
+    pub async fn fwrite_stream_unbounded<P, R>(
+        &self,
+        path: P,
+        mut stream: R,
+        chunk_size: usize,
+        opt: WriteOption,
+    ) -> Result<(), XHFSError>
+    where
+        P: Into<PathBuf>,
+        R: AsyncRead + Unpin,
+    {
+        let path: PathBuf = path.into();
+        self.fwrite(&path, vec![], opt).await?;
+        let mut buf = vec![0u8; chunk_size];
+        {
+            // Handle first chunk so that we have an extent to append to
+            // in the next loop, the reason is that fappend is doing an extra resolve_path
+            // producing more reads than necessary
+            let n = stream.read(&mut buf).await.map_err(XHFSError::from_error)?;
+            if n == 0 {
+                return Ok(());
+            }
+            self.fappend(&path, buf[..n].to_vec()).await?;
+        }
+
+        let inode_with_extent = self.resolve_path(&path).await?;
+        loop {
+            if buf.len() != chunk_size {
+                buf.resize(chunk_size, 0);
+            }
+
+            let n = stream.read(&mut buf).await.map_err(XHFSError::from_error)?;
+            if n == 0 {
+                break;
+            }
+
+            self.fappend_inode(inode_with_extent.clone(), buf[..n].to_vec())
+                .await?;
+        }
+        Ok(())
+    }
+
     pub async fn fwrite_stream<P, R>(
         &self,
         path: P,
@@ -857,35 +925,8 @@ impl XHFS {
             )));
         }
 
-        self.fwrite(&path, vec![], opt).await?;
-        let mut buf = vec![0u8; block_size];
-        {
-            // Handle first chunk so that we have an extent to append to
-            // in the next loop, the reason is that fappend is doing an extra resolve_path
-            // producing more reads than necessary
-            let n = stream.read(&mut buf).await.map_err(XHFSError::from_error)?;
-            if n == 0 {
-                return Ok(());
-            }
-            self.fappend(&path, buf[..n].to_vec()).await?;
-        }
-
-        let inode_with_extent = self.resolve_path(&path).await?;
-        loop {
-            if buf.len() != block_size {
-                buf.resize(block_size, 0);
-            }
-
-            let n = stream.read(&mut buf).await.map_err(XHFSError::from_error)?;
-            if n == 0 {
-                break;
-            }
-
-            self.fappend_inode(inode_with_extent.clone(), buf[..n].to_vec())
-                .await?;
-        }
-
-        Ok(())
+        self.fwrite_stream_unbounded(path, stream, block_size, opt)
+            .await
     }
 
     pub async fn create_symlink<P: Into<PathBuf> + Clone>(
@@ -1104,9 +1145,6 @@ impl XHFS {
             }
         }
     }
-
-    // TODO:
-    // fprepend?
 
     pub async fn fappend_inode(&self, mut inode: INode, data: Vec<u8>) -> Result<(), XHFSError> {
         loop {
@@ -1425,15 +1463,13 @@ impl XHFS {
 
         let mut addr = start_extent_addr;
         while let Some(current_addr) = addr.to_optional() {
-            let (curr_region, next_hop, _) = self.read_extent_metadata(current_addr).await?;
-
+            let meta = self.read_extent_metadata(current_addr).await?;
             self.mark_as_reusable(AddressSlot {
                 addr: MaybeU64::from(current_addr),
-                capacity: curr_region.size_span() as usize,
+                capacity: meta.full_aligned_region.size_span() as usize,
             })
             .await?;
-
-            addr = next_hop;
+            addr = meta.next_extent;
         }
 
         Ok(())
@@ -1460,8 +1496,8 @@ impl XHFS {
 
         while let Some(current_addr) = addr.to_optional() {
             last_extent = Some(current_addr);
-            let (_, next_addr, _) = self.read_extent_metadata(current_addr).await?;
-            addr = next_addr;
+            let meta = self.read_extent_metadata(current_addr).await?;
+            addr = meta.next_extent;
         }
 
         let mut all_extent_start = start_extent_addr;
@@ -1517,49 +1553,51 @@ impl XHFS {
     }
 
     pub async fn read_extent(&self, addr: u64) -> Result<Extent, XHFSError> {
-        let extent_header = self.ctrl.read(addr as usize, 8).await?;
-        let curr_extent_data_size = u64::from_le_bytes(
-            extent_header[0..8]
-                .try_into()
-                .map_err(XHFSError::from_error)?,
-        );
+        let meta = self.read_extent_metadata(addr).await?;
         let out = Extent::deserialize(
             &self
                 .ctrl
-                .read(addr as usize, 8 + 8 + curr_extent_data_size as usize)
+                .read(
+                    meta.full_canon_region.start.into(),
+                    meta.full_canon_region.size_span() as usize,
+                )
                 .await?,
         )?;
         Ok(out)
     }
 
-    pub async fn read_extent_metadata(
-        &self,
-        addr: u64,
-    ) -> eyre::Result<(RegionSlot, MaybeU64, u64)> {
-        let extent_header = self.ctrl.read(addr as usize, 16).await?;
+    pub async fn read_extent_metadata(&self, addr: u64) -> eyre::Result<ExtentMetadata> {
+        let full_offset = (Extent::HEADER_CAP_OFFSET + Extent::HEADER_CAP_OFFSET) as usize;
+        eyre::ensure!(full_offset == 16);
+        let extent_header = self.ctrl.read(addr as usize, full_offset).await?;
         let curr_extent_data_size = u64::from_le_bytes(extent_header[0..8].try_into()?);
-        eyre::ensure!(Extent::HEADER_NEXT_OFFSET == 8);
-
         let next_extent = MaybeU64::from(u64::from_le_bytes(extent_header[8..16].try_into()?));
         let raw_footprint = 16 + curr_extent_data_size as u64;
         let block_size = self.static_format.block_size_bytes as u64;
         let aligned_capacity = ((raw_footprint + block_size - 1) / block_size) * block_size;
 
-        Ok((
-            RegionSlot {
+        Ok(ExtentMetadata {
+            full_aligned_region: RegionSlot {
                 start: MaybeU64::from(addr),
                 end: MaybeU64::from(addr + aligned_capacity),
             },
+            full_canon_region: RegionSlot {
+                start: MaybeU64::from(addr),
+                end: MaybeU64::from(addr + raw_footprint),
+            },
+            full_canon_data_slot: AddressSlot {
+                addr: MaybeU64::from(addr + 16),
+                capacity: curr_extent_data_size as usize,
+            },
             next_extent,
-            curr_extent_data_size,
-        ))
+        })
     }
 
     pub async fn find_full_extent_metadata(
         &self,
         mut addr: MaybeU64,
         stop: Option<u32>,
-    ) -> eyre::Result<Vec<RegionSlot>> {
+    ) -> eyre::Result<Vec<ExtentMetadata>> {
         let mut blocks = vec![];
         let max = stop.unwrap_or(u32::MAX);
         let mut i = 1;
@@ -1568,9 +1606,9 @@ impl XHFS {
                 break;
             }
             tracing::debug!("Resolving {i}-th extent metadata 0x{next_addr:x}");
-            let (block_slot, next_addr, _) = self.read_extent_metadata(next_addr).await?;
-            addr = next_addr;
-            blocks.push(block_slot);
+            let meta = self.read_extent_metadata(next_addr).await?;
+            addr = meta.next_extent;
+            blocks.push(meta);
             i += 1;
         }
         Ok(blocks)
@@ -1595,12 +1633,10 @@ impl XHFS {
         let mut cursor = 0;
         let mut addr = addr;
         while let Some(next_addr) = addr.to_optional() {
-            let extent = self.read_extent(next_addr).await?;
-            addr = extent.next;
-            let data = extent.data;
+            let meta = self.read_extent_metadata(next_addr).await?;
+            addr = meta.next_extent;
             let extent_start = cursor;
-            let extent_end = cursor + data.len() as u64;
-
+            let extent_end = cursor + meta.full_canon_data_slot.capacity as u64;
             if extent_end <= addr_start {
                 cursor = extent_end;
                 continue;
@@ -1610,8 +1646,18 @@ impl XHFS {
             }
 
             let start_in_ext = addr_start.saturating_sub(extent_start) as usize;
-            let end_in_ext = (addr_end.saturating_sub(extent_start) as usize).min(data.len());
-            if start_in_ext < data.len() && start_in_ext < end_in_ext {
+            let end_in_ext = (addr_end.saturating_sub(extent_start) as usize)
+                .min(meta.full_canon_data_slot.capacity);
+            if start_in_ext < meta.full_canon_data_slot.capacity && start_in_ext < end_in_ext {
+                // TODO:
+                // streamable
+                let data = self
+                    .ctrl
+                    .read(
+                        meta.full_canon_data_slot.addr.into(),
+                        meta.full_canon_data_slot.capacity,
+                    )
+                    .await?;
                 buf.extend_from_slice(&data[start_in_ext..end_in_ext]);
             }
             cursor = extent_end;
@@ -1619,4 +1665,15 @@ impl XHFS {
 
         Ok(buf)
     }
+}
+
+pub fn into_reader<S>(stream: S) -> impl AsyncRead + Unpin
+where
+    S: Stream<Item = Result<Vec<u8>, XHFSError>> + Unpin,
+{
+    StreamReader::new(stream.map(|chunk| {
+        chunk
+            .map(Bytes::from)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+    }))
 }
