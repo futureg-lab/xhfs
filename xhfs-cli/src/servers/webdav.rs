@@ -22,8 +22,34 @@ use std::{
 use tokio::{net::TcpListener, sync::Mutex};
 use xhfs_core::xhfs::{
     WriteOption, XHFS,
-    ds::{EntryStat, INodeKind},
+    ds::{EntryStat, INodeKind, XHFSError},
 };
+
+macro_rules! read_only_guard {
+    ($inp:expr) => {
+        if $inp {
+            return std::future::ready(Err(FsError::Forbidden)).boxed();
+        }
+    };
+}
+macro_rules! read_only_guard_raw {
+    ($inp:expr) => {
+        if $inp {
+            return Err(FsError::Forbidden);
+        }
+    };
+}
+
+struct EConv(XHFSError);
+impl From<EConv> for FsError {
+    fn from(value: EConv) -> Self {
+        tracing::error!("XHFS error occured: {}", value.0);
+        match value.0 {
+            XHFSError::Insufficient { .. } => FsError::TooLarge,
+            XHFSError::Error { .. } => FsError::GeneralFailure,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 struct XHFSDirEntry(EntryStat);
@@ -68,6 +94,7 @@ pub struct XHFSFile {
     path: PathBuf,
     offset: Mutex<u64>,
     chunk_size: usize,
+    read_only: bool,
 }
 
 impl std::fmt::Debug for XHFSFile {
@@ -91,7 +118,6 @@ impl DavFile for XHFSFile {
                 let offset_guard = self.offset.lock().await;
                 *offset_guard
             };
-
             let mut stream = xhfs.fread_stream(path, chunk_size).await.map_err(|e| {
                 tracing::error!("Error pulling chunk stream from block layer: {e:?}");
                 FsError::NotFound
@@ -177,7 +203,6 @@ impl DavFile for XHFSFile {
     fn metadata(&mut self) -> FsFuture<'_, Box<dyn DavMetaData>> {
         let xhfs = self.xhfs.clone();
         let path = self.path.clone();
-
         async move {
             match xhfs.stats(path, true).await {
                 Ok(Some(stat)) => Ok(Box::new(XHFSMetaData(stat)) as Box<dyn DavMetaData>),
@@ -192,20 +217,18 @@ impl DavFile for XHFSFile {
     }
 
     fn write_bytes(&'_ mut self, buf: Bytes) -> FsFuture<'_, ()> {
+        read_only_guard!(self.read_only);
         let xhfs = self.xhfs.clone();
         let path = self.path.clone();
         async move {
-            let len = buf.len();
-            xhfs.fappend(&path, buf.to_vec()).await.map_err(|e| {
-                tracing::error!("Failed writting {len} bytes into {path:?}: {e:?}");
-                FsError::GeneralFailure
-            })?;
+            xhfs.fappend(&path, buf.to_vec()).await.map_err(EConv)?;
             Ok(())
         }
         .boxed()
     }
 
     fn write_buf(&'_ mut self, mut buf: Box<dyn Buf + Send>) -> FsFuture<'_, ()> {
+        read_only_guard!(self.read_only);
         tracing::debug!("Writting buf");
         let xhfs = self.xhfs.clone();
         let path = self.path.clone();
@@ -213,10 +236,7 @@ impl DavFile for XHFSFile {
             while buf.has_remaining() {
                 let b = buf.chunk();
                 let len = b.len();
-                xhfs.fappend(&path, b.to_vec()).await.map_err(|e| {
-                    tracing::error!("Failed writting {len} bytes into {path:?}: {e:?}");
-                    FsError::GeneralFailure
-                })?;
+                xhfs.fappend(&path, b.to_vec()).await.map_err(EConv)?;
                 buf.advance(len);
             }
             Ok(())
@@ -234,9 +254,10 @@ impl DavFile for XHFSFile {
 }
 
 #[derive(Clone)]
-pub struct XHFSAdapter {
-    pub xhfs: Arc<XHFS>,
-    pub chunk_size: usize,
+struct XHFSAdapter {
+    xhfs: Arc<XHFS>,
+    read_only: bool,
+    chunk_size: usize,
 }
 
 impl GuardedFileSystem<()> for XHFSAdapter {
@@ -250,9 +271,11 @@ impl GuardedFileSystem<()> for XHFSAdapter {
         let xhfs = self.xhfs.clone();
         let path_buf = path.as_pathbuf();
         let chunk_size = self.chunk_size;
+        let read_only = self.read_only;
         async move {
             tracing::info!("WebDAV open {path_buf:?}");
             if options.write && options.truncate {
+                read_only_guard_raw!(read_only);
                 xhfs.fwrite(
                     &path_buf,
                     vec![],
@@ -261,10 +284,7 @@ impl GuardedFileSystem<()> for XHFSAdapter {
                     },
                 )
                 .await
-                .map_err(|e| {
-                    tracing::error!("Failed truncated/overwrite with path {path_buf:?}: {e:?}");
-                    FsError::GeneralFailure
-                })?;
+                .map_err(EConv)?;
             }
 
             match xhfs.stats(path_buf.clone(), true).await {
@@ -278,6 +298,7 @@ impl GuardedFileSystem<()> for XHFSAdapter {
                         path: path_buf,
                         offset: tokio::sync::Mutex::new(0),
                         chunk_size,
+                        read_only,
                     };
                     Ok(Box::new(file_handle) as Box<dyn DavFile>)
                 }
@@ -363,6 +384,7 @@ impl GuardedFileSystem<()> for XHFSAdapter {
     }
 
     fn create_dir<'a>(&'a self, path: &'a DavPath, _creds: &'a ()) -> FsFuture<'a, ()> {
+        read_only_guard!(self.read_only);
         tracing::warn!("create dir: {path:?}");
         let xhfs = self.xhfs.clone();
         let path_buf = path.as_pathbuf();
@@ -377,14 +399,15 @@ impl GuardedFileSystem<()> for XHFSAdapter {
     }
 
     fn remove_dir<'a>(&'a self, path: &'a DavPath, _creds: &'a ()) -> FsFuture<'a, ()> {
+        read_only_guard!(self.read_only);
         tracing::warn!("remove dir: {path:?}");
         let xhfs = self.xhfs.clone();
         let path_buf = path.as_pathbuf();
         async move {
             // TODO: native recursive
             // right now, I believe it is using a combination of ls and unlink
-            xhfs.unlink(path_buf).await.map_err(|err| {
-                tracing::error!("unlink folder failed: {err:?}");
+            xhfs.unlink(path_buf).await.map_err(|e| {
+                tracing::error!("unlink folder failed: {e:?}");
                 FsError::GeneralFailure
             })?;
             Ok(())
@@ -393,11 +416,12 @@ impl GuardedFileSystem<()> for XHFSAdapter {
     }
 
     fn remove_file<'a>(&'a self, path: &'a DavPath, _creds: &'a ()) -> FsFuture<'a, ()> {
+        read_only_guard!(self.read_only);
         let xhfs = self.xhfs.clone();
         let path_buf = path.as_pathbuf();
         async move {
-            xhfs.unlink(path_buf).await.map_err(|err| {
-                tracing::error!("unlink file failed: {err:?}");
+            xhfs.unlink(path_buf).await.map_err(|e| {
+                tracing::error!("unlink file failed: {e:?}");
                 FsError::GeneralFailure
             })?;
             Ok(())
@@ -411,22 +435,22 @@ impl GuardedFileSystem<()> for XHFSAdapter {
         to: &'a DavPath,
         _creds: &'a (),
     ) -> FsFuture<'a, ()> {
+        read_only_guard!(self.read_only);
         let xhfs = self.xhfs.clone();
         let from_path_buf = from.as_pathbuf();
         let to_path_buf = to.as_pathbuf();
         async move {
-            xhfs.fmove(from_path_buf, to_path_buf)
-                .await
-                .map_err(|err| {
-                    tracing::error!("fmove failed: {err:?}");
-                    FsError::GeneralFailure
-                })?;
+            xhfs.fmove(from_path_buf, to_path_buf).await.map_err(|e| {
+                tracing::error!("fmove failed: {e:?}");
+                FsError::GeneralFailure
+            })?;
             Ok(())
         }
         .boxed()
     }
 
     fn copy<'a>(&'a self, from: &'a DavPath, to: &'a DavPath, _creds: &'a ()) -> FsFuture<'a, ()> {
+        read_only_guard!(self.read_only);
         tracing::warn!("fcopy {from:?} => {to:?}");
         let xhfs = self.xhfs.clone();
         let from_path_buf = from.as_pathbuf();
@@ -434,10 +458,7 @@ impl GuardedFileSystem<()> for XHFSAdapter {
         async move {
             xhfs.fcopy(from_path_buf, to_path_buf, WriteOption { overwrite: true })
                 .await
-                .map_err(|err| {
-                    tracing::error!("fcopy failed: {err:?}");
-                    FsError::GeneralFailure
-                })?;
+                .map_err(EConv)?;
             Ok(())
         }
         .boxed()
@@ -499,10 +520,16 @@ impl GuardedFileSystem<()> for XHFSAdapter {
     }
 }
 
-pub async fn webdav_main(addr: String, port: u16, xhfs_instance: Arc<XHFS>) -> eyre::Result<()> {
+pub async fn webdav_main(
+    addr: String,
+    port: u16,
+    xhfs_instance: Arc<XHFS>,
+    read_only: bool,
+) -> eyre::Result<()> {
     let addr = format!("{addr}:{port}").parse::<SocketAddr>()?;
     let xhfs_adapter = Box::new(XHFSAdapter {
         xhfs: xhfs_instance,
+        read_only,
         chunk_size: 64 * 1024, // standard 64KB disk read windows
     });
     let dav_server = DavHandler::builder()

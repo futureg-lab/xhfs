@@ -6,11 +6,7 @@ use crate::{
 use async_stream::try_stream;
 use eyre::{Context, ContextCompat};
 use futures::{Stream, StreamExt};
-use std::{
-    fmt::Debug,
-    io::{self, Cursor},
-    path::PathBuf,
-};
+use std::{fmt::Debug, path::PathBuf};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt},
     sync::Mutex,
