@@ -360,6 +360,10 @@ async fn test_fstream_from_no_file() -> eyre::Result<()> {
     .await?;
 
     assert_eq!(xhfs.fread("hello.txt").await?, b"123456789");
+    assert_eq!(
+        xhfs.stats("hello.txt", false).await?.unwrap().size.unwrap(),
+        9
+    );
 
     let inode = xhfs.resolve_path("hello.txt").await?;
 

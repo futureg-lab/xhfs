@@ -387,9 +387,10 @@ impl XHFS {
         Ok(())
     }
 
-    pub async fn update_inode_mtime_now(&self, mut inode: INode) -> eyre::Result<()> {
+    pub async fn update_inode_mtime_now(&self, mut inode: INode) -> eyre::Result<INode> {
         inode.mtime = utc_now_u64();
-        self.register_inode(&inode, true).await
+        self.register_inode(&inode, true).await?;
+        Ok(inode)
     }
 
     pub async fn increment_inode_nlink(&self, mut inode: INode) -> eyre::Result<()> {
@@ -876,7 +877,7 @@ impl XHFS {
             self.fappend(&path, buf[..n].to_vec()).await?;
         }
 
-        let inode_with_extent = self.resolve_path(&path).await?;
+        let mut inode_with_extent = self.resolve_path(&path).await?;
         loop {
             if buf.len() != chunk_size {
                 buf.resize(chunk_size, 0);
@@ -887,7 +888,8 @@ impl XHFS {
                 break;
             }
 
-            self.fappend_inode(inode_with_extent.clone(), buf[..n].to_vec())
+            inode_with_extent = self
+                .fappend_inode(inode_with_extent.clone(), buf[..n].to_vec())
                 .await?;
         }
         Ok(())
@@ -1146,7 +1148,7 @@ impl XHFS {
         }
     }
 
-    pub async fn fappend_inode(&self, mut inode: INode, data: Vec<u8>) -> Result<(), XHFSError> {
+    pub async fn fappend_inode(&self, mut inode: INode, data: Vec<u8>) -> Result<INode, XHFSError> {
         loop {
             match inode.kind {
                 INodeKind::File => {
@@ -1154,8 +1156,8 @@ impl XHFS {
                     inode.extent_addr = self
                         .append_or_allocate_extent(inode.extent_addr, data)
                         .await?;
-                    self.update_inode_mtime_now(inode).await?;
-                    return Ok(());
+                    self.update_inode_mtime_now(inode.clone()).await?;
+                    return Ok(inode);
                 }
                 INodeKind::Symlink => {
                     inode = self.follow_link_or_noop(inode).await?;

@@ -24,9 +24,10 @@ you may argue makes it slower for seek operations but still good enough.
   filesystem.
 - As a storage layer on top of an existing one:
   - Split your XHFS storage into multiple files, then store them on a locally
-    synchronized folder using nullfs, Syncthing, Google Drive, Mega, OneDrive or
-    anything similar. You get an encrypted storage layer that can be shared
-    publicly + automatic backups.
+    synchronized folder using
+    [null.fs](https://github.com/michael-0acf4/null.fs), Syncthing, Google
+    Drive, Mega, OneDrive or anything similar. You get an encrypted storage
+    layer that can be shared publicly + automatic backups.
 - Distributed: Out of the box, XHFS makes no assumptions about the underlying
   device as long as we can read/write/seek arbitrary data.
 - As Yet Another Filesystem: The wiring is already there, you can hack your way
