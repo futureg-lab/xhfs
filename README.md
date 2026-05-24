@@ -96,9 +96,9 @@ Download the binary from the
 - `XHFS_CONFIG`: Can be overridden by `--config <CONFIG>`. If none is set, will
   default to `xhfs.yaml`.
 - `XHFS_PASSWORD`: Can be overridden by password in config file if set or
-  `--password <STRING>`. The xhfs client will not use encryption if all are
-  unset (you will still need a password for an existing encrypted volume
-  though).
+  `--password`. The xhfs client will not use encryption if all are unset (you
+  will still need a password for an existing encrypted volume though).
+- XHFS will automatically load from .env if detected.
 
 # Features
 

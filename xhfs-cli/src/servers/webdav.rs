@@ -528,12 +528,15 @@ impl GuardedFileSystem<()> for XHFSAdapter {
 pub async fn webdav_main(
     addr: String,
     port: u16,
-    xhfs_instance: Arc<XHFS>,
+    xhfs: Arc<XHFS>,
     read_only: bool,
 ) -> eyre::Result<()> {
+    println!("-------");
+    println!("{}", xhfs.format_headers_report().await?);
+    println!("-------");
     let addr = format!("{addr}:{port}").parse::<SocketAddr>()?;
     let xhfs_adapter = Box::new(XHFSAdapter {
-        xhfs: xhfs_instance,
+        xhfs,
         read_only,
         chunk_size: 64 * 1024, // standard 64KB disk read windows
     });
@@ -548,7 +551,6 @@ pub async fn webdav_main(
         let (stream, _) = listener.accept().await.unwrap();
         let dav_server = dav_server.clone();
         let io = TokioIo::new(stream);
-
         tokio::task::spawn(async move {
             if let Err(err) = http1::Builder::new()
                 .serve_connection(

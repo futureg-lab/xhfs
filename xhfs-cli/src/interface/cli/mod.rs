@@ -3,13 +3,18 @@ use crate::interface::{
     config::Config,
 };
 use clap::{Args, Parser, Subcommand};
+use eyre::Context;
 use futures::StreamExt;
-use std::{io::Write, path::PathBuf};
+use std::{collections::HashMap, io::Write, path::PathBuf, sync::Arc};
 use tokio::{
     fs::{self, File, OpenOptions},
     io::{AsyncWriteExt, stdout},
+    sync::RwLock,
 };
-use xhfs_core::xhfs::*;
+use xhfs_core::{
+    device::{ConcreteDevice, disk::Controller, kv_device::*, logical::LogicalDevice},
+    xhfs::*,
+};
 
 mod inspect;
 mod server;
@@ -52,11 +57,23 @@ pub struct GlobalOptions {
     #[arg(long)]
     pub config: Option<PathBuf>,
     #[arg(long)]
-    pub password: Option<String>,
+    pub password: bool,
     #[arg(short, long)]
     pub verbose: bool,
     #[arg(short, long)]
     pub force: bool,
+    /// Activate dev mode flags (only relevant for server related features)
+    #[arg(long, default_value = "false")]
+    pub dev: bool,
+    /// Physical unit capacity (must be divisible by 1024)
+    #[arg(long, default_value = "134217728")]
+    pub dev_unit_capacity: usize,
+    /// Physical unit replication count
+    #[arg(long, default_value = "1")]
+    pub dev_replica_count: u8,
+    /// How many logical device rassembling each dev_replica_count
+    #[arg(long, default_value = "1")]
+    pub dev_logical_count: usize,
 }
 
 #[derive(Args, Debug)]
@@ -203,7 +220,7 @@ impl MainCommand {
             Commands::X(x) => x.run().await?,
             Commands::Info(global_options) => {
                 println!(
-                    "Config used: {}",
+                    "Config loaded: {}",
                     global_options.resolve_config_path().display()
                 );
                 let xhfs = global_options.get_xhfs().await?;
@@ -228,14 +245,45 @@ impl GlobalOptions {
         }
     }
 
-    pub async fn format_and_get_xhfs(&self) -> eyre::Result<XHFS> {
+    fn resolve_password(&self) -> Option<String> {
+        if self.password {
+            let password = rpassword::prompt_password("Password: ").unwrap();
+            if password.is_empty() {
+                return None;
+            }
+            Some(password)
+        } else {
+            std::env::var("XHFS_PASSWORD").ok()
+        }
+    }
+
+    async fn load_xhfs(&self, format: bool) -> eyre::Result<XHFS> {
+        if self.dev {
+            println!("In-memory mode enabled, the configs will be ignored.");
+            let xhfs = create_simple_memory_xhfs(
+                self.dev_unit_capacity,
+                self.dev_replica_count,
+                self.dev_logical_count,
+            )
+            .await?;
+            return Ok(xhfs);
+        }
+
         let config = Config::load(self.resolve_config_path())?;
-        config.materialize(true, self.password.clone()).await
+        let password = self.resolve_password();
+        let xhfs = config.materialize(format, password).await?;
+        xhfs.get_root_inode().await.with_context(|| {
+            "Failed to decrypt data. The password may be incorrect or the data may be corrupted.".to_string()
+        })?;
+        Ok(xhfs)
+    }
+
+    pub async fn format_and_get_xhfs(&self) -> eyre::Result<XHFS> {
+        self.load_xhfs(true).await
     }
 
     pub async fn get_xhfs(&self) -> eyre::Result<XHFS> {
-        let config = Config::load(self.resolve_config_path())?;
-        config.materialize(false, self.password.clone()).await
+        self.load_xhfs(false).await
     }
 }
 
@@ -251,4 +299,33 @@ fn confirm_destructive_action() -> bool {
         "y" | "yes" => true,
         _ => false,
     }
+}
+
+async fn create_simple_memory_xhfs(
+    unit_capacity: usize,
+    replica_count: u8,
+    logical_count: usize,
+) -> eyre::Result<XHFS> {
+    let slot_capacity = 1024;
+    if unit_capacity % slot_capacity != 0 {
+        eyre::bail!("In-memory capacity must be divisible by {slot_capacity}");
+    }
+
+    let mut logical_devices = vec![];
+    for _ in 0..logical_count {
+        let devices = (0..replica_count)
+            .map(|_| {
+                ConcreteDevice::KVDevice(KVDevice {
+                    store: Arc::new(MemoryKV(RwLock::new(HashMap::new()))),
+                    total_slots: unit_capacity / slot_capacity,
+                    slot_capacity,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        logical_devices.push(LogicalDevice::new(2, devices)?);
+    }
+
+    let ctrl = Controller::from(logical_devices).await?;
+    XHFS::format_new(ctrl, None).await
 }

@@ -30,10 +30,10 @@ pub enum InspectSubcommands {
 
 #[derive(Args, Debug)]
 pub struct ViewMap {
-    /// Start address
+    /// Start group
     #[arg(value_parser = parse_hex_or_decimal, default_value = "1")]
     pub start_group: u64,
-    /// End address
+    /// End group
     #[arg(value_parser = parse_hex_or_decimal, default_value = "6")]
     pub end_group: u64,
     #[arg(short, long, default_value = "64")]

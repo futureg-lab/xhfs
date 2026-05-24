@@ -12,7 +12,7 @@ pub struct ServerCommands {
 
 #[derive(Subcommand, Debug)]
 pub enum ServerSubcommands {
-    /// Spawn a Webdav server
+    /// Spawn a WebDAV server
     Webdav(Webdav),
 }
 

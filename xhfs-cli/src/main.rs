@@ -19,5 +19,7 @@ async fn main() -> eyre::Result<()> {
         .without_time()
         .init();
 
+    dotenv::dotenv().ok();
+
     MainCommand::parse().run().await
 }
