@@ -2,7 +2,7 @@
 
 ```bash
 # Not persistent accross runs
-xhfs server upload test.jpg --dev
+xhfs upload test.jpg --dev
 
 # Will allocate 134217728  * 2 * 3 bytes sized in-memory buffer
 xhfs server webdav \
