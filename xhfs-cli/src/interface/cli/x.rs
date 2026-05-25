@@ -215,13 +215,12 @@ impl LsCommand {
 
 impl CopyCommand {
     pub async fn run(&self) -> eyre::Result<()> {
-        let cp = self;
-        let xhfs = cp.global.get_xhfs().await?;
+        let xhfs = self.global.get_xhfs().await?;
         xhfs.fcopy(
-            &cp.src,
-            &cp.dest,
+            &self.src,
+            &self.dest,
             WriteOption {
-                overwrite: cp.overwrite,
+                overwrite: self.overwrite,
             },
         )
         .await?;
@@ -231,9 +230,8 @@ impl CopyCommand {
 
 impl MoveCommand {
     pub async fn run(&self) -> eyre::Result<()> {
-        let cp = self;
-        let xhfs = cp.global.get_xhfs().await?;
-        xhfs.fmove(&cp.src, &cp.dest).await?;
+        let xhfs = self.global.get_xhfs().await?;
+        xhfs.fmove(&self.src, &self.dest).await?;
         Ok(())
     }
 }

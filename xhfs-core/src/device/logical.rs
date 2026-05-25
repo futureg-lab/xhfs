@@ -58,8 +58,7 @@ impl LogicalDevice {
         // TODO:
         // each logical device should the events
         // and retry entries that has failed to write
-        // it should show user friendly logs outlining which backend fails
-
+        // it should display user friendly logs outlining which backend fails
         stream::iter(
             self.replica
                 .iter()

@@ -41,7 +41,6 @@ impl Device for KVDevice {
     async fn write(&self, addr: usize, data: &[u8]) -> eyre::Result<()> {
         let mut remaining = data;
         let mut current_addr = addr;
-
         while !remaining.is_empty() {
             let slot = current_addr / self.slot_capacity;
             let offset = current_addr % self.slot_capacity;
@@ -73,20 +72,15 @@ impl Device for KVDevice {
     async fn read(&self, addr: usize, size: usize) -> eyre::Result<Vec<u8>> {
         let mut remaining = size;
         let mut current_addr = addr;
-
         let mut buf = Vec::with_capacity(size);
-
         while remaining > 0 {
             let slot = current_addr / self.slot_capacity;
             let offset = current_addr % self.slot_capacity;
-
             if slot >= self.total_slots {
                 eyre::bail!("Read out of bounds");
             }
-
             let readable = (self.slot_capacity - offset).min(remaining);
             let key = slot as u64;
-
             let slot_buf = self
                 .store
                 .get(&key)

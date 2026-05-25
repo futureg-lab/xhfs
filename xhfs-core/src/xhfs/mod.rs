@@ -281,7 +281,6 @@ impl XHFS {
         let mut chosen_inumber = None;
         let mut chosen_group = None;
         let mut chosen_bitmap = None;
-
         for i in 0..self.static_format.group_count {
             let current_g_index = (starting_group.g_index + i) % self.static_format.group_count;
             let group = GroupLayout::derive_from_group_index(current_g_index, &self.geometry)
@@ -322,7 +321,6 @@ impl XHFS {
             ctime: utc_now_u64(),
             extra_metadata: [0; 32],
         };
-
         let inode_slot = self.resolve_inode_addr(inumber).ok_or_else(|| {
             eyre::eyre!(
                 "Could not map table space layout coordinates for newly chosen inumber {inumber}"
@@ -468,7 +466,6 @@ impl XHFS {
         tracing::debug!("Resolving path {path:?}");
         let components = path_to_string_list(path);
         let mut inode = self.get_root_inode().await?;
-
         for (i, component) in components.iter().enumerate() {
             match inode.kind {
                 INodeKind::Directory => {
@@ -503,8 +500,6 @@ impl XHFS {
                     );
                 }
                 INodeKind::Symlink | INodeKind::Hardlink => {
-                    // IDEA: impl symlink resolution traversal loop substitution here
-                    // resolving a link should resolve into its containing path?
                     eyre::bail!(
                         "Encountered link at path '{}'",
                         join_absolute(&components[..i])
@@ -670,7 +665,7 @@ impl XHFS {
 
         // commit sequence
 
-        // we update DESTINATION directory first
+        // We update DESTINATION directory first
         // so that if we crash right here, the file safely lives in both places (clone/Link state)
         self.update_inode_mtime_now(dst_parent_inode).await?;
         // then update SOURCE directory second
@@ -1556,16 +1551,17 @@ impl XHFS {
 
     pub async fn read_extent(&self, addr: u64) -> Result<Extent, XHFSError> {
         let meta = self.read_extent_metadata(addr).await?;
-        let out = Extent::deserialize(
-            &self
-                .ctrl
-                .read(
-                    meta.full_canon_region.start.into(),
-                    meta.full_canon_region.size_span() as usize,
-                )
-                .await?,
-        )?;
-        Ok(out)
+        let data = self
+            .ctrl
+            .read(
+                meta.full_canon_data_slot.addr.into(),
+                meta.full_canon_data_slot.capacity,
+            )
+            .await?;
+        Ok(Extent {
+            next: meta.next_extent,
+            data,
+        })
     }
 
     pub async fn read_extent_metadata(&self, addr: u64) -> eyre::Result<ExtentMetadata> {
@@ -1588,7 +1584,7 @@ impl XHFS {
                 end: MaybeU64::from(addr + raw_footprint),
             },
             full_canon_data_slot: AddressSlot {
-                addr: MaybeU64::from(addr + 16),
+                addr: MaybeU64::from(addr + full_offset as u64),
                 capacity: curr_extent_data_size as usize,
             },
             next_extent,
@@ -1631,6 +1627,7 @@ impl XHFS {
         addr_start: u64,
         addr_end: u64,
     ) -> eyre::Result<Vec<u8>> {
+        // tracing::warn!("   Seeking 0x{addr_start:08x} - 0x{addr_end:08x}");
         let mut buf = vec![];
         let mut cursor = 0;
         let mut addr = addr;
@@ -1656,11 +1653,11 @@ impl XHFS {
                 let data = self
                     .ctrl
                     .read(
-                        meta.full_canon_data_slot.addr.into(),
-                        meta.full_canon_data_slot.capacity,
+                        meta.full_canon_data_slot.addr.get() as usize + start_in_ext,
+                        end_in_ext.saturating_sub(start_in_ext) as usize,
                     )
                     .await?;
-                buf.extend_from_slice(&data[start_in_ext..end_in_ext]);
+                buf.extend_from_slice(&data);
             }
             cursor = extent_end;
         }

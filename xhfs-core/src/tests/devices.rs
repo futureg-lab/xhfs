@@ -13,7 +13,6 @@ macro_rules! test_read_write_simple {
     ($device:expr) => {{
         async {
             let device = $device;
-
             let data = "ABC D";
             let addr = 4;
             let size = data.len();
@@ -35,7 +34,6 @@ macro_rules! test_read_write_complex {
     ($device:expr) => {{
         async {
             let device = $device;
-
             device.write(2, b"HELLOWORLD").await?;
 
             assert_eq!(
@@ -43,7 +41,6 @@ macro_rules! test_read_write_complex {
                 b"HELLOWORLD",
                 "verify exact readback"
             );
-
             assert_eq!(
                 device.read(0, 16).await?,
                 vec![
@@ -59,7 +56,6 @@ macro_rules! test_read_write_complex {
                 b"HELXYZORLD",
                 "partial overwrite inside existing slot chain"
             );
-
             assert_eq!(device.read(4, 5).await?, b"LXYZO", "mid-slot read");
 
             Ok::<(), eyre::Report>(())

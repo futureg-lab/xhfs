@@ -180,7 +180,7 @@ impl RegionSlot {
     pub fn to_addr_slot(&self) -> AddressSlot {
         AddressSlot {
             addr: self.start,
-            capacity: 1 + self.size_span() as usize, // like index 0 arrays
+            capacity: 1 + self.size_span() as usize, // 0-indexed
         }
     }
 }

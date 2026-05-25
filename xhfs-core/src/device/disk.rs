@@ -13,15 +13,6 @@ pub struct Controller {
     crypto: Option<Crypto>,
 }
 
-// TODO:
-// from yaml config
-// chunks:
-//   - type: fs
-//     allocate: ...
-//     path: A.bin
-//   - type: kv # addr resolution should be fun
-//     allocate: ..
-//     backend: memory | http (makes request to remote kv like Cloudflare) | redis | s3
 impl Controller {
     pub async fn from<D>(devices: D) -> eyre::Result<Self>
     where
@@ -29,7 +20,6 @@ impl Controller {
     {
         let mut logical_end = 0;
         let mut pinned_devices = vec![];
-
         for device in devices {
             let size = device.validate_layout().await?;
             let start = logical_end;
@@ -87,12 +77,9 @@ impl Controller {
             else {
                 eyre::bail!("No device range covers address 0x{logical_addr:x}");
             };
-
             let local_offset = logical_addr - pinned.start;
             let max_len = (pinned.end - logical_addr).min(remaining.len());
-
             plan.push((&pinned.device, local_offset, remaining[..max_len].to_vec()));
-
             logical_addr += max_len;
             remaining = &remaining[max_len..];
         }
@@ -111,7 +98,6 @@ impl Controller {
     ) -> eyre::Result<Vec<u8>> {
         tracing::debug!(" Reading {size} bytes at 0x{logical_addr:x}");
         let mut buf = Vec::with_capacity(size);
-
         while size > 0 {
             let Some(pinned) = self
                 .pinned_devices

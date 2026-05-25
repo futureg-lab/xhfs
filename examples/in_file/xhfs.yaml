@@ -1,5 +1,4 @@
-# the drive will be encrypted
-# or use the cli with --password helloworld if the config and bins are made public
+# You can use --password if the config and bins are made public
 password: helloworld
 devices:
   - type: file

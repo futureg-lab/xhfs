@@ -21,7 +21,7 @@ impl KeyValue for HttpKV {
     async fn set(&self, k: u64, v: Vec<u8>) -> eyre::Result<()> {
         let client = reqwest::Client::new();
         let k = self.to_internal(k);
-        let mut req = client.put(self.url.join(&format!("xhfs/{}", k))?).body(v);
+        let mut req = client.put(self.url.join(&format!("xhfs/{k}"))?).body(v);
         for (key, val) in &self.headers {
             req = req.header(key, val);
         }
@@ -41,7 +41,7 @@ impl KeyValue for HttpKV {
     async fn get(&self, k: &u64) -> eyre::Result<Option<Vec<u8>>> {
         let client = reqwest::Client::new();
         let k = self.to_internal(*k);
-        let mut req = client.get(self.url.join(&format!("xhfs/{}", k))?);
+        let mut req = client.get(self.url.join(&format!("xhfs/{k}"))?);
         for (key, val) in &self.headers {
             req = req.header(key, val);
         }
