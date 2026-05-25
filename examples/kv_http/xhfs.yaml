@@ -1,4 +1,4 @@
-# the drive will be encrypted
+# You can use --password if the config and bins are made public
 password: helloworld
 devices:
   - type: kvhttp

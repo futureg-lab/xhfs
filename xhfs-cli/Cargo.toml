@@ -15,13 +15,11 @@ categories = ["command-line-utilities", "filesystem", "database-implementations"
 xhfs-core = { workspace = true }
 clap = { version = "4.6.1", features = ["derive"] }
 dav-server = "0.11.0"
-async-recursion = "1.1.1"
+async-recursion = "1.1.1" # TODO: make --tree non-recursive
 
-async-trait = { workspace = true }
 async-stream = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true }
-tokio-util = { workspace = true }
 
 tracing = { workspace = true }
 tracing-error = { workspace = true }
@@ -37,9 +35,5 @@ rand = { workspace = true }
 bytes = { workspace = true }
 hyper = { version = "1.9.0", features = ["http1", "server"] }
 hyper-util = { version = "0.1.20", features = ["tokio"] }
-parking_lot = "0.12.5"
-futures-util = "0.3.32"
 rpassword = "7.5.3"
 dotenv = "0.15.0"
-
-
