@@ -1556,16 +1556,17 @@ impl XHFS {
 
     pub async fn read_extent(&self, addr: u64) -> Result<Extent, XHFSError> {
         let meta = self.read_extent_metadata(addr).await?;
-        let out = Extent::deserialize(
-            &self
-                .ctrl
-                .read(
-                    meta.full_canon_region.start.into(),
-                    meta.full_canon_region.size_span() as usize,
-                )
-                .await?,
-        )?;
-        Ok(out)
+        let data = self
+            .ctrl
+            .read(
+                meta.full_canon_data_slot.addr.into(),
+                meta.full_canon_data_slot.capacity,
+            )
+            .await?;
+        Ok(Extent {
+            next: meta.next_extent,
+            data,
+        })
     }
 
     pub async fn read_extent_metadata(&self, addr: u64) -> eyre::Result<ExtentMetadata> {
@@ -1588,7 +1589,7 @@ impl XHFS {
                 end: MaybeU64::from(addr + raw_footprint),
             },
             full_canon_data_slot: AddressSlot {
-                addr: MaybeU64::from(addr + 16),
+                addr: MaybeU64::from(addr + full_offset as u64),
                 capacity: curr_extent_data_size as usize,
             },
             next_extent,
@@ -1631,6 +1632,7 @@ impl XHFS {
         addr_start: u64,
         addr_end: u64,
     ) -> eyre::Result<Vec<u8>> {
+        // tracing::warn!("   Seeking 0x{addr_start:08x} - 0x{addr_end:08x}");
         let mut buf = vec![];
         let mut cursor = 0;
         let mut addr = addr;
@@ -1656,11 +1658,11 @@ impl XHFS {
                 let data = self
                     .ctrl
                     .read(
-                        meta.full_canon_data_slot.addr.into(),
-                        meta.full_canon_data_slot.capacity,
+                        meta.full_canon_data_slot.addr.get() as usize + start_in_ext,
+                        end_in_ext.saturating_sub(start_in_ext) as usize,
                     )
                     .await?;
-                buf.extend_from_slice(&data[start_in_ext..end_in_ext]);
+                buf.extend_from_slice(&data);
             }
             cursor = extent_end;
         }

@@ -8,7 +8,7 @@ use dav_server::{
         GuardedFileSystem, OpenOptions, ReadDirMeta,
     },
 };
-use futures::{FutureExt, StreamExt, stream};
+use futures::{FutureExt, stream};
 use hyper::{server::conn::http1, service::service_fn};
 use hyper_util::rt::TokioIo;
 use std::{
@@ -19,7 +19,7 @@ use std::{
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio::{net::TcpListener, sync::Mutex};
+use tokio::net::TcpListener;
 use xhfs_core::xhfs::{
     WriteOption, XHFS,
     ds::{EntryStat, INodeKind, XHFSError},
@@ -92,17 +92,18 @@ impl DavDirEntry for XHFSDirEntry {
 pub struct XHFSFile {
     xhfs: Arc<XHFS>,
     path: PathBuf,
-    offset: Mutex<u64>,
+    offset: u64,
     chunk_size: usize,
     read_only: bool,
+    estat: EntryStat,
+    write_buffer: Vec<u8>,
 }
 
 impl std::fmt::Debug for XHFSFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let current_pos = self.offset.try_lock().map(|g| *g).unwrap_or(0);
         f.debug_struct("XHFSFile")
             .field("path", &self.path)
-            .field("current_offset", &current_pos)
+            .field("current_offset", &self.offset)
             .finish()
     }
 }
@@ -111,90 +112,49 @@ impl DavFile for XHFSFile {
     fn read_bytes(&mut self, count: usize) -> FsFuture<'_, Bytes> {
         let xhfs = self.xhfs.clone();
         let path = self.path.clone();
-        let chunk_size = self.chunk_size;
-        tracing::info!("Reading bytes {count}");
         async move {
-            let current_pos = {
-                let offset_guard = self.offset.lock().await;
-                *offset_guard
-            };
-            let mut stream = xhfs.fread_stream(path, chunk_size).await.map_err(|e| {
-                tracing::error!("Error pulling chunk stream from block layer: {e:?}");
-                FsError::NotFound
+            if !self.write_buffer.is_empty() {
+                let flush_buf = std::mem::take(&mut self.write_buffer);
+                xhfs.fappend(&path, flush_buf).await.map_err(EConv)?;
+                self.write_buffer = Vec::with_capacity(self.chunk_size);
+            }
+            let start = self.offset;
+            let end = start + count as u64;
+            let data = xhfs.fseek(&path, start, end).await.map_err(|e| {
+                tracing::error!("Read failed: {e:?}");
+                FsError::GeneralFailure
             })?;
+            self.offset += data.len() as u64;
 
-            let mut skip_remaining = current_pos;
-            let mut collected_bytes = vec![];
-            while let Some(chunk_result) = stream.next().await {
-                match chunk_result {
-                    Ok(chunk) => {
-                        let chunk_len = chunk.len() as u64;
-
-                        if skip_remaining >= chunk_len {
-                            skip_remaining -= chunk_len;
-                            continue;
-                        }
-
-                        let start_idx = skip_remaining as usize;
-                        skip_remaining = 0;
-
-                        let available_in_chunk = chunk.len() - start_idx;
-                        let needed = count - collected_bytes.len();
-                        let take_len = std::cmp::min(available_in_chunk, needed);
-
-                        collected_bytes.extend_from_slice(&chunk[start_idx..start_idx + take_len]);
-
-                        if collected_bytes.len() >= count {
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!("Underlying block device read failed: {e:?}");
-                        return Err(FsError::GeneralFailure);
-                    }
-                }
-            }
-
-            {
-                let mut offset_guard = self.offset.lock().await;
-                *offset_guard += collected_bytes.len() as u64;
-            }
-
-            Ok(Bytes::from(collected_bytes))
+            Ok(Bytes::from(data))
         }
         .boxed()
     }
 
     fn seek(&mut self, pos: std::io::SeekFrom) -> FsFuture<'_, u64> {
-        let xhfs = self.xhfs.clone();
-        let path = self.path.clone();
         async move {
-            let mut offset_guard = self.offset.lock().await;
             match pos {
                 std::io::SeekFrom::Start(n) => {
-                    *offset_guard = n;
+                    self.offset = n;
                     Ok(n)
                 }
                 std::io::SeekFrom::Current(n) => {
-                    let new_pos = (*offset_guard as i64).saturating_add(n);
+                    let new_pos = (self.offset as i64).saturating_add(n);
                     if new_pos < 0 {
                         return Err(FsError::GeneralFailure);
                     }
-                    *offset_guard = new_pos as u64;
-                    Ok(*offset_guard)
+                    self.offset = new_pos as u64;
+                    Ok(self.offset)
                 }
-                std::io::SeekFrom::End(n) => match xhfs.stats(path, true).await {
-                    Ok(Some(entry_stat)) => {
-                        let total_size = entry_stat.size.unwrap_or(0) as i64;
-                        let new_pos = total_size.saturating_add(n);
-                        if new_pos < 0 {
-                            return Err(FsError::GeneralFailure);
-                        }
-                        *offset_guard = new_pos as u64;
-                        Ok(*offset_guard)
+                std::io::SeekFrom::End(n) => {
+                    let total_size = self.estat.size.unwrap_or(0) as i64;
+                    let new_pos = total_size.saturating_add(n);
+                    if new_pos < 0 {
+                        return Err(FsError::GeneralFailure);
                     }
-                    _ => Err(FsError::NotFound),
-                },
+                    self.offset = new_pos as u64;
+                    Ok(self.offset)
+                }
             }
         }
         .boxed()
@@ -218,10 +178,17 @@ impl DavFile for XHFSFile {
 
     fn write_bytes(&'_ mut self, buf: Bytes) -> FsFuture<'_, ()> {
         read_only_guard!(self.read_only);
-        let xhfs = self.xhfs.clone();
-        let path = self.path.clone();
         async move {
-            xhfs.fappend(&path, buf.to_vec()).await.map_err(EConv)?;
+            self.write_buffer.extend_from_slice(&buf);
+            if self.write_buffer.len() >= self.chunk_size {
+                let flush_buf = std::mem::take(&mut self.write_buffer);
+                self.xhfs
+                    .fappend(&self.path, flush_buf)
+                    .await
+                    .map_err(EConv)?;
+                self.write_buffer = Vec::with_capacity(self.chunk_size);
+            }
+            self.offset += buf.len() as u64;
             Ok(())
         }
         .boxed()
@@ -229,15 +196,20 @@ impl DavFile for XHFSFile {
 
     fn write_buf(&'_ mut self, mut buf: Box<dyn Buf + Send>) -> FsFuture<'_, ()> {
         read_only_guard!(self.read_only);
-        tracing::debug!("Writting buf");
-        let xhfs = self.xhfs.clone();
-        let path = self.path.clone();
         async move {
             while buf.has_remaining() {
-                let b = buf.chunk();
-                let len = b.len();
-                xhfs.fappend(&path, b.to_vec()).await.map_err(EConv)?;
-                buf.advance(len);
+                let chunk = buf.chunk();
+                self.write_buffer.extend_from_slice(chunk);
+                self.offset += chunk.len() as u64;
+                buf.advance(chunk.len());
+                if self.write_buffer.len() >= self.chunk_size {
+                    let flush_buf = std::mem::take(&mut self.write_buffer);
+                    self.xhfs
+                        .fappend(&self.path, flush_buf)
+                        .await
+                        .map_err(EConv)?;
+                    self.write_buffer = Vec::with_capacity(self.chunk_size);
+                }
             }
             Ok(())
         }
@@ -245,7 +217,18 @@ impl DavFile for XHFSFile {
     }
 
     fn flush(&mut self) -> FsFuture<'_, ()> {
-        async move { Ok(()) }.boxed()
+        async move {
+            if !self.write_buffer.is_empty() {
+                let flush_buf = std::mem::take(&mut self.write_buffer);
+                self.xhfs
+                    .fappend(&self.path, flush_buf)
+                    .await
+                    .map_err(EConv)?;
+                self.write_buffer = Vec::with_capacity(self.chunk_size);
+            }
+            Ok(())
+        }
+        .boxed()
     }
 
     fn redirect_url(&'_ mut self) -> FsFuture<'_, Option<String>> {
@@ -288,17 +271,19 @@ impl GuardedFileSystem<()> for XHFSAdapter {
             }
 
             match xhfs.stats(path_buf.clone(), true).await {
-                Ok(Some(stat)) => {
-                    if matches!(stat.kind, INodeKind::Directory) {
+                Ok(Some(estat)) => {
+                    if matches!(estat.kind, INodeKind::Directory) {
                         tracing::warn!("Attempted to open directory {path_buf:?}");
                         return Err(FsError::Forbidden);
                     }
                     let file_handle = XHFSFile {
                         xhfs,
                         path: path_buf,
-                        offset: tokio::sync::Mutex::new(0),
+                        offset: 0,
                         chunk_size,
                         read_only,
+                        estat,
+                        write_buffer: Vec::with_capacity(chunk_size),
                     };
                     Ok(Box::new(file_handle) as Box<dyn DavFile>)
                 }

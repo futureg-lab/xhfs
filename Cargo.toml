@@ -7,7 +7,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.3.9"
+version = "0.3.11"
 license = "MPL-2.0"
 edition = "2024"
 description = "Bruteforce your way into storing files anywhere across an arbitrary combination of arbitrary devices."
@@ -24,7 +24,7 @@ include = [
 ]
 
 [workspace.dependencies]
-xhfs-core = { version = "0.3.9", path = "xhfs-core"}
+xhfs-core = { version = "0.3.11", path = "xhfs-core"}
 
 async-trait = "0.1.89"
 bitvec = "1.0.1"
