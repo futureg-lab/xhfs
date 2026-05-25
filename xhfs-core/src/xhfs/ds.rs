@@ -442,8 +442,8 @@ fn deserialize_255_utf8_string(data: &[u8]) -> eyre::Result<String> {
 impl Directory {
     pub fn serialize(&self) -> eyre::Result<Vec<u8>> {
         let items = self.entries.len();
-        let mut data = Vec::with_capacity(8 + items * (255 + 8));
-        data.extend(items.to_le_bytes());
+        let mut data = Vec::with_capacity(8 + items * (256 + 8));
+        data.extend((items as u64).to_le_bytes());
         for (k, v) in &self.entries {
             data.extend(serialize_255_utf8_string(k)?);
             data.extend(v.to_le_bytes());
