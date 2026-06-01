@@ -393,10 +393,12 @@ impl XHFS {
         Ok(inode)
     }
 
+    #[inline]
     pub async fn update_inode_mtime_now(&self, inode: INode) -> eyre::Result<INode> {
         self.update_inode_mtime(inode, utc_now_u64()).await
     }
 
+    #[inline]
     pub async fn increment_inode_nlink(&self, mut inode: INode) -> eyre::Result<()> {
         inode.nlink += 1;
         self.register_inode(&inode, true).await
@@ -854,6 +856,7 @@ impl XHFS {
         Ok(())
     }
 
+    #[inline]
     pub async fn fwrite<P: Into<PathBuf>>(
         &self,
         path: P,
@@ -1202,6 +1205,7 @@ impl XHFS {
         }
     }
 
+    #[inline]
     pub async fn fappend<P: Into<PathBuf>>(
         &self,
         path: P,
@@ -1214,6 +1218,7 @@ impl XHFS {
         Ok(())
     }
 
+    #[inline]
     pub async fn exists<P: Into<PathBuf>>(&self, path: P) -> eyre::Result<bool> {
         Ok(self.stats(path, false).await?.is_some())
     }
