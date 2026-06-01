@@ -5,7 +5,13 @@ use crate::interface::{
 use clap::{Args, Parser, Subcommand};
 use eyre::Context;
 use futures::StreamExt;
-use std::{collections::HashMap, io::Write, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap,
+    io::Write,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, UNIX_EPOCH},
+};
 use tokio::{
     fs::{self, File, OpenOptions},
     io::{AsyncWriteExt, stdout},
@@ -13,6 +19,7 @@ use tokio::{
 };
 use xhfs_core::{
     device::{ConcreteDevice, disk::Controller, kv_device::*, logical::LogicalDevice},
+    utils::systime_to_u64,
     xhfs::*,
 };
 
@@ -140,6 +147,13 @@ impl MainCommand {
             Commands::Upload(u) => {
                 let xhfs = u.global.get_xhfs().await?;
                 let data = fs::read(&u.src_path).await?;
+                let modified = fs::metadata(&u.src_path)
+                    .await
+                    .map(|m| m.modified().ok())
+                    .ok()
+                    .flatten()
+                    .map(systime_to_u64);
+
                 let dest_path = match &u.dest_path {
                     Some(path) => path.to_owned(),
                     None => PathBuf::from(u.src_path.file_name().ok_or_else(|| {
@@ -156,6 +170,7 @@ impl MainCommand {
                         data,
                         WriteOption {
                             overwrite: u.overwrite,
+                            modified,
                         },
                     )
                     .await?;
@@ -167,6 +182,7 @@ impl MainCommand {
                         u.block_size,
                         WriteOption {
                             overwrite: u.overwrite,
+                            modified,
                         },
                     )
                     .await?;
@@ -198,6 +214,11 @@ impl MainCommand {
                         file.write_all(&chunk).await?;
                     }
                     file.flush().await?;
+                }
+                if let Some(stats) = xhfs.stats(&d.src_path, false).await? {
+                    let file = std::fs::OpenOptions::new().write(true).open(&dest_path)?;
+                    let time = UNIX_EPOCH + Duration::from_secs(stats.mtime);
+                    file.set_modified(time)?;
                 }
             }
             Commands::Read(r) => {

@@ -116,7 +116,7 @@ impl DavFile for XHFSFile {
         async move {
             if !self.write_buffer.is_empty() {
                 let flush_buf = std::mem::take(&mut self.write_buffer);
-                xhfs.fappend(&path, flush_buf).await.map_err(EConv)?;
+                xhfs.fappend(&path, flush_buf, None).await.map_err(EConv)?;
                 self.write_buffer = Vec::with_capacity(self.chunk_size);
             }
             let start = self.offset;
@@ -184,7 +184,7 @@ impl DavFile for XHFSFile {
             if self.write_buffer.len() >= self.chunk_size {
                 let flush_buf = std::mem::take(&mut self.write_buffer);
                 self.xhfs
-                    .fappend(&self.path, flush_buf)
+                    .fappend(&self.path, flush_buf, None)
                     .await
                     .map_err(EConv)?;
                 self.write_buffer = Vec::with_capacity(self.chunk_size);
@@ -206,7 +206,7 @@ impl DavFile for XHFSFile {
                 if self.write_buffer.len() >= self.chunk_size {
                     let flush_buf = std::mem::take(&mut self.write_buffer);
                     self.xhfs
-                        .fappend(&self.path, flush_buf)
+                        .fappend(&self.path, flush_buf, None)
                         .await
                         .map_err(EConv)?;
                     self.write_buffer = Vec::with_capacity(self.chunk_size);
@@ -222,7 +222,7 @@ impl DavFile for XHFSFile {
             if !self.write_buffer.is_empty() {
                 let flush_buf = std::mem::take(&mut self.write_buffer);
                 self.xhfs
-                    .fappend(&self.path, flush_buf)
+                    .fappend(&self.path, flush_buf, None)
                     .await
                     .map_err(EConv)?;
                 self.write_buffer = Vec::with_capacity(self.chunk_size);
@@ -265,6 +265,7 @@ impl GuardedFileSystem<()> for XHFSAdapter {
                     vec![],
                     WriteOption {
                         overwrite: options.truncate,
+                        ..Default::default()
                     },
                 )
                 .await
@@ -446,7 +447,10 @@ impl GuardedFileSystem<()> for XHFSAdapter {
                 from_path_buf,
                 to_path_buf,
                 self.chunk_size,
-                WriteOption { overwrite: true },
+                WriteOption {
+                    overwrite: true,
+                    ..Default::default()
+                },
             )
             .await
             .map_err(EConv)?;

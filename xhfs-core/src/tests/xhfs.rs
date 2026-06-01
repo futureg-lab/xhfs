@@ -39,7 +39,10 @@ async fn test_xhfs_core_ops() -> eyre::Result<()> {
     xhfs.fwrite(
         "/hello/baz/123.bin",
         vec![1, 2, 3],
-        WriteOption { overwrite: false },
+        WriteOption {
+            overwrite: false,
+            ..Default::default()
+        },
     )
     .await?;
     xhfs.mkdir("/world", true).await?;
@@ -87,13 +90,19 @@ async fn test_xhfs_core_ops() -> eyre::Result<()> {
         xhfs.fwrite(
             "/hello/baz/bbb/content1.txt",
             data1.as_bytes().to_vec(),
-            WriteOption { overwrite: false },
+            WriteOption {
+                overwrite: false,
+                ..Default::default()
+            },
         )
         .await?;
         xhfs.fwrite(
             "/hello/baz/bbb/content2.txt",
             data2.as_bytes().to_vec(),
-            WriteOption { overwrite: false },
+            WriteOption {
+                overwrite: false,
+                ..Default::default()
+            },
         )
         .await?;
         assert_eq!(
@@ -113,7 +122,11 @@ async fn test_xhfs_core_ops() -> eyre::Result<()> {
         xhfs.fwrite(
             "/hello/baz/bbb/content1.txt",
             data1.as_bytes().to_vec(),
-            WriteOption { overwrite: true },
+            WriteOption {
+                overwrite: true,
+
+                ..Default::default()
+            },
         )
         .await?;
 
@@ -143,14 +156,18 @@ async fn test_xhfs_ref_manips_and_stats() -> eyre::Result<()> {
     xhfs.fwrite(
         "/many/entries/d.txt",
         b"HELLO".to_vec(),
-        WriteOption { overwrite: false },
+        WriteOption {
+            overwrite: false,
+            ..Default::default()
+        },
     )
     .await?;
 
     {
         // extent 1 = HELLO
         // extent 2 = ABC
-        xhfs.fappend("/many/entries/d.txt", b"ABC".to_vec()).await?;
+        xhfs.fappend("/many/entries/d.txt", b"ABC".to_vec(), None)
+            .await?;
         assert_eq!(
             xhfs.fread("/many/entries/d.txt").await?,
             b"HELLOABC",
@@ -168,33 +185,48 @@ async fn test_xhfs_ref_manips_and_stats() -> eyre::Result<()> {
         xhfs.fcopy(
             "/many/entries/d.txt",
             "/many/entries/other.txt",
-            WriteOption { overwrite: false },
+            WriteOption {
+                overwrite: false,
+                ..Default::default()
+            },
         )
         .await?;
         xhfs.fcopy_stream(
             "/many/entries/d.txt",
             "/many/entries/other-but-streamed.txt",
             3,
-            WriteOption { overwrite: false },
+            WriteOption {
+                overwrite: false,
+                ..Default::default()
+            },
         )
         .await?;
         xhfs.fmove("/many/entries", "/many/entries2").await?;
         xhfs.create_symlink(
             "/file.link",
             "/many/entries2/d.txt",
-            WriteOption { overwrite: false },
+            WriteOption {
+                overwrite: false,
+                ..Default::default()
+            },
         )
         .await?;
         xhfs.create_hardlink(
             "/file.hardlink",
             "/many/entries2/d.txt",
-            WriteOption { overwrite: false },
+            WriteOption {
+                overwrite: false,
+                ..Default::default()
+            },
         )
         .await?;
         xhfs.create_symlink(
             "/folder.link",
             "/many/entries2",
-            WriteOption { overwrite: false },
+            WriteOption {
+                overwrite: false,
+                ..Default::default()
+            },
         )
         .await?;
     }
@@ -283,8 +315,15 @@ async fn test_fremove_and_hardlinks() -> eyre::Result<()> {
     let space_before_any_writes = xhfs.total_remaining_capacity().await?;
     assert_eq!(space_before_any_writes, 83869696);
 
-    xhfs.fwrite(og_path, homework.clone(), WriteOption { overwrite: false })
-        .await?;
+    xhfs.fwrite(
+        og_path,
+        homework.clone(),
+        WriteOption {
+            overwrite: false,
+            ..Default::default()
+        },
+    )
+    .await?;
     let after_write_remaining = xhfs.total_remaining_capacity().await?;
     assert_eq!(after_write_remaining, 83701760);
 
@@ -294,7 +333,10 @@ async fn test_fremove_and_hardlinks() -> eyre::Result<()> {
     xhfs.create_hardlink(
         "/deeply/nested/001.hardlink",
         og_path,
-        WriteOption { overwrite: false },
+        WriteOption {
+            overwrite: false,
+            ..Default::default()
+        },
     )
     .await?;
     assert_eq!(
@@ -308,7 +350,10 @@ async fn test_fremove_and_hardlinks() -> eyre::Result<()> {
     xhfs.create_hardlink(
         "/deeply/nested/002.hardlink",
         og_path,
-        WriteOption { overwrite: false },
+        WriteOption {
+            overwrite: false,
+            ..Default::default()
+        },
     )
     .await?;
     assert_eq!(
@@ -355,7 +400,10 @@ async fn test_fstream_from_no_file() -> eyre::Result<()> {
         "hello.txt",
         &mut memory_stream,
         block_size,
-        WriteOption { overwrite: false },
+        WriteOption {
+            overwrite: false,
+            ..Default::default()
+        },
     )
     .await?;
 
@@ -404,11 +452,18 @@ async fn test_xhfs_fread_stream() -> eyre::Result<()> {
     let part2 = vec![2; 111];
     let part3 = vec![3; 1];
 
-    xhfs.fwrite("/file.bin", vec![], WriteOption { overwrite: false })
-        .await?;
-    xhfs.fappend("/file.bin", part1.clone()).await?;
-    xhfs.fappend("/file.bin", part2.clone()).await?;
-    xhfs.fappend("/file.bin", part3.clone()).await?;
+    xhfs.fwrite(
+        "/file.bin",
+        vec![],
+        WriteOption {
+            overwrite: false,
+            ..Default::default()
+        },
+    )
+    .await?;
+    xhfs.fappend("/file.bin", part1.clone(), None).await?;
+    xhfs.fappend("/file.bin", part2.clone(), None).await?;
+    xhfs.fappend("/file.bin", part3.clone(), None).await?;
 
     let examples = [13, 17, 22, 100000];
     for chunk_size in examples {
