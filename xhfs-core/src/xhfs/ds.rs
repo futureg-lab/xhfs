@@ -91,7 +91,8 @@ impl Display for XHFSError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             XHFSError::Insufficient { operation, wanted } => {
-                write!(f, "Insufficient space, {operation} requires {wanted} B")
+                let fmt_wanted = PrettySize(*wanted as u64);
+                write!(f, "Insufficient space, {operation} requires {fmt_wanted}")
             }
             XHFSError::Error { err } => write!(f, "{err}"),
         }
@@ -151,12 +152,14 @@ impl Display for AddressSlot {
 
 impl Display for RegionSlot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let slot = self.to_addr_slot();
         write!(
             f,
-            "0x{:08x} -- 0x{:08x} ({:>10} B)",
+            "0x{:08x} -- 0x{:08x} ({:>10} B) ({:>12})",
             self.start.get(),
             self.end.get(),
-            self.to_addr_slot().capacity
+            slot.capacity,
+            bytesize::ByteSize(slot.capacity as u64)
         )
     }
 }
@@ -388,7 +391,7 @@ impl Display for INode {
         writeln!(f, "- Number of Links: {}", self.nlink)?;
         writeln!(f, "- Kind: {:?}", self.kind)?;
         if !matches!(self.kind, INodeKind::Directory) {
-            writeln!(f, "- Size: {} B", self.total_file_size)?;
+            writeln!(f, "- Size: {}", PrettySize(self.total_file_size),)?;
         }
         writeln!(f, "- Creation time: {}", u64_to_utc_datetime(self.ctime))?;
         writeln!(
@@ -966,7 +969,7 @@ impl GroupLayout {
 impl Display for GeometryLayout {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "Geometry Layout (relative):")?;
-        writeln!(f, "  Group Stride:        {} B", self.group_stride)?;
+        writeln!(f, "  Group Stride:        {}", self.group_stride)?;
         writeln!(f, "  INodes per Group:    {}", self.n_inodes_in_group)?;
         writeln!(f, "  Usable Blocks/Group: {}", self.usable_blocks_per_group)?;
         writeln!(f, "  Header Region:       {}", self.rel_header_region)?;
@@ -980,7 +983,11 @@ impl Display for GeometryLayout {
 impl Display for Format {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "Format Configuration:")?;
-        writeln!(f, "  Block Size:       {} B", self.block_size_bytes)?;
+        writeln!(
+            f,
+            "  Block Size:            {}",
+            PrettySize(self.block_size_bytes),
+        )?;
         writeln!(
             f,
             "  Data Blocks per Group: {}",
@@ -992,5 +999,14 @@ impl Display for Format {
             self.param_inode_count_per_group
         )?;
         write!(f, "  Total Groups:     {}", self.group_count)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PrettySize(pub u64);
+
+impl Display for PrettySize {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} B ({})", self.0, bytesize::ByteSize(self.0))
     }
 }

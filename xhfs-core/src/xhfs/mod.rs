@@ -410,8 +410,14 @@ impl XHFS {
 
         let capacity = self.total_capacity()?;
         let rem_capacity = self.total_remaining_capacity().await?;
-        out.push_str(&format!("Capacity:  {capacity:>10} B\n"));
-        out.push_str(&format!("Remaining: {rem_capacity:>10} B\n"));
+        out.push_str(&format!(
+            "Capacity:  {capacity:>15} B ({})\n",
+            bytesize::ByteSize(capacity as u64)
+        ));
+        out.push_str(&format!(
+            "Remaining: {rem_capacity:>15} B ({})\n",
+            bytesize::ByteSize(rem_capacity as u64)
+        ));
         out.push_str(&format!("{}\n", self.static_format));
         out.push_str(&format!("{}\n", self.geometry));
 
@@ -762,10 +768,10 @@ impl XHFS {
         let inp_len = data.len();
         if inp_len >= remaining {
             return Err(XHFSError::from_report(eyre::eyre!(
-                "Insufficient space, input size is {} B, remaining {} B, operation requires {} B more",
-                inp_len,
-                remaining,
-                inp_len.saturating_sub(remaining) + 1
+                "Insufficient space, input size is {}, remaining {}, operation requires {} more",
+                PrettySize(inp_len as u64),
+                PrettySize(remaining as u64),
+                PrettySize((inp_len.saturating_sub(remaining) + 1) as u64)
             )));
         }
 
@@ -925,10 +931,10 @@ impl XHFS {
         let remaining = self.total_remaining_capacity().await?;
         if inp_len >= remaining {
             return Err(XHFSError::from_report(eyre::eyre!(
-                "Insufficient space, input size is {} B, remaining {} B, operation requires {} B more",
-                inp_len,
-                remaining,
-                inp_len.saturating_sub(remaining) + 1
+                "Insufficient space, input size is {}, remaining {}, operation requires {} more",
+                PrettySize(inp_len as u64),
+                PrettySize(remaining as u64),
+                PrettySize((inp_len.saturating_sub(remaining) + 1) as u64)
             )));
         }
 
