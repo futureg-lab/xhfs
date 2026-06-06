@@ -41,6 +41,7 @@ pub struct XHFS {
 #[derive(Debug, Clone, Default)]
 pub struct WriteOption {
     pub overwrite: bool,
+    pub modified: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -328,7 +329,7 @@ impl XHFS {
         })?;
 
         self.ctrl
-            .write(inode_slot.addr.into(), &inode.serialize()?)
+            .write_owned(inode_slot.addr.into(), inode.serialize()?)
             .await?;
         let inode_index_in_group = (inumber - 1) % self.geometry.n_inodes_in_group;
         bitmap.set(inode_index_in_group as usize, true)?;
@@ -385,12 +386,19 @@ impl XHFS {
         Ok(())
     }
 
-    pub async fn update_inode_mtime_now(&self, mut inode: INode) -> eyre::Result<INode> {
-        inode.mtime = utc_now_u64();
+    #[inline]
+    pub async fn update_inode_mtime(&self, mut inode: INode, mtime: u64) -> eyre::Result<INode> {
+        inode.mtime = mtime;
         self.register_inode(&inode, true).await?;
         Ok(inode)
     }
 
+    #[inline]
+    pub async fn update_inode_mtime_now(&self, inode: INode) -> eyre::Result<INode> {
+        self.update_inode_mtime(inode, utc_now_u64()).await
+    }
+
+    #[inline]
     pub async fn increment_inode_nlink(&self, mut inode: INode) -> eyre::Result<()> {
         inode.nlink += 1;
         self.register_inode(&inode, true).await
@@ -404,8 +412,14 @@ impl XHFS {
 
         let capacity = self.total_capacity()?;
         let rem_capacity = self.total_remaining_capacity().await?;
-        out.push_str(&format!("Capacity:  {capacity:>10} B\n"));
-        out.push_str(&format!("Remaining: {rem_capacity:>10} B\n"));
+        out.push_str(&format!(
+            "Capacity:  {capacity:>15} B ({})\n",
+            bytesize::ByteSize(capacity as u64)
+        ));
+        out.push_str(&format!(
+            "Remaining: {rem_capacity:>15} B ({})\n",
+            bytesize::ByteSize(rem_capacity as u64)
+        ));
         out.push_str(&format!("{}\n", self.static_format));
         out.push_str(&format!("{}\n", self.geometry));
 
@@ -756,10 +770,10 @@ impl XHFS {
         let inp_len = data.len();
         if inp_len >= remaining {
             return Err(XHFSError::from_report(eyre::eyre!(
-                "Insufficient space, input size is {} B, remaining {} B, operation requires {} B more",
-                inp_len,
-                remaining,
-                inp_len.saturating_sub(remaining) + 1
+                "Insufficient space, input size is {}, remaining {}, operation requires {} more",
+                PrettySize(inp_len as u64),
+                PrettySize(remaining as u64),
+                PrettySize((inp_len.saturating_sub(remaining) + 1) as u64)
             )));
         }
 
@@ -790,7 +804,11 @@ impl XHFS {
                         let old_extent_addr = inode.extent_addr;
                         inode.total_file_size = data.len() as u64;
                         inode.extent_addr = self.allocate_and_write_extent(data).await?;
-                        self.update_inode_mtime_now(inode).await?;
+                        if let Some(mtime) = opt.modified {
+                            self.update_inode_mtime(inode, mtime).await?;
+                        } else {
+                            self.update_inode_mtime_now(inode).await?;
+                        }
 
                         self.free_full_extent(old_extent_addr).await?;
 
@@ -838,6 +856,7 @@ impl XHFS {
         Ok(())
     }
 
+    #[inline]
     pub async fn fwrite<P: Into<PathBuf>>(
         &self,
         path: P,
@@ -859,7 +878,7 @@ impl XHFS {
         R: AsyncRead + Unpin,
     {
         let path: PathBuf = path.into();
-        self.fwrite(&path, vec![], opt).await?;
+        self.fwrite(&path, vec![], opt.clone()).await?;
         let mut buf = vec![0u8; chunk_size];
         {
             // Handle first chunk so that we have an extent to append to
@@ -869,7 +888,7 @@ impl XHFS {
             if n == 0 {
                 return Ok(());
             }
-            self.fappend(&path, buf[..n].to_vec()).await?;
+            self.fappend(&path, buf[..n].to_vec(), opt.modified).await?;
         }
 
         let mut inode_with_extent = self.resolve_path(&path).await?;
@@ -884,7 +903,7 @@ impl XHFS {
             }
 
             inode_with_extent = self
-                .fappend_inode(inode_with_extent.clone(), buf[..n].to_vec())
+                .fappend_inode(inode_with_extent.clone(), buf[..n].to_vec(), opt.modified)
                 .await?;
         }
         Ok(())
@@ -915,10 +934,10 @@ impl XHFS {
         let remaining = self.total_remaining_capacity().await?;
         if inp_len >= remaining {
             return Err(XHFSError::from_report(eyre::eyre!(
-                "Insufficient space, input size is {} B, remaining {} B, operation requires {} B more",
-                inp_len,
-                remaining,
-                inp_len.saturating_sub(remaining) + 1
+                "Insufficient space, input size is {}, remaining {}, operation requires {} more",
+                PrettySize(inp_len as u64),
+                PrettySize(remaining as u64),
+                PrettySize((inp_len.saturating_sub(remaining) + 1) as u64)
             )));
         }
 
@@ -1143,7 +1162,12 @@ impl XHFS {
         }
     }
 
-    pub async fn fappend_inode(&self, mut inode: INode, data: Vec<u8>) -> Result<INode, XHFSError> {
+    pub async fn fappend_inode(
+        &self,
+        mut inode: INode,
+        data: Vec<u8>,
+        mtime: Option<u64>,
+    ) -> Result<INode, XHFSError> {
         loop {
             match inode.kind {
                 INodeKind::File => {
@@ -1151,7 +1175,11 @@ impl XHFS {
                     inode.extent_addr = self
                         .append_or_allocate_extent(inode.extent_addr, data)
                         .await?;
-                    self.update_inode_mtime_now(inode.clone()).await?;
+                    if let Some(mtime) = mtime {
+                        self.update_inode_mtime(inode.clone(), mtime).await?;
+                    } else {
+                        self.update_inode_mtime_now(inode.clone()).await?;
+                    }
                     return Ok(inode);
                 }
                 INodeKind::Symlink => {
@@ -1177,13 +1205,20 @@ impl XHFS {
         }
     }
 
-    pub async fn fappend<P: Into<PathBuf>>(&self, path: P, data: Vec<u8>) -> Result<(), XHFSError> {
+    #[inline]
+    pub async fn fappend<P: Into<PathBuf>>(
+        &self,
+        path: P,
+        data: Vec<u8>,
+        mtime: Option<u64>,
+    ) -> Result<(), XHFSError> {
         let path: PathBuf = path.into();
         let inode = self.resolve_path(&path).await?;
-        self.fappend_inode(inode, data).await?;
+        self.fappend_inode(inode, data, mtime).await?;
         Ok(())
     }
 
+    #[inline]
     pub async fn exists<P: Into<PathBuf>>(&self, path: P) -> eyre::Result<bool> {
         Ok(self.stats(path, false).await?.is_some())
     }
@@ -1437,9 +1472,9 @@ impl XHFS {
                 data: chunk_data,
             };
             self.ctrl
-                .write(
+                .write_owned(
                     absolute_byte_addr as usize,
-                    &extent
+                    extent
                         .serialize()
                         .map_err(|e| XHFSError::Error { err: e.to_string() })?,
                 )

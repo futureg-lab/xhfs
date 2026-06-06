@@ -34,3 +34,4 @@ tracing-error = { workspace = true }
 tracing-subscriber = { workspace = true }
 url = { workspace = true }
 bytes = { workspace = true }
+bytesize = { workspace = true }

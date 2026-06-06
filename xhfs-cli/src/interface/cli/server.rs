@@ -1,8 +1,6 @@
-use std::sync::Arc;
-
-use clap::{Args, Subcommand};
-
 use crate::{interface::cli::GlobalOptions, servers::webdav::webdav_main};
+use clap::{Args, Subcommand};
+use std::sync::Arc;
 
 #[derive(Args, Debug)]
 pub struct ServerCommands {

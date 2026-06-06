@@ -4,7 +4,7 @@ use clap::{Args, Subcommand};
 use eyre::OptionExt;
 use std::path::{Path, PathBuf};
 use xhfs_core::{
-    utils::{normalize_path, u64_to_utc_datetime},
+    utils::{normalize_path, u64_to_utc_datetime_local},
     xhfs::{WriteOption, XHFS, ds::INodeKind},
 };
 
@@ -134,7 +134,8 @@ impl LsCommand {
                     .await?
                     .ok_or_eyre(format!("Missing stat for {entry}"))?;
 
-                let ctime = u64_to_utc_datetime(stat.ctime);
+                let ctime = u64_to_utc_datetime_local(stat.ctime);
+                let mtime = u64_to_utc_datetime_local(stat.mtime);
 
                 let (kind, size_str) = match stat.kind {
                     INodeKind::File => {
@@ -153,9 +154,10 @@ impl LsCommand {
                 };
 
                 println!(
-                    "{:<8} {:<20} {:>10} {}",
+                    "{:<8} {:<20} {:<20} {:>10} {}",
                     kind,
                     ctime.format("%Y-%m-%d %H:%M:%S"),
+                    mtime.format("%Y-%m-%d %H:%M:%S"),
                     size_str,
                     entry
                 );
@@ -221,6 +223,7 @@ impl CopyCommand {
             &self.dest,
             WriteOption {
                 overwrite: self.overwrite,
+                ..Default::default()
             },
         )
         .await?;
@@ -276,11 +279,11 @@ impl PathCommand {
             println!("Size: {size_str}");
             println!(
                 " Created Time: {}",
-                u64_to_utc_datetime(stat.ctime).format("%Y-%m-%d %H:%M:%S")
+                u64_to_utc_datetime_local(stat.ctime).format("%Y-%m-%d %H:%M:%S")
             );
             println!(
                 " Modified Time: {}",
-                u64_to_utc_datetime(stat.mtime).format("%Y-%m-%d %H:%M:%S")
+                u64_to_utc_datetime_local(stat.mtime).format("%Y-%m-%d %H:%M:%S")
             );
         } else {
             println!("Path {} does not exist", normalize_path(&self.path));
@@ -298,6 +301,7 @@ impl LinkCommand {
                 &self.src_path,
                 WriteOption {
                     overwrite: self.overwrite,
+                    ..Default::default()
                 },
             )
             .await?;
@@ -307,6 +311,7 @@ impl LinkCommand {
                 &self.src_path,
                 WriteOption {
                     overwrite: self.overwrite,
+                    ..Default::default()
                 },
             )
             .await?;

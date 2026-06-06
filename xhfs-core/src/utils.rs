@@ -3,15 +3,23 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-pub fn utc_now_u64() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
+pub fn systime_to_u64(s: SystemTime) -> u64 {
+    s.duration_since(UNIX_EPOCH)
         .expect("Time went backwards")
         .as_secs()
 }
 
+pub fn utc_now_u64() -> u64 {
+    systime_to_u64(SystemTime::now())
+}
+
 pub fn u64_to_utc_datetime(timestamp: u64) -> chrono::DateTime<chrono::Utc> {
     chrono::DateTime::<chrono::Utc>::from_timestamp(timestamp as i64, 0).expect("Invalid timestamp")
+}
+
+pub fn u64_to_utc_datetime_local(timestamp: u64) -> chrono::DateTime<chrono::Local> {
+    let dt_utc = u64_to_utc_datetime(timestamp);
+    dt_utc.with_timezone(&chrono::Local)
 }
 
 pub fn normalize_path<P: Into<PathBuf>>(path: P) -> String {
