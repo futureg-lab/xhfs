@@ -55,18 +55,25 @@ impl Controller {
         None
     }
 
-    pub async fn write(&self, logical_addr: usize, data: &[u8]) -> eyre::Result<()> {
-        let data = self.encrypt_apply(logical_addr, data.to_vec());
+    #[inline]
+    pub async fn write_owned(&self, logical_addr: usize, data: Vec<u8>) -> eyre::Result<()> {
+        let data = self.encrypt_apply(logical_addr, data);
         self.raw_write(logical_addr, &data).await
     }
 
+    #[inline]
+    pub async fn write(&self, logical_addr: usize, data: &[u8]) -> eyre::Result<()> {
+        self.write_owned(logical_addr, data.to_vec()).await
+    }
+
+    #[inline]
     pub async fn read(&self, logical_addr: usize, size: usize) -> eyre::Result<Vec<u8>> {
         let data = self.raw_read(logical_addr, size).await?;
         Ok(self.encrypt_apply(logical_addr, data))
     }
 
     pub async fn raw_write(&self, mut logical_addr: usize, data: &[u8]) -> eyre::Result<()> {
-        tracing::debug!(" Writting {} bytes at 0x{:x}", data.len(), logical_addr);
+        tracing::debug!(" Writing {} bytes at 0x{:x}", data.len(), logical_addr);
         let mut plan = vec![];
         let mut remaining = data;
         while !remaining.is_empty() {
@@ -79,13 +86,13 @@ impl Controller {
             };
             let local_offset = logical_addr - pinned.start;
             let max_len = (pinned.end - logical_addr).min(remaining.len());
-            plan.push((&pinned.device, local_offset, remaining[..max_len].to_vec()));
+            plan.push((&pinned.device, local_offset, &remaining[..max_len]));
             logical_addr += max_len;
             remaining = &remaining[max_len..];
         }
 
         for (dev, offset, chunk) in plan {
-            dev.write(offset, &chunk).await?;
+            dev.write(offset, chunk).await?;
         }
 
         Ok(())

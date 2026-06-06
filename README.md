@@ -5,10 +5,10 @@ anywhere, on anything, across an arbitrary combination of arbitrary devices.
 
 # Concept
 
-Fundamentally, any writable, readable, and seekable entity can be used as a
-storage device, whether or not it was built for such an operation: be it a file
-on disk, a remote Key-Value store (Redis, Cloudflare KV), or hell, even a
-database.
+Fundamentally, any writable, readable, and seekable abstract device block can be
+used as a storage device, whether or not it was built for such an operation: be
+it a file on disk, a remote Key-Value store (Redis, Cloudflare KV), or heck,
+even a database.
 
 XHFS makes no assumptions about what the underlying "device" actually is; in
 fact, it remains entirely agnostic as long as you provide a way to read/write to
@@ -90,7 +90,11 @@ xhfs download test.txt my_physical_copy.txt
 # Installation
 
 Download the binary from the
-[release](https://github.com/futureg-lab/xhfs/releases).
+[releases](https://github.com/futureg-lab/xhfs/releases) or install using cargo.
+
+```bash
+cargo install xhfs
+```
 
 ## Environment variables
 

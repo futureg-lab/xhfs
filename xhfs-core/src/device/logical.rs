@@ -55,10 +55,6 @@ impl LogicalDevice {
     }
 
     pub async fn write(&self, addr: usize, data: &[u8]) -> eyre::Result<()> {
-        // TODO:
-        // each logical device should the events
-        // and retry entries that has failed to write
-        // it should display user friendly logs outlining which backend fails
         stream::iter(
             self.replica
                 .iter()

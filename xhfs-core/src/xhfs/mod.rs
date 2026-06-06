@@ -329,7 +329,7 @@ impl XHFS {
         })?;
 
         self.ctrl
-            .write(inode_slot.addr.into(), &inode.serialize()?)
+            .write_owned(inode_slot.addr.into(), inode.serialize()?)
             .await?;
         let inode_index_in_group = (inumber - 1) % self.geometry.n_inodes_in_group;
         bitmap.set(inode_index_in_group as usize, true)?;
@@ -1472,9 +1472,9 @@ impl XHFS {
                 data: chunk_data,
             };
             self.ctrl
-                .write(
+                .write_owned(
                     absolute_byte_addr as usize,
-                    &extent
+                    extent
                         .serialize()
                         .map_err(|e| XHFSError::Error { err: e.to_string() })?,
                 )
