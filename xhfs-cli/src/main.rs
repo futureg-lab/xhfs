@@ -10,6 +10,8 @@ mod tests;
 
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
+    dotenv::dotenv().ok();
+
     let env_filter = EnvFilter::try_from_default_env()
         .or_else(|_| EnvFilter::try_new("xhfs=ERROR"))
         .unwrap();
@@ -18,8 +20,6 @@ async fn main() -> eyre::Result<()> {
         .with_env_filter(env_filter)
         .without_time()
         .init();
-
-    dotenv::dotenv().ok();
 
     MainCommand::parse().run().await
 }

@@ -1,9 +1,7 @@
-use std::{collections::HashMap, sync::Arc};
-
-use async_trait::async_trait;
-use tokio::sync::RwLock;
-
 use crate::device::{Device, KeyValue};
+use async_trait::async_trait;
+use std::{collections::HashMap, sync::Arc};
+use tokio::sync::RwLock;
 
 pub struct MemoryKV(pub RwLock<HashMap<u64, Vec<u8>>>);
 

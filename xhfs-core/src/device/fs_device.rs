@@ -39,7 +39,7 @@ impl FsDevice {
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                tracing::warn!("Creating new file {path:?}");
+                tracing::warn!(error = ?e, "Creating new file {path:?}");
                 fs::write(&path, vec![0u8; size])
                     .await
                     .map_err(|e| eyre::eyre!(e))?;

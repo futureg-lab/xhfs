@@ -55,36 +55,41 @@ impl LogicalDevice {
     }
 
     pub async fn write(&self, addr: usize, data: &[u8]) -> eyre::Result<()> {
-        stream::iter(
+        let mut results = stream::iter(
             self.replica
                 .iter()
                 .cloned()
                 .map(|device| async move { device.write(addr, data).await }),
         )
-        .buffer_unordered(self.max_concurrent)
-        .try_collect::<()>()
-        .await
+        .buffer_unordered(self.max_concurrent);
+
+        let mut total_replicas = 0;
+        let mut failed_replicas = 0;
+        while let Some(result) = results.next().await {
+            total_replicas += 1;
+            if let Err(e) = result {
+                failed_replicas += 1;
+                tracing::warn!(error = ?e, "Failed to write to device replica #{total_replicas}");
+            }
+        }
+        if total_replicas > 0 && failed_replicas == total_replicas {
+            eyre::bail!("All {total_replicas} replicas failed to write");
+        }
+
+        Ok(())
     }
 
     pub async fn read(&self, addr: usize, size: usize) -> eyre::Result<Vec<u8>> {
-        let mut tasks = futures::stream::FuturesUnordered::new();
-        for replica in self.replica.clone() {
-            tasks.push(async move { replica.read(addr, size).await });
-        }
         let mut errors = vec![];
-        while let Some(result) = tasks.next().await {
-            match result {
+        for (i, replica) in self.replica.iter().enumerate() {
+            match replica.read(addr, size).await {
                 Ok(data) => return Ok(data),
-                Err(err) => errors.push(err),
+                Err(e) => {
+                    tracing::warn!(error = ?e, "Failed to reading device replica #{}", i + 1);
+                    errors.push(format!("Failing device read #{}: {:#}", i + 1, e))
+                }
             }
         }
-
-        eyre::bail!(
-            errors
-                .into_iter()
-                .map(|e| format!("{e:#}"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        )
+        eyre::bail!(errors.join("\n"))
     }
 }

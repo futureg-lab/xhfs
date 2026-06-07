@@ -122,7 +122,7 @@ impl DavFile for XHFSFile {
             let start = self.offset;
             let end = start + count as u64;
             let data = xhfs.fseek(&path, start, end).await.map_err(|e| {
-                tracing::error!("Read failed: {e:?}");
+                tracing::error!("Read failed: {e:#}");
                 FsError::GeneralFailure
             })?;
             self.offset += data.len() as u64;
@@ -169,7 +169,7 @@ impl DavFile for XHFSFile {
                 Ok(Some(stat)) => Ok(Box::new(XHFSMetaData(stat)) as Box<dyn DavMetaData>),
                 Ok(None) => Err(FsError::NotFound),
                 Err(err) => {
-                    tracing::error!("File metadata fetch failed: {err:?}");
+                    tracing::error!("File metadata fetch failed: {err:#}");
                     Err(FsError::GeneralFailure)
                 }
             }
@@ -293,8 +293,8 @@ impl GuardedFileSystem<()> for XHFSAdapter {
                     tracing::warn!("File not found {path_buf:?}");
                     Err(FsError::NotFound)
                 }
-                Err(err) => {
-                    tracing::error!("Metadata lookup failed {path_buf:?}: {err:?}");
+                Err(e) => {
+                    tracing::error!(error = ?e, "Metadata lookup failed {path_buf:?}");
                     Err(FsError::GeneralFailure)
                 }
             }
@@ -318,7 +318,7 @@ impl GuardedFileSystem<()> for XHFSAdapter {
                 }
                 Ok(None) => Err(FsError::NotFound),
                 Err(e) => {
-                    tracing::error!("Backend metadata lookup failure: {e:?}");
+                    tracing::error!("Backend metadata lookup failure: {e:#}");
                     Err(FsError::GeneralFailure)
                 }
             }
@@ -342,7 +342,7 @@ impl GuardedFileSystem<()> for XHFSAdapter {
                 return Err(FsError::NotFound);
             }
             let item_names = xhfs.ls(path_buf.clone()).await.map_err(|e| {
-                tracing::error!("Failed listing path collection targets: {e:?}");
+                tracing::error!(error = ?e, "Failed listing path collection targets");
                 FsError::NotFound
             })?;
 
@@ -376,8 +376,8 @@ impl GuardedFileSystem<()> for XHFSAdapter {
         let xhfs = self.xhfs.clone();
         let path_buf = path.as_pathbuf();
         async move {
-            xhfs.mkdir(path_buf, true).await.map_err(|err| {
-                tracing::error!("mkdir failed: {err:?}");
+            xhfs.mkdir(&path_buf, true).await.map_err(|e| {
+                tracing::error!(error = ?e, "mkdir failed for path {path_buf:?}");
                 FsError::GeneralFailure
             })?;
             Ok(())
@@ -393,8 +393,8 @@ impl GuardedFileSystem<()> for XHFSAdapter {
         async move {
             // TODO: native recursive
             // The default implementation is using a combination of ls and unlink
-            xhfs.unlink(path_buf).await.map_err(|e| {
-                tracing::error!("unlink folder failed: {e:?}");
+            xhfs.unlink(&path_buf).await.map_err(|e| {
+                tracing::error!(error = ?e, "unlink folder failed for path {path_buf:?}");
                 FsError::GeneralFailure
             })?;
             Ok(())
@@ -407,8 +407,8 @@ impl GuardedFileSystem<()> for XHFSAdapter {
         let xhfs = self.xhfs.clone();
         let path_buf = path.as_pathbuf();
         async move {
-            xhfs.unlink(path_buf).await.map_err(|e| {
-                tracing::error!("unlink file failed: {e:?}");
+            xhfs.unlink(&path_buf).await.map_err(|e| {
+                tracing::error!(error = ?e, "unlink file failed for path {path_buf:?}");
                 FsError::GeneralFailure
             })?;
             Ok(())
@@ -428,7 +428,7 @@ impl GuardedFileSystem<()> for XHFSAdapter {
         let to_path_buf = to.as_pathbuf();
         async move {
             xhfs.fmove(from_path_buf, to_path_buf).await.map_err(|e| {
-                tracing::error!("fmove failed: {e:?}");
+                tracing::error!("fmove failed: {e:#}");
                 FsError::GeneralFailure
             })?;
             Ok(())
@@ -502,11 +502,11 @@ impl GuardedFileSystem<()> for XHFSAdapter {
         let xhfs = self.xhfs.clone();
         async move {
             let total_capacity = xhfs.total_capacity().map_err(|e| {
-                tracing::error!("Failed listing path collection targets: {e:?}");
+                tracing::error!("Failed listing path collection targets: {e:#}");
                 FsError::NotFound
             })?;
             let remaining = xhfs.total_remaining_capacity().await.map_err(|e| {
-                tracing::error!("Failed calculating capacity: {e:?}");
+                tracing::error!("Failed calculating capacity: {e:#}");
                 FsError::NotFound
             })?;
             Ok((total_capacity as u64, Some(remaining as u64)))
@@ -556,7 +556,7 @@ pub async fn webdav_main(
                 )
                 .await
             {
-                eprintln!("Error executing HTTP session processing context: {err:?}");
+                eprintln!("Error executing HTTP session processing context: {err:#}");
             }
         });
     }
