@@ -55,6 +55,9 @@ devices:
 configuration:
   logical:
     - name: dev1
+      # The data will be replicated accross these block devices.
+      # The first block device will be the main block for reads
+      # and we can swap the order if we suspect corruption
       include: [blob1, blob2]
       capacity: "50 MiB"
       max_concurrent: 2
@@ -78,9 +81,9 @@ echo "Hello World" > thething.txt
 xhfs upload thething.txt /test.txt
 
 xhfs x ls -v
-# FILE 2026-05-14 16:49:49        28 B test.txt
+# FILE     2026-06-07 12:58:47  2026-06-07 12:58:33        28 B test.txt
 
-xhfs x read test.txt | echo
+xhfs read test.txt | echo
 # Hello World
 
 # You can also import stored files like this..
@@ -145,22 +148,24 @@ The `info` command will show you the general layout of what constitutes your
 storage, this includes the remaining usable space and metadata layout.
 
 ```
+Config loaded: xhfs.yaml
 XHFS version: 1
-Capacity:     4194304 B
-Remaining:    3790848 B
+Capacity:        104857600 B (100.0 MiB)
+Remaining:        83886080 B (80.0 MiB)
 Format Configuration:
-  Block Size:       1024 B
-  Blocks per Group: 4096
+  Block Size:            4096 B (4.0 KiB)
+  Data Blocks per Group: 20480
+  INode count per Group: 4096
   Total Groups:     1
 Geometry Layout (relative):
-  Group Stride:        4194304 B
-  Inodes per Group:    8192
-  Usable Blocks/Group: 3702
-  Header Region:       0x00000000 -- 0x00000028 (        41 B)
-  Data Bitmap Region:  0x00000029 -- 0x00000230 (       520 B)
-  INode Bitmap Region: 0x00000231 -- 0x00000638 (      1032 B)
-  INode Table Region:  0x00000639 -- 0x00062638 (    401408 B)
-  Data Payload Region: 0x00062639 -- 0x003ffe38 (   3790848 B)
+  Group Stride:        84221025
+  INodes per Group:    4096
+  Usable Blocks/Group: 20480
+  Header Region:       0x00000000 -- 0x00000050 (        81 B) (        81 B)
+  Data Bitmap Region:  0x00000051 -- 0x00000a58 (      2568 B) (     2.5 KiB)
+  INode Bitmap Region: 0x00000a59 -- 0x00000c60 (       520 B) (       520 B)
+  INode Table Region:  0x00000c61 -- 0x00051c60 (    331776 B) (   324.0 KiB)
+  Data Payload Region: 0x00051c61 -- 0x05051c60 (  83886080 B) (    80.0 MiB)
 ```
 
 ## INode metadata

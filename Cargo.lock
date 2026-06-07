@@ -2885,7 +2885,7 @@ dependencies = [
 
 [[package]]
 name = "xhfs"
-version = "0.4.0"
+version = "0.4.5"
 dependencies = [
  "async-recursion",
  "async-stream",
@@ -2913,7 +2913,7 @@ dependencies = [
 
 [[package]]
 name = "xhfs-core"
-version = "0.4.0"
+version = "0.4.5"
 dependencies = [
  "async-stream",
  "async-trait",
