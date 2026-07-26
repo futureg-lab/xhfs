@@ -23,10 +23,11 @@ mod argon2_params {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(tag = "algorithm")]
 pub enum KeyDerivation {
     #[serde(rename = "sha256")]
+    #[default]
     Sha256,
     #[serde(rename = "argon2")]
     Argon2 {
@@ -37,12 +38,6 @@ pub enum KeyDerivation {
         #[serde(default = "argon2_params::default_parallelism")]
         parallelism: u32,
     },
-}
-
-impl Default for KeyDerivation {
-    fn default() -> Self {
-        Self::Sha256
-    }
 }
 
 #[derive(Clone)]

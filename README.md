@@ -42,6 +42,8 @@ Consider the following configuration:
 # Encrypt the drive
 # or use the cli with --password helloworld if the config and bins are made public
 password: helloworld
+key_derivation:
+  algorithm: argon2 # or sha256
 devices:
   - type: file
     name: blob1

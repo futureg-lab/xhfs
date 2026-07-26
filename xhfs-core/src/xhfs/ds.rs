@@ -399,9 +399,9 @@ impl Display for INode {
             "- Modification time: {}",
             u64_to_utc_datetime(self.mtime)
         )?;
-        write!(
+        writeln!(
             f,
-            "- Immediate Extent address: {} (0x{:08x})\n",
+            "- Immediate Extent address: {} (0x{:08x})",
             self.extent_addr.get(),
             self.extent_addr.get()
         )
@@ -490,8 +490,8 @@ impl Symlink {
     }
 
     pub fn deserialize(data: &[u8]) -> eyre::Result<Self> {
-        let path = String::from_utf8(data.try_into()?)
-            .wrap_err_with(|| eyre::eyre!("Parsing Symlink path"))?;
+        let path =
+            String::from_utf8(data.into()).wrap_err_with(|| eyre::eyre!("Parsing Symlink path"))?;
         Ok(Self {
             path: PathBuf::from(path),
         })
@@ -708,9 +708,7 @@ impl Bitmap {
                     word &= mask;
                 }
             }
-            let valid_bits = if byte_index < full_bytes {
-                8
-            } else if rem_bits == 0 {
+            let valid_bits = if byte_index < full_bytes || rem_bits == 0 {
                 8
             } else {
                 rem_bits
@@ -865,8 +863,8 @@ impl Format {
         let data_block_count = data_block_count.min(max_bits_per_block).max(1);
         let inode_count = inode_count.min(max_bits_per_block).max(1);
         let header_bytes = XHFSHeader::serialized_size() as u64;
-        let data_bitmap_bytes = ((data_block_count + 8 - 1) / 8).max(1);
-        let inode_bitmap_bytes = ((inode_count + 8 - 1) / 8).max(1);
+        let data_bitmap_bytes = data_block_count.div_ceil(8);
+        let inode_bitmap_bytes = inode_count.div_ceil(8);
         let inode_table_bytes = inode_count * INode::serialized_size() as u64;
         let data_blocks_bytes = data_block_count * block_size_bytes;
 

@@ -158,7 +158,7 @@ impl InspectSubcommands {
                 let xhfs = v.global.get_xhfs().await?;
                 let header = xhfs.get_header().await?;
                 let (g, _) = header.calculate_relative_geometry()?;
-                let start_idx = v.start_group.saturating_sub(1).max(0);
+                let start_idx = v.start_group.saturating_sub(1);
                 let end_idx = v
                     .end_group
                     .saturating_sub(1)
@@ -174,10 +174,7 @@ impl InspectSubcommands {
                     let inode_bitmap = {
                         let region = g.rel_inode_bitmap_region.add_offset(offset);
                         let slot = region.to_addr_slot();
-                        let data = xhfs
-                            .ctrl
-                            .raw_read(slot.addr.into(), slot.capacity as usize)
-                            .await?;
+                        let data = xhfs.ctrl.raw_read(slot.addr.into(), slot.capacity).await?;
                         Bitmap::deserialize(&data)?
                     };
                     print_bitmap(&inode_bitmap, v.columns, v.global.verbose);
@@ -186,10 +183,7 @@ impl InspectSubcommands {
                     let data_bitmap = {
                         let region = g.rel_data_bitmap_region.add_offset(offset);
                         let slot = region.to_addr_slot();
-                        let data = xhfs
-                            .ctrl
-                            .raw_read(slot.addr.into(), slot.capacity as usize)
-                            .await?;
+                        let data = xhfs.ctrl.raw_read(slot.addr.into(), slot.capacity).await?;
                         Bitmap::deserialize(&data)?
                     };
                     print_bitmap(&data_bitmap, v.columns, v.global.verbose);

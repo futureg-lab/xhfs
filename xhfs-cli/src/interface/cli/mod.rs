@@ -20,7 +20,7 @@ use tokio::{
 use xhfs_core::{
     device::{ConcreteDevice, disk::Controller, kv_device::*, logical::LogicalDevice},
     utils::systime_to_u64,
-    xhfs::{crypto::KeyDerivation, *},
+    xhfs::{crypto::KeyDerivation, ds::PrettySize, *},
 };
 
 mod inspect;
@@ -139,7 +139,7 @@ impl MainCommand {
             Commands::Format(global_options) => {
                 if global_options.force || confirm_destructive_action() {
                     let xhfs = global_options.format_and_get_xhfs().await?;
-                    println!("Formatted {} Bytes", xhfs.total_capacity()?);
+                    println!("Formatted {}", PrettySize(xhfs.total_capacity()? as u64));
                 } else {
                     println!("abort");
                 }
@@ -316,10 +316,7 @@ fn confirm_destructive_action() -> bool {
         .read_line(&mut input)
         .expect("Failed to read line");
 
-    match input.trim().to_lowercase().as_str() {
-        "y" | "yes" => true,
-        _ => false,
-    }
+    matches!(input.trim().to_lowercase().as_str(), "y" | "yes")
 }
 
 async fn create_simple_memory_xhfs(
@@ -328,7 +325,7 @@ async fn create_simple_memory_xhfs(
     logical_count: usize,
 ) -> eyre::Result<XHFS> {
     let slot_capacity = 1024;
-    if unit_capacity % slot_capacity != 0 {
+    if !unit_capacity.is_multiple_of(slot_capacity) {
         eyre::bail!("In-memory capacity must be divisible by {slot_capacity}");
     }
 

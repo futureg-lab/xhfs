@@ -70,7 +70,7 @@ impl XHFS {
         kd: KeyDerivation,
     ) -> eyre::Result<Self> {
         let header_size = XHFSHeader::template().serialize()?.len();
-        let mut bfs = Self {
+        let mut xhfs = Self {
             header_size,
             ctrl,
             alloc_guard: Mutex::new(()),
@@ -83,19 +83,19 @@ impl XHFS {
             geometry: Default::default(),
         };
 
-        let header = bfs.get_header().await?;
+        let header = xhfs.get_header().await?;
 
-        bfs.geometry = header.calculate_relative_geometry()?.0;
+        xhfs.geometry = header.calculate_relative_geometry()?.0;
         let nonce = header.chacha20_nonce;
-        bfs.static_format = header.format;
-        bfs.static_format.validate()?;
+        xhfs.static_format = header.format;
+        xhfs.static_format.validate()?;
 
         if let Some(password) = password {
-            bfs.ctrl.setup_crypto(Crypto::new(&password, nonce, &kd));
+            xhfs.ctrl.setup_crypto(Crypto::new(&password, nonce, &kd));
         }
-        bfs.ensure_headers().await?;
+        xhfs.ensure_headers().await?;
 
-        Ok(bfs)
+        Ok(xhfs)
     }
 
     pub async fn format_new(
@@ -148,9 +148,9 @@ impl XHFS {
             offset += g.group_stride as usize;
         }
 
-        let bfs = Self::from_formatted(ctrl, password, kd).await?;
+        let xhfs = Self::from_formatted(ctrl, password, kd).await?;
 
-        bfs.register_inode(
+        xhfs.register_inode(
             &INode {
                 kind: INodeKind::Directory,
                 inumber: 1,
@@ -165,7 +165,7 @@ impl XHFS {
         )
         .await?;
 
-        Ok(bfs)
+        Ok(xhfs)
     }
 
     pub fn resolve_inode_addr(&self, inumber: u64) -> Option<AddressSlot> {
@@ -449,7 +449,6 @@ impl XHFS {
     }
 
     pub async fn update_header(&self, header: XHFSHeader) -> eyre::Result<()> {
-        let header = header;
         self.ctrl.raw_write(0, &header.serialize()?).await
     }
 
@@ -1400,13 +1399,13 @@ impl XHFS {
             .await?;
         let mut bitmap = Bitmap::deserialize(&raw_bitmap)?;
 
-        let block_size = self.static_format.block_size_bytes as u64;
+        let block_size = self.static_format.block_size_bytes;
         let block_start = (addr - group.data_region.start.get()) / block_size;
         // make trailing partial block fully freed
-        let calculated_blocks = (size as u64 + block_size - 1) / block_size;
+        let calculated_blocks = (size as u64).div_ceil(block_size);
         let blocks_count = calculated_blocks.max(1);
         // ensure we don't spil past this group's legal bitmap bounds
-        let max_blocks = self.geometry.usable_blocks_per_group as u64;
+        let max_blocks = self.geometry.usable_blocks_per_group;
         if block_start + blocks_count > max_blocks {
             eyre::bail!(
                 "Bitmap boundary violation in group! Trying to free blocks {}..{} but max is {}",
@@ -1444,7 +1443,7 @@ impl XHFS {
             let max_payload_per_slot = max_slot_bytes - metadata_overhead;
             let chunk_size = std::cmp::min(remaining_payload, max_payload_per_slot);
             let extent_bytes = Extent::emulate_serialized_size(chunk_size);
-            let blocks_for_chunk = (extent_bytes + block_size - 1) / block_size;
+            let blocks_for_chunk = extent_bytes.div_ceil(block_size);
 
             exact_blocks_needed += blocks_for_chunk;
             remaining_payload -= chunk_size;
@@ -1619,8 +1618,9 @@ impl XHFS {
         let curr_extent_data_size = u64::from_le_bytes(extent_header[0..8].try_into()?);
         let next_extent = MaybeU64::from(u64::from_le_bytes(extent_header[8..16].try_into()?));
         let raw_footprint = 16 + curr_extent_data_size as u64;
-        let block_size = self.static_format.block_size_bytes as u64;
-        let aligned_capacity = ((raw_footprint + block_size - 1) / block_size) * block_size;
+        let block_size = self.static_format.block_size_bytes;
+        // let aligned_capacity = ((raw_footprint + block_size - 1) / block_size) * block_size;
+        let aligned_capacity = raw_footprint.div_ceil(block_size) * block_size;
 
         Ok(ExtentMetadata {
             full_aligned_region: RegionSlot {
@@ -1648,7 +1648,7 @@ impl XHFS {
         let max = stop.unwrap_or(u32::MAX);
         let mut i = 1;
         while let Some(next_addr) = addr.to_optional() {
-            if i - 1 >= max {
+            if i > max {
                 break;
             }
             tracing::debug!("Resolving {i}-th extent metadata 0x{next_addr:x}");
@@ -1718,9 +1718,5 @@ pub fn into_reader<S>(stream: S) -> impl AsyncRead + Unpin
 where
     S: Stream<Item = Result<Vec<u8>, XHFSError>> + Unpin,
 {
-    StreamReader::new(stream.map(|chunk| {
-        chunk
-            .map(Bytes::from)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
-    }))
+    StreamReader::new(stream.map(|chunk| chunk.map(Bytes::from).map_err(io::Error::other)))
 }

@@ -29,9 +29,9 @@ impl From<usize> for MaybeU64 {
     }
 }
 
-impl Into<usize> for MaybeU64 {
-    fn into(self) -> usize {
-        self.get() as usize
+impl From<MaybeU64> for usize {
+    fn from(val: MaybeU64) -> Self {
+        val.get() as usize
     }
 }
 
@@ -80,7 +80,7 @@ impl MaybeU64 {
     }
 
     pub fn deserialize(data: [u8; 8]) -> Self {
-        let addr = u64::from_le_bytes(data).try_into().unwrap();
+        let addr = u64::from_le_bytes(data);
         Self {
             inner: match addr {
                 0 => AddrKind::None,

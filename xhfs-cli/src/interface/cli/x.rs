@@ -187,28 +187,28 @@ impl LsCommand {
             let stat = xhfs.stats(&full_path, self.recursive).await?;
 
             let mut info = String::new();
-            if self.global.verbose {
-                if let Some(ref s) = stat {
-                    let size = if matches!(s.kind, INodeKind::Directory) {
-                        "-".to_string()
-                    } else {
-                        bytesize::ByteSize(s.size.unwrap_or(0) as u64).to_string()
-                    };
-                    info = format!(
-                        " [{:<4} {:>8}]",
-                        format!("{:?}", s.kind).to_uppercase(),
-                        size
-                    );
-                }
+            if self.global.verbose
+                && let Some(ref s) = stat
+            {
+                let size = if matches!(s.kind, INodeKind::Directory) {
+                    "-".to_string()
+                } else {
+                    bytesize::ByteSize(s.size.unwrap_or(0) as u64).to_string()
+                };
+                info = format!(
+                    " [{:<4} {:>8}]",
+                    format!("{:?}", s.kind).to_uppercase(),
+                    size
+                );
             }
 
             println!("{}{}{}{}", prefix, connector, entry, info);
 
-            if let Some(s) = stat {
-                if matches!(s.kind, INodeKind::Directory) {
-                    let new_prefix = format!("{}{}", prefix, if is_last { "    " } else { "│   " });
-                    self.print_tree(xhfs, &full_path, &new_prefix).await?;
-                }
+            if let Some(s) = stat
+                && matches!(s.kind, INodeKind::Directory)
+            {
+                let new_prefix = format!("{}{}", prefix, if is_last { "    " } else { "│   " });
+                self.print_tree(xhfs, &full_path, &new_prefix).await?;
             }
         }
         Ok(())
