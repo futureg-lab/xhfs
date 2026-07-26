@@ -1,5 +1,10 @@
 # You can use --password if the config and bins are made public
 password: helloworld
+# key_derivation:
+#   algorithm: argon2     # default: sha256
+#   memory_cost: 65536    # default: 65536
+#   time_cost: 3          # default: 3
+#   parallelism: 4        # default: 4
 devices:
   - type: kvhttp
     name: blob1

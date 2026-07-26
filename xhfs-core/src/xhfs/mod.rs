@@ -1,7 +1,11 @@
 use crate::{
     device::disk::Controller,
     utils::*,
-    xhfs::{addr::MaybeU64, crypto::Crypto, ds::*},
+    xhfs::{
+        addr::MaybeU64,
+        crypto::{Crypto, KeyDerivation},
+        ds::*,
+    },
 };
 use async_stream::try_stream;
 use bytes::Bytes;
@@ -60,7 +64,11 @@ pub struct AllocationSlot {
 }
 
 impl XHFS {
-    pub async fn from_formatted(ctrl: Controller, password: Option<String>) -> eyre::Result<Self> {
+    pub async fn from_formatted(
+        ctrl: Controller,
+        password: Option<String>,
+        kd: KeyDerivation,
+    ) -> eyre::Result<Self> {
         let header_size = XHFSHeader::template().serialize()?.len();
         let mut bfs = Self {
             header_size,
@@ -78,23 +86,27 @@ impl XHFS {
         let header = bfs.get_header().await?;
 
         bfs.geometry = header.calculate_relative_geometry()?.0;
+        let nonce = header.chacha20_nonce;
         bfs.static_format = header.format;
         bfs.static_format.validate()?;
 
         if let Some(password) = password {
-            bfs.ctrl
-                .setup_crypto(Crypto::new(&password, header.chacha20_nonce));
+            bfs.ctrl.setup_crypto(Crypto::new(&password, nonce, &kd));
         }
         bfs.ensure_headers().await?;
 
         Ok(bfs)
     }
 
-    pub async fn format_new(mut ctrl: Controller, password: Option<String>) -> eyre::Result<Self> {
+    pub async fn format_new(
+        mut ctrl: Controller,
+        password: Option<String>,
+        kd: KeyDerivation,
+    ) -> eyre::Result<Self> {
         let mut header = XHFSHeader::template();
         header.chacha20_nonce = Crypto::gen_nonce();
         if let Some(password) = &password {
-            ctrl.setup_crypto(Crypto::new(password, header.chacha20_nonce));
+            ctrl.setup_crypto(Crypto::new(password, header.chacha20_nonce, &kd));
         }
 
         let total_capacity = ctrl
@@ -136,7 +148,7 @@ impl XHFS {
             offset += g.group_stride as usize;
         }
 
-        let bfs = Self::from_formatted(ctrl, password).await?;
+        let bfs = Self::from_formatted(ctrl, password, kd).await?;
 
         bfs.register_inode(
             &INode {

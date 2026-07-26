@@ -3,7 +3,47 @@ use chacha20::{
     cipher::{KeyIvInit, StreamCipher, StreamCipherSeek},
 };
 use rand::Rng;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+mod argon2_params {
+    #[inline(always)]
+    pub const fn default_memory_cost() -> u32 {
+        65536
+    }
+
+    #[inline(always)]
+    pub const fn default_time_cost() -> u32 {
+        3
+    }
+
+    #[inline(always)]
+    pub const fn default_parallelism() -> u32 {
+        4
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "algorithm")]
+pub enum KeyDerivation {
+    #[serde(rename = "sha256")]
+    Sha256,
+    #[serde(rename = "argon2")]
+    Argon2 {
+        #[serde(default = "argon2_params::default_memory_cost")]
+        memory_cost: u32,
+        #[serde(default = "argon2_params::default_time_cost")]
+        time_cost: u32,
+        #[serde(default = "argon2_params::default_parallelism")]
+        parallelism: u32,
+    },
+}
+
+impl Default for KeyDerivation {
+    fn default() -> Self {
+        Self::Sha256
+    }
+}
 
 #[derive(Clone)]
 pub struct Crypto {
@@ -14,10 +54,29 @@ pub struct Crypto {
 }
 
 impl Crypto {
-    pub fn new(password: &str, nonce: [u8; 12]) -> Self {
-        let hash = Sha256::digest(password.as_bytes());
-        let mut key = [0u8; 32];
-        key.copy_from_slice(&hash);
+    pub fn new(password: &str, nonce: [u8; 12], kd: &KeyDerivation) -> Self {
+        let key = match kd {
+            KeyDerivation::Sha256 => {
+                let hash = Sha256::digest(password.as_bytes());
+                let mut key = [0u8; 32];
+                key.copy_from_slice(&hash);
+                key
+            }
+            KeyDerivation::Argon2 {
+                memory_cost,
+                time_cost,
+                parallelism,
+            } => {
+                let mut key = [0u8; 32];
+                let params = argon2::Params::new(*memory_cost, *time_cost, *parallelism, Some(32))
+                    .expect("invalid argon2 params");
+                argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params)
+                    .hash_password_into(password.as_bytes(), &nonce, &mut key)
+                    .expect("argon2 hash failed");
+                key
+            }
+        };
+
         Self { key, nonce }
     }
 

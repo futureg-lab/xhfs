@@ -20,7 +20,7 @@ use tokio::{
 use xhfs_core::{
     device::{ConcreteDevice, disk::Controller, kv_device::*, logical::LogicalDevice},
     utils::systime_to_u64,
-    xhfs::*,
+    xhfs::{crypto::KeyDerivation, *},
 };
 
 mod inspect;
@@ -348,5 +348,5 @@ async fn create_simple_memory_xhfs(
     }
 
     let ctrl = Controller::from(logical_devices).await?;
-    XHFS::format_new(ctrl, None).await
+    XHFS::format_new(ctrl, None, KeyDerivation::default()).await
 }

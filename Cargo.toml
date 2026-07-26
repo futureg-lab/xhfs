@@ -30,9 +30,10 @@ async-trait = "0.1.89"
 bitvec = "1.0.1"
 bytesize = "2.3.1"
 chacha20 = "0.10.0"
+argon2 = "0.5"
+rand = "0.10.1"
 chrono = "0.4.44"
 eyre = "0.6.12"
-rand = "0.10.1"
 reqwest = "0.13.3"
 
 serde = {version = "1.0.228", features = ["derive"]}

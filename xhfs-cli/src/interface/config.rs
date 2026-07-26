@@ -15,12 +15,14 @@ use xhfs_core::{
         logical::*,
     },
     utils::normalize_path,
-    xhfs::*,
+    xhfs::{crypto::KeyDerivation, *},
 };
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Config {
     pub password: Option<String>,
+    #[serde(default)]
+    pub key_derivation: KeyDerivation,
     pub devices: Vec<DeviceConfig>,
     pub configuration: Configuration,
 }
@@ -85,6 +87,8 @@ impl Config {
     pub fn example() -> eyre::Result<Self> {
         let text = r#"
 password: helloworld
+# key_derivation:
+#   algorithm: argon2     # default: sha256
 devices:
   - type: file
     name: blob1
@@ -254,9 +258,9 @@ configuration:
             self.password.clone()
         };
         if format_new {
-            XHFS::format_new(ctrl, password).await
+            XHFS::format_new(ctrl, password, self.key_derivation.clone()).await
         } else {
-            XHFS::from_formatted(ctrl, password).await
+            XHFS::from_formatted(ctrl, password, self.key_derivation.clone()).await
         }
     }
 }

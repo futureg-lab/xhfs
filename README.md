@@ -111,7 +111,7 @@ cargo install xhfs
 # Features
 
 - [x] File System
-  - [x] Encryption (ChaCha20 stream cipher)
+  - [x] Encryption (ChaCha20 stream cipher + argon2 or sha256 key derivation)
   - [x] No journaling, CoW based
   - [x] xhfs core: fopen, fwrite, fseek, mkdir, fmove, fcopy, unlink
   - [x] Native Symlink support: create_symlink

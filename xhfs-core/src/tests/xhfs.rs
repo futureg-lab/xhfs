@@ -1,6 +1,6 @@
 use crate::{
     device::{ConcreteDevice, disk::Controller, kv_device::*, logical::LogicalDevice},
-    xhfs::{WriteOption, XHFS, ds::*},
+    xhfs::{WriteOption, XHFS, crypto::KeyDerivation, ds::*},
 };
 use futures::StreamExt;
 use std::{collections::HashMap, io::Cursor, sync::Arc};
@@ -17,7 +17,12 @@ async fn create_simple_memory_xhfs(capacity: usize) -> eyre::Result<XHFS> {
     });
     let dev1 = LogicalDevice::new(2, [dev1])?;
     let ctrl = Controller::from([dev1]).await?;
-    XHFS::format_new(ctrl, Some("helloworld".to_string())).await
+    XHFS::format_new(
+        ctrl,
+        Some("helloworld".to_string()),
+        KeyDerivation::default(),
+    )
+    .await
 }
 
 #[tokio::test]

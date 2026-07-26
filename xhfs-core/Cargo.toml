@@ -13,6 +13,7 @@ categories = ["filesystem", "database-implementations"]
 
 [dependencies]
 sha2 = "0.11.0"
+argon2 = { workspace = true }
 
 bitvec = { workspace = true }
 chacha20 = { workspace = true }
