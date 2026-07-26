@@ -56,7 +56,7 @@ impl LogicalDevice {
 
     pub async fn write(&self, addr: usize, data: &[u8]) -> eyre::Result<()> {
         #[allow(clippy::redundant_iter_cloned)]
-        // clippy does not understand downstream type erasure due to async Device traits for some reason
+        // https://github.com/rust-lang/rust-clippy/issues/15725
         let mut results = stream::iter(
             self.replica
                 .iter()
