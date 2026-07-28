@@ -21,6 +21,7 @@ pub fn test_basic_binary_serialization() -> eyre::Result<()> {
     {
         let original = Extent {
             next: MaybeU64::from(1234),
+            nonce: Crypto::gen_nonce(),
             data: vec![],
         };
         let data = original.serialize()?;
@@ -29,6 +30,7 @@ pub fn test_basic_binary_serialization() -> eyre::Result<()> {
 
         let original = Extent {
             next: MaybeU64::from(1234),
+            nonce: Crypto::gen_nonce(),
             data: vec![1, 2, 3, 4, 5, 6, 7, 8, 9],
         };
         let data = original.serialize()?;

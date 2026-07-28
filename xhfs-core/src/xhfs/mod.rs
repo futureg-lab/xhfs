@@ -55,6 +55,7 @@ pub struct ExtentMetadata {
     pub full_canon_region: RegionSlot,
     pub full_canon_data_slot: AddressSlot,
     pub next_extent: MaybeU64,
+    pub nonce: [u8; 12],
 }
 
 #[derive(Debug, Clone)]
@@ -1424,7 +1425,7 @@ impl XHFS {
     }
 
     pub async fn allocate_and_write_extent(&self, data: Vec<u8>) -> Result<MaybeU64, XHFSError> {
-        tracing::debug!("Allocating and writing {} B", data.len());
+        tracing::debug!("Allocating and writing {}", PrettySize(data.len() as u64));
 
         let metadata_overhead = Extent::emulate_serialized_size(0);
         let block_size = self.static_format.block_size_bytes as usize;
@@ -1481,6 +1482,7 @@ impl XHFS {
         for (absolute_byte_addr, chunk_data) in serialization_plan.into_iter().rev() {
             let extent = Extent {
                 next: next_link,
+                nonce: Crypto::gen_nonce(),
                 data: chunk_data,
             };
             self.ctrl
@@ -1607,17 +1609,28 @@ impl XHFS {
             .await?;
         Ok(Extent {
             next: meta.next_extent,
+            nonce: meta.nonce,
             data,
         })
     }
 
     pub async fn read_extent_metadata(&self, addr: u64) -> eyre::Result<ExtentMetadata> {
-        let full_offset = (Extent::HEADER_CAP_OFFSET + Extent::HEADER_CAP_OFFSET) as usize;
-        eyre::ensure!(full_offset == 16);
+        let full_offset = (Extent::HEADER_CAP_OFFSET
+            + Extent::HEADER_CAP_OFFSET
+            + Extent::HEADER_NONCE_OFFSET) as usize;
+        eyre::ensure!(full_offset == 28);
         let extent_header = self.ctrl.read(addr as usize, full_offset).await?;
-        let curr_extent_data_size = u64::from_le_bytes(extent_header[0..8].try_into()?);
-        let next_extent = MaybeU64::from(u64::from_le_bytes(extent_header[8..16].try_into()?));
-        let raw_footprint = 16 + curr_extent_data_size as u64;
+        let mut addr_start = 0;
+        let curr_extent_data_size = u64::from_le_bytes(extent_header[addr_start..8].try_into()?);
+        addr_start += 8;
+        let next_extent = MaybeU64::from(u64::from_le_bytes(
+            extent_header[addr_start..addr_start + 8].try_into()?,
+        ));
+        addr_start += 8;
+        let nonce = extent_header[addr_start..addr_start + 12].try_into()?;
+        addr_start += 12;
+
+        let raw_footprint = addr_start as u64 + curr_extent_data_size;
         let block_size = self.static_format.block_size_bytes;
         // let aligned_capacity = ((raw_footprint + block_size - 1) / block_size) * block_size;
         let aligned_capacity = raw_footprint.div_ceil(block_size) * block_size;
@@ -1636,6 +1649,7 @@ impl XHFS {
                 capacity: curr_extent_data_size as usize,
             },
             next_extent,
+            nonce,
         })
     }
 

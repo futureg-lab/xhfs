@@ -51,6 +51,7 @@ pub struct EntryStat {
 pub struct Extent {
     /// 0 coerces to None
     pub next: MaybeU64,
+    pub nonce: [u8; 12],
     pub data: Vec<u8>,
 }
 
@@ -269,19 +270,22 @@ impl INodeKind {
 impl Extent {
     pub const HEADER_NEXT_OFFSET: u64 = 8;
     pub const HEADER_CAP_OFFSET: u64 = 8;
+    pub const HEADER_NONCE_OFFSET: u64 = 12;
 
     pub fn serialize(&self) -> eyre::Result<Vec<u8>> {
         let mut buf = Vec::with_capacity(self.serialized_size());
         buf.extend_from_slice(&(self.data.len() as u64).to_le_bytes());
         buf.extend_from_slice(&self.next.serialize()?);
+        buf.extend_from_slice(&self.nonce);
         buf.extend(&self.data);
 
         Ok(buf)
     }
 
+    #[cfg(test)]
     pub fn deserialize(data: &[u8]) -> eyre::Result<Self> {
-        let (size, next) = Self::deserialize_header_only(data)?;
-        let data = &data[8 + 8..];
+        let (size, next, nonce) = Self::deserialize_header_only(data)?;
+        let data = &data[8 + 8 + 12..];
         eyre::ensure!(
             size == data.len() as u64,
             "Expected Extent data region to be of size {}, got {} instead",
@@ -291,28 +295,33 @@ impl Extent {
 
         Ok(Extent {
             next,
+            nonce: nonce.try_into()?,
             data: data.to_vec(),
         })
     }
 
-    pub fn deserialize_header_only(data: &[u8]) -> eyre::Result<(u64, MaybeU64)> {
-        let meta_expected_size = 8 + 8;
+    #[cfg(test)]
+    pub fn deserialize_header_only(data: &[u8]) -> eyre::Result<(u64, MaybeU64, [u8; 12])> {
+        let meta_expected_size = 8 + 8 + 12;
         let incoming_size = data.len();
         eyre::ensure!(
             incoming_size >= meta_expected_size,
-            "Expected Extent data to be at least 8 + 8 (16) bytes"
+            "Expected Extent data to be at least 8 + 8 (16) bytes: {incoming_size} >= {meta_expected_size}"
         );
 
         let mut addr_start = 0;
         let size = u64::from_le_bytes(data[addr_start..addr_start + 8].try_into()?);
         addr_start += 8;
         let next = MaybeU64::deserialize(data[addr_start..addr_start + 8].try_into()?);
+        addr_start += 8;
+        let nonce: [u8; 12] = data[addr_start..addr_start + 12].try_into()?;
 
-        Ok((size, next))
+        Ok((size, next, nonce))
     }
 
     pub fn emulate_serialized_size(data_len: usize) -> usize {
-        (Self::HEADER_NEXT_OFFSET + Self::HEADER_CAP_OFFSET) as usize + data_len
+        (Self::HEADER_NEXT_OFFSET + Self::HEADER_CAP_OFFSET + Self::HEADER_NONCE_OFFSET) as usize
+            + data_len
     }
 
     pub fn serialized_size(&self) -> usize {

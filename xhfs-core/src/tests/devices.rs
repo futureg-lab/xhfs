@@ -43,7 +43,7 @@ macro_rules! test_read_write_complex {
             );
             assert_eq!(
                 device.read(0, 16).await?,
-                vec![
+                [
                     0, 0, b'H', b'E', b'L', b'L', b'O', b'W', b'O', b'R', b'L', b'D', 0, 0, 0, 0
                 ],
                 "verify surrounding zero-padding"
