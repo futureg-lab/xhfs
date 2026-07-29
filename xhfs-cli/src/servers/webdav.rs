@@ -2,11 +2,11 @@ use bytes::{Buf, Bytes};
 use dav_server::{
     DavHandler,
     davpath::DavPath,
-    fakels::FakeLs,
     fs::{
         DavDirEntry, DavFile, DavMetaData, FsError, FsFuture, FsResult, FsStream,
         GuardedFileSystem, OpenOptions, ReadDirMeta,
     },
+    memls::MemLs,
 };
 use eyre::Context;
 use futures::{FutureExt, stream};
@@ -532,7 +532,7 @@ pub async fn webdav_main(
     });
     let dav_server = DavHandler::builder()
         .filesystem(xhfs_adapter)
-        .locksystem(FakeLs::new())
+        .locksystem(MemLs::new())
         .build_handler();
 
     let listener = TcpListener::bind(addr)
