@@ -75,8 +75,10 @@ impl Crypto {
         Self { key, nonce }
     }
 
-    pub fn apply(&self, addr: u64, data: &mut [u8]) {
-        let mut cipher = ChaCha20::new(&self.key.into(), &self.nonce.into());
+    pub fn apply(&self, addr: u64, data: &mut [u8], nonce: Option<[u8; 12]>) {
+        // let nonce = nonce.unwrap_or_else(|| self.nonce);
+        let nonce = nonce.unwrap_or(self.nonce); // hot path
+        let mut cipher = ChaCha20::new(&self.key.into(), &nonce.into());
         cipher.seek(addr);
         cipher.apply_keystream(data);
     }

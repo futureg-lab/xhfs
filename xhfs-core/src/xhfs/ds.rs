@@ -285,7 +285,7 @@ impl Extent {
     #[cfg(test)]
     pub fn deserialize(data: &[u8]) -> eyre::Result<Self> {
         let (size, next, nonce) = Self::deserialize_header_only(data)?;
-        let data = &data[8 + 8 + 12..];
+        let data = &data[Self::header_size()..];
         eyre::ensure!(
             size == data.len() as u64,
             "Expected Extent data region to be of size {}, got {} instead",
@@ -302,7 +302,7 @@ impl Extent {
 
     #[cfg(test)]
     pub fn deserialize_header_only(data: &[u8]) -> eyre::Result<(u64, MaybeU64, [u8; 12])> {
-        let meta_expected_size = 8 + 8 + 12;
+        let meta_expected_size = Self::header_size();
         let incoming_size = data.len();
         eyre::ensure!(
             incoming_size >= meta_expected_size,
@@ -320,8 +320,12 @@ impl Extent {
     }
 
     pub fn emulate_serialized_size(data_len: usize) -> usize {
+        Self::header_size() + data_len
+    }
+
+    #[inline(always)]
+    pub fn header_size() -> usize {
         (Self::HEADER_NEXT_OFFSET + Self::HEADER_CAP_OFFSET + Self::HEADER_NONCE_OFFSET) as usize
-            + data_len
     }
 
     pub fn serialized_size(&self) -> usize {
@@ -519,6 +523,7 @@ impl Hardlink {
 }
 
 impl XHFSHeader {
+    const XHFS_HEADER_VERSION: u8 = 2;
     pub fn serialize(&self) -> eyre::Result<Vec<u8>> {
         let mut buf = Vec::with_capacity(Self::serialized_size());
         buf.extend_from_slice(b"XHFS");
@@ -579,7 +584,7 @@ impl XHFSHeader {
 
     pub fn template() -> Self {
         Self {
-            version: 1,
+            version: Self::XHFS_HEADER_VERSION,
             chacha20_nonce: Default::default(),
             extra_metadata: [0; 32],
             format: Format {

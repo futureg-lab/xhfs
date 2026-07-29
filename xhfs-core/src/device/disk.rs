@@ -41,9 +41,14 @@ impl Controller {
         self.crypto = Some(crypto)
     }
 
-    pub fn encrypt_apply(&self, addr: usize, mut data: Vec<u8>) -> Vec<u8> {
+    pub fn encrypt_apply(
+        &self,
+        addr: usize,
+        mut data: Vec<u8>,
+        nonce: Option<[u8; 12]>,
+    ) -> Vec<u8> {
         if let Some(crypto) = &self.crypto {
-            crypto.apply(addr as u64, &mut data);
+            crypto.apply(addr as u64, &mut data, nonce);
         }
         data
     }
@@ -57,8 +62,30 @@ impl Controller {
 
     #[inline]
     pub async fn write_owned(&self, logical_addr: usize, data: Vec<u8>) -> eyre::Result<()> {
-        let data = self.encrypt_apply(logical_addr, data);
+        let data = self.encrypt_apply(logical_addr, data, None);
         self.raw_write(logical_addr, &data).await
+    }
+
+    #[inline]
+    pub async fn write_with_nonce(
+        &self,
+        logical_addr: usize,
+        data: &[u8],
+        nonce: Option<[u8; 12]>,
+    ) -> eyre::Result<()> {
+        let data = self.encrypt_apply(logical_addr, data.to_vec(), nonce);
+        self.raw_write(logical_addr, &data).await
+    }
+
+    #[inline(always)]
+    pub async fn read_with_nonce(
+        &self,
+        logical_addr: usize,
+        size: usize,
+        nonce: Option<[u8; 12]>,
+    ) -> eyre::Result<Vec<u8>> {
+        let data = self.raw_read(logical_addr, size).await?;
+        Ok(self.encrypt_apply(logical_addr, data, nonce))
     }
 
     #[inline]
@@ -68,8 +95,7 @@ impl Controller {
 
     #[inline]
     pub async fn read(&self, logical_addr: usize, size: usize) -> eyre::Result<Vec<u8>> {
-        let data = self.raw_read(logical_addr, size).await?;
-        Ok(self.encrypt_apply(logical_addr, data))
+        self.read_with_nonce(logical_addr, size, None).await
     }
 
     pub async fn raw_write(&self, mut logical_addr: usize, data: &[u8]) -> eyre::Result<()> {

@@ -446,7 +446,13 @@ impl XHFS {
     }
 
     pub async fn get_header(&self) -> eyre::Result<XHFSHeader> {
-        XHFSHeader::deserialize(&self.ctrl.raw_read(0, self.header_size).await?)
+        let header = XHFSHeader::deserialize(&self.ctrl.raw_read(0, self.header_size).await?)?;
+        eyre::ensure!(
+            header.version == 2,
+            "XHFS version 2 expected, installed file system is version {}",
+            header.version
+        );
+        Ok(header)
     }
 
     pub async fn update_header(&self, header: XHFSHeader) -> eyre::Result<()> {
@@ -1424,6 +1430,18 @@ impl XHFS {
             .await
     }
 
+    #[inline(always)]
+    pub async fn write_extent(&self, mut addr: usize, extent: Extent) -> Result<(), XHFSError> {
+        let raw_extent = extent.serialize().map_err(XHFSError::from_report)?;
+        let header_size = Extent::header_size();
+        self.ctrl.write(addr, &raw_extent[..header_size]).await?;
+        addr += header_size;
+        self.ctrl
+            .write_with_nonce(addr, &raw_extent[header_size..], Some(extent.nonce))
+            .await
+            .map_err(XHFSError::from_report)
+    }
+
     pub async fn allocate_and_write_extent(&self, data: Vec<u8>) -> Result<MaybeU64, XHFSError> {
         tracing::debug!("Allocating and writing {}", PrettySize(data.len() as u64));
 
@@ -1485,15 +1503,10 @@ impl XHFS {
                 nonce: Crypto::gen_nonce(),
                 data: chunk_data,
             };
-            self.ctrl
-                .write_owned(
-                    absolute_byte_addr as usize,
-                    extent
-                        .serialize()
-                        .map_err(|e| XHFSError::Error { err: e.to_string() })?,
-                )
-                .await
-                .map_err(|e| XHFSError::Error { err: e.to_string() })?;
+
+            self.write_extent(absolute_byte_addr as usize, extent)
+                .await?;
+
             next_link = MaybeU64::from(absolute_byte_addr);
         }
 
@@ -1602,9 +1615,10 @@ impl XHFS {
         let meta = self.read_extent_metadata(addr).await?;
         let data = self
             .ctrl
-            .read(
+            .read_with_nonce(
                 meta.full_canon_data_slot.addr.into(),
                 meta.full_canon_data_slot.capacity,
+                Some(meta.nonce),
             )
             .await?;
         Ok(Extent {
@@ -1714,9 +1728,10 @@ impl XHFS {
                 // streamable
                 let data = self
                     .ctrl
-                    .read(
+                    .read_with_nonce(
                         meta.full_canon_data_slot.addr.get() as usize + start_in_ext,
                         end_in_ext.saturating_sub(start_in_ext) as usize,
+                        Some(meta.nonce),
                     )
                     .await?;
                 buf.extend_from_slice(&data);
